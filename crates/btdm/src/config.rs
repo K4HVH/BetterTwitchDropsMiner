@@ -131,8 +131,10 @@ mod tests {
             data_dir: None,
             accounts: vec![AccountConfig {
                 name: "main".into(),
+                strategy: "coverage".into(),
                 priority_games: vec!["Deadlock".into()],
                 favourite_channels: vec!["somestreamer".into()],
+                pinned_channel: None,
             }],
         };
         cfg.save_atomic(&path).unwrap();
@@ -162,5 +164,61 @@ mod tests {
         Config::default().save_atomic(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    #[test]
+    fn an_unconfigured_account_gets_sensible_defaults() {
+        let cfg = Config {
+            bind: "127.0.0.1:8080".into(),
+            data_dir: None,
+            accounts: vec![],
+        };
+        let a = cfg.account("whoever");
+        assert_eq!(a.name, "whoever");
+        assert_eq!(a.strategy, "deadline");
+        assert!(a.priority_games.is_empty());
+    }
+
+    #[test]
+    fn a_configured_account_is_found_by_name() {
+        let cfg = Config {
+            bind: "127.0.0.1:8080".into(),
+            data_dir: None,
+            accounts: vec![
+                AccountConfig {
+                    name: "alt".into(),
+                    strategy: "coverage".into(),
+                    ..AccountConfig::default()
+                },
+                AccountConfig {
+                    name: "main".into(),
+                    strategy: "priority".into(),
+                    ..AccountConfig::default()
+                },
+            ],
+        };
+        assert_eq!(cfg.account("main").strategy, "priority");
+        assert_eq!(cfg.account("alt").strategy, "coverage");
+    }
+
+    /// Old config files predate the strategy field; they must keep working
+    /// rather than failing to parse.
+    #[test]
+    fn a_config_without_the_newer_fields_still_loads() {
+        let toml = r#"
+bind = "127.0.0.1:8080"
+
+[[accounts]]
+name = "main"
+priority_games = ["Deadlock"]
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.account("main").strategy, "deadline");
+        assert_eq!(cfg.account("main").priority_games, vec!["Deadlock"]);
     }
 }
