@@ -1534,7 +1534,15 @@ impl<A: TwitchApi> Engine<A> {
 
         let mut channels_by_game: HashMap<GameId, Vec<(Channel, Stream)>> = HashMap::new();
         for (game, limit) in games {
-            let found = self.api.live_channels(&game, limit).await?;
+            let mut found = self.api.live_channels(&game, limit).await?;
+            // Twitch does occasionally list the same channel twice in one
+            // directory page. Left alone, the channel is mapped to the same
+            // campaign once per appearance, so it looks like it advances that
+            // campaign twice — inflating its coverage score, duplicating the
+            // session's campaign list, and spending the per-campaign channel
+            // budget on a channel already counted.
+            let mut seen: HashSet<ChannelId> = HashSet::new();
+            found.retain(|(c, _)| seen.insert(c.id.clone()));
             channels_by_game.insert(game.id.clone(), found);
         }
 
@@ -1662,15 +1670,16 @@ impl<A: TwitchApi> Engine<A> {
                     break;
                 }
                 taken += 1;
-                by_channel
+                let entry = by_channel
                     .entry(channel.id.clone())
                     .or_insert_with(|| ChannelWork {
                         channel: channel.clone(),
                         stream: stream.clone(),
                         wants: Vec::new(),
-                    })
-                    .wants
-                    .push(i);
+                    });
+                if !entry.wants.contains(&i) {
+                    entry.wants.push(i);
+                }
             }
             if !any {
                 campaigns_without_channels.push(want.campaign.clone());
