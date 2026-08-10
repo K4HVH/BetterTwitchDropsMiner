@@ -122,8 +122,66 @@ async fn index(State(state): State<AppState>, headers: HeaderMap, uri: axum::htt
     Html(INDEX_HTML).into_response()
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "ok": true }))
+/// A monitoring probe.
+///
+/// This is the one unauthenticated route, so it deliberately reveals no
+/// account names, channels or campaigns — only whether mining is actually
+/// working. It used to return a bare `{"ok": true}` from a handler that looked
+/// at nothing, which meant a miner whose token had expired an hour ago
+/// reported itself perfectly healthy.
+async fn health(State(state): State<AppState>) -> Response {
+    let snapshots = state.hub.snapshots();
+
+    if snapshots.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "status": "starting",
+                "detail": "no account has reported yet",
+                "accounts": 0,
+            })),
+        )
+            .into_response();
+    }
+
+    let total = snapshots.len();
+    let paused = snapshots.iter().filter(|s| s.paused).count();
+    let stalled = snapshots
+        .iter()
+        .filter(|s| s.watching.as_ref().is_some_and(|w| w.stalled))
+        .count();
+    let mining = snapshots.iter().filter(|s| s.state == "Mining").count();
+    let idle = total - paused - mining;
+
+    // Paused is a deliberate state, not a fault. Stalled is a fault, and the
+    // whole point of a probe is that it fires on one.
+    let ok = stalled == 0;
+    let status = if stalled > 0 {
+        "stalled"
+    } else if mining > 0 {
+        "mining"
+    } else if paused == total {
+        "paused"
+    } else {
+        "idle"
+    };
+
+    let body = Json(serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "accounts": total,
+        "mining": mining,
+        "idle": idle,
+        "paused": paused,
+        "stalled": stalled,
+    }));
+
+    if ok {
+        body.into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    }
 }
 
 async fn snapshots(

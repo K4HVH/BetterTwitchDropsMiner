@@ -13,6 +13,10 @@ pub mod watch;
 pub enum TwitchError {
     #[error("network failure: {0}")]
     Network(String),
+    /// A failure that could plausibly succeed if asked again: a 5xx, a
+    /// timeout, or a connection that never completed. Retried automatically.
+    #[error("temporary failure: {0}")]
+    Transient(String),
     #[error("authentication is no longer valid")]
     Unauthorized,
     #[error("rate limited by Twitch")]
@@ -38,6 +42,9 @@ impl From<TwitchError> for btdm_core::api::ApiError {
             TwitchError::Unauthorized => ApiError::Unauthorized,
             TwitchError::RateLimited => ApiError::RateLimited,
             TwitchError::Network(m) => ApiError::Network(m),
+            // A transient failure that survived every retry is still a network
+            // problem, not a malformed response.
+            TwitchError::Transient(m) => ApiError::Network(m),
             other => ApiError::Malformed(other.to_string()),
         }
     }

@@ -23,6 +23,12 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
     /// Optional Discord webhook for drop claims and anything needing attention.
     pub discord_webhook: Option<String>,
+    /// Route all Twitch traffic through this proxy. Applies to every account
+    /// unless one overrides it.
+    pub proxy: Option<String>,
+    /// Timings. Every one has a working default; this is for tuning a slow
+    /// connection or a Raspberry Pi, not for ordinary use.
+    pub timing: Timing,
     /// Bearer token for a dashboard bound off loopback.
     ///
     /// Generated on first use and kept, rather than regenerated each start: a
@@ -38,8 +44,90 @@ impl Default for Config {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            proxy: None,
+            timing: Timing::default(),
             dashboard_token: None,
             accounts: vec![AccountConfig::default()],
+        }
+    }
+}
+
+/// Every timing the engine uses, so none of them requires a rebuild to change.
+///
+/// The design notes said "starting values, all configurable" from the outset;
+/// they were in fact unreachable from the config file entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Timing {
+    /// How often a watch heartbeat is sent. Twitch expects roughly one a
+    /// minute; raising it earns nothing and lowering it stops progress.
+    pub watch_interval_secs: u32,
+    /// How often progress is polled as a backstop to the websocket.
+    pub poll_interval_secs: u32,
+    /// How often campaigns are re-fetched.
+    pub sync_interval_mins: u32,
+    /// How often the choice of channel is reconsidered while watching.
+    pub reselect_interval_mins: u32,
+    /// Channels to consider per game.
+    pub channels_per_game: u32,
+    /// Channels to verify per campaign.
+    pub max_channels_per_campaign: u32,
+    /// Upper bound on availability checks in one selection pass.
+    pub availability_checks: u32,
+    /// How many of those run at once.
+    pub check_concurrency: u32,
+    /// Quiet for this long is suspicious.
+    pub suspect_after_secs: u32,
+    /// Quiet for this long starts the recovery ladder.
+    pub stalled_after_secs: u32,
+    /// Minimum gap between recovery rungs.
+    pub recovery_cooldown_secs: u32,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            watch_interval_secs: 60,
+            poll_interval_secs: 120,
+            sync_interval_mins: 10,
+            reselect_interval_mins: 10,
+            channels_per_game: 30,
+            max_channels_per_campaign: 8,
+            availability_checks: 160,
+            check_concurrency: 8,
+            suspect_after_secs: 150,
+            stalled_after_secs: 360,
+            recovery_cooldown_secs: 60,
+        }
+    }
+}
+
+impl Timing {
+    /// Applies these to an engine configuration.
+    ///
+    /// Values that would stop mining outright are clamped rather than
+    /// obeyed: a zero heartbeat interval is a typo, not an instruction, and
+    /// honouring it would hammer Twitch until the account was flagged.
+    pub fn apply(&self, cfg: &mut btdm_core::engine::EngineConfig) {
+        use chrono::Duration;
+        cfg.watch_interval = Duration::seconds(self.watch_interval_secs.clamp(15, 600) as i64);
+        cfg.poll_interval = Duration::seconds(self.poll_interval_secs.clamp(30, 3600) as i64);
+        cfg.sync_interval = Duration::minutes(self.sync_interval_mins.clamp(1, 720) as i64);
+        cfg.reselect_interval =
+            Duration::minutes(self.reselect_interval_mins.clamp(1, 720) as i64);
+        cfg.channel_limit = self.channels_per_game.clamp(5, 200);
+        cfg.max_channels_per_campaign = self.max_channels_per_campaign.clamp(1, 50) as usize;
+        cfg.max_availability_checks = self.availability_checks.clamp(5, 1000) as usize;
+        cfg.check_concurrency = self.check_concurrency.clamp(1, 32) as usize;
+        cfg.watchdog.suspect_after = Duration::seconds(self.suspect_after_secs.clamp(30, 3600) as i64);
+        cfg.watchdog.stalled_after = Duration::seconds(self.stalled_after_secs.clamp(60, 7200) as i64);
+        cfg.watchdog.cooldown =
+            Duration::seconds(self.recovery_cooldown_secs.clamp(10, 3600) as i64);
+
+        // A stall threshold at or below the suspicion threshold would skip
+        // straight to recovery on every quiet moment.
+        if cfg.watchdog.stalled_after <= cfg.watchdog.suspect_after {
+            cfg.watchdog.stalled_after = cfg.watchdog.suspect_after + Duration::seconds(60);
         }
     }
 }
@@ -61,6 +149,9 @@ pub struct AccountConfig {
     pub excluded_campaigns: Vec<String>,
     /// Game names never to mine.
     pub excluded_games: Vec<String>,
+    /// Route this account's traffic through its own proxy, overriding the
+    /// global one.
+    pub proxy: Option<String>,
     /// Start paused. Set by the dashboard's pause button so the state survives
     /// a restart — a miner that silently resumed on reboot would be mining
     /// against the user's stated wish.
@@ -77,6 +168,7 @@ impl Default for AccountConfig {
             pinned_channel: None,
             excluded_campaigns: Vec::new(),
             excluded_games: Vec::new(),
+            proxy: None,
             paused: false,
         }
     }
@@ -221,6 +313,8 @@ mod tests {
             bind: "0.0.0.0:9000".into(),
             data_dir: None,
             discord_webhook: None,
+            proxy: None,
+            timing: Timing::default(),
             dashboard_token: None,
             accounts: vec![AccountConfig {
                 name: "main".into(),
@@ -270,6 +364,8 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            proxy: None,
+            timing: Timing::default(),
             dashboard_token: None,
             accounts: vec![],
         };
@@ -285,6 +381,8 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            proxy: None,
+            timing: Timing::default(),
             dashboard_token: None,
             accounts: vec![
                 AccountConfig {
@@ -403,6 +501,8 @@ mod store_tests {
             bind: "0.0.0.0:9999".into(),
             data_dir: None,
             discord_webhook: Some("https://example.invalid/hook".into()),
+            proxy: None,
+            timing: Timing::default(),
             dashboard_token: None,
             accounts: vec![AccountConfig::default()],
         }

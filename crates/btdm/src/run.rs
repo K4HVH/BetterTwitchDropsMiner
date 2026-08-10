@@ -10,7 +10,7 @@ use btdm_core::model::ChannelId;
 use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::api_impl::TwitchClient;
 use btdm_twitch::auth::AuthClient;
-use btdm_twitch::client::build_http_client;
+use btdm_twitch::client::{build_http_client, build_http_client_with_proxy};
 use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
 use btdm_web::Hub;
 use chrono::{Duration, Utc};
@@ -42,7 +42,14 @@ pub async fn mine(
         .get_tokens(account)?
         .ok_or_else(|| anyhow::anyhow!("account '{account}' is not linked. Run: btdm login"))?;
 
-    let http = build_http_client()?;
+    // A per-account proxy overrides the global one; this is the mitigation for
+    // several accounts mining from a single address.
+    let proxy = account_config_proxy(config, account);
+    let http = build_http_client_with_proxy(proxy.as_deref())
+        .map_err(|e| anyhow::anyhow!("could not build the HTTP client (proxy {proxy:?}): {e}"))?;
+    if let Some(p) = &proxy {
+        tracing::info!(proxy = %p, account, "routing Twitch traffic through a proxy");
+    }
     let auth = AuthClient::new(http.clone(), tokens.device_id.clone());
     let validated = auth.validate(&tokens.access_token).await?;
     tracing::info!(login = %validated.login, user_id = %validated.user_id, "authenticated");
@@ -55,7 +62,7 @@ pub async fn mine(
     );
 
     let account_config = config.account(account);
-    let engine_config = EngineConfig {
+    let mut engine_config = EngineConfig {
         strategy: account_config.strategy.clone(),
         favourites: account_config.favourite_channels.clone(),
         priority_games: account_config.priority_games.clone(),
@@ -65,6 +72,7 @@ pub async fn mine(
         paused: account_config.paused,
         ..EngineConfig::default()
     };
+    config.timing.apply(&mut engine_config);
     let watch_interval = engine_config.watch_interval.to_std()?;
     let mut engine = Engine::new(api, engine_config);
     tracing::info!(
@@ -262,6 +270,16 @@ pub async fn mine(
         hub.unregister(account);
     }
     result
+}
+
+/// The proxy this account should use, if any.
+fn account_config_proxy(config: &Config, account: &str) -> Option<String> {
+    config
+        .account(account)
+        .proxy
+        .or_else(|| config.proxy.clone())
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
 }
 
 /// Publishes a fresh snapshot. Called after anything that can change state, so

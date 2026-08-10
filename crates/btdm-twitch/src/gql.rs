@@ -10,6 +10,17 @@
 use crate::TwitchError;
 use crate::client::{CLIENT_ID, GQL_URL};
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// How many times a transient failure is retried before giving up.
+const MAX_RETRIES: usize = 3;
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(400);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(4);
+
+/// Whether asking again could plausibly succeed.
+fn is_transient(e: &TwitchError) -> bool {
+    matches!(e, TwitchError::Transient(_))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct GqlOperation {
@@ -65,7 +76,45 @@ impl GqlClient {
         }
     }
 
+    /// Posts with bounded retry.
+    ///
+    /// One HTTP 500 or dropped connection used to abort a whole campaign sync
+    /// or selection pass, and the miner then sat idle until its next scheduled
+    /// one — up to ten minutes of doing nothing because of a single blip. That
+    /// is exactly the "random connections just completely failing" symptom
+    /// this project exists to fix.
+    ///
+    /// Only transient failures are retried. A rejected token or a malformed
+    /// response will not become valid by asking again, and retrying a rate
+    /// limit immediately makes it worse.
     async fn post(&self, body: &Value) -> Result<Value, TwitchError> {
+        let mut delay = FIRST_RETRY_DELAY;
+        let mut last: TwitchError;
+        let mut attempt = 0usize;
+
+        loop {
+            match self.post_once(body).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if attempt >= MAX_RETRIES || !is_transient(&e) {
+                        return Err(e);
+                    }
+                    last = e;
+                    attempt += 1;
+                    tracing::debug!(
+                        error = %last,
+                        attempt,
+                        retry_in_ms = delay.as_millis(),
+                        "transient Twitch failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    async fn post_once(&self, body: &Value) -> Result<Value, TwitchError> {
         let mut req = self
             .http
             .post(&self.endpoint)
@@ -75,15 +124,23 @@ impl GqlClient {
             req = req.header("Authorization", format!("OAuth {token}"));
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+        let resp = req.send().await.map_err(|e| {
+            // A connection that never completed is worth another go; anything
+            // else is a real problem with the request.
+            if e.is_timeout() || e.is_connect() || e.is_request() {
+                TwitchError::Transient(e.to_string())
+            } else {
+                TwitchError::Network(e.to_string())
+            }
+        })?;
 
         match resp.status().as_u16() {
             200 => {}
             401 | 403 => return Err(TwitchError::Unauthorized),
             429 => return Err(TwitchError::RateLimited),
+            // 5xx is Twitch having a moment; 4xx is us being wrong. Only the
+            // former is worth asking again about.
+            s @ 500..=599 => return Err(TwitchError::Transient(format!("HTTP {s}"))),
             s => return Err(TwitchError::Network(format!("HTTP {s}"))),
         }
 

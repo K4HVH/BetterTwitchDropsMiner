@@ -73,16 +73,94 @@ async fn an_unguarded_dashboard_serves_the_page_and_snapshots() {
     assert_eq!(snaps[0].account, "main");
 }
 
+/// A probe that always says "ok" is useless. Before any miner has reported,
+/// the honest answer is "starting", not "healthy".
 #[tokio::test]
-async fn health_reports_ok() {
+async fn health_is_not_ok_before_any_miner_reports() {
     let base = start(Hub::new(), None).await;
-    let body: serde_json::Value = reqwest::get(format!("{base}/api/health"))
+    let res = reqwest::get(format!("{base}/api/health")).await.unwrap();
+    assert_eq!(res.status(), 503);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["status"], "starting");
+}
+
+#[tokio::test]
+async fn health_reports_mining() {
+    let hub = Hub::new();
+    hub.publish(snapshot("main"));
+    let base = start(hub, None).await;
+
+    let res = reqwest::get(format!("{base}/api/health")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["status"], "mining");
+    assert_eq!(body["accounts"], 1);
+}
+
+/// The point of a probe is that it fires when mining has stopped earning.
+/// This is what a systemd or Docker healthcheck hangs off.
+#[tokio::test]
+async fn health_fails_when_a_miner_is_stalled() {
+    let hub = Hub::new();
+    let mut s = snapshot("main");
+    s.watching = Some(btdm_core::snapshot::WatchingView {
+        channel_login: "someone".into(),
+        channel_display_name: "Someone".into(),
+        stream_title: String::new(),
+        viewers: 0,
+        campaign: "Camp".into(),
+        campaigns: vec!["Camp".into()],
+        reason: String::new(),
+        since: chrono::Utc::now(),
+        drop_name: None,
+        current_minutes: None,
+        required_minutes: None,
+        seconds_since_confirmation: Some(900),
+        stalled: true,
+    });
+    hub.publish(s);
+    let base = start(hub, None).await;
+
+    let res = reqwest::get(format!("{base}/api/health")).await.unwrap();
+    assert_eq!(res.status(), 503, "a stalled miner must fail the probe");
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "stalled");
+    assert_eq!(body["stalled"], 1);
+}
+
+/// Pausing is a decision the user made, not a fault.
+#[tokio::test]
+async fn a_paused_miner_is_healthy() {
+    let hub = Hub::new();
+    let mut s = snapshot("main");
+    s.paused = true;
+    s.state = "Paused".into();
+    hub.publish(s);
+    let base = start(hub, None).await;
+
+    let res = reqwest::get(format!("{base}/api/health")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "paused");
+}
+
+/// It is the only unauthenticated route, so it must leak nothing.
+#[tokio::test]
+async fn health_reveals_no_account_details() {
+    let hub = Hub::new();
+    hub.publish(snapshot("my-secret-account"));
+    let base = start(hub, Some("secret")).await;
+
+    let text = reqwest::get(format!("{base}/api/health"))
         .await
         .unwrap()
-        .json()
+        .text()
         .await
         .unwrap();
-    assert_eq!(body["ok"], true);
+    assert!(!text.contains("my-secret-account"), "leaked: {text}");
+    assert!(!text.contains("someone"), "leaked the Twitch login: {text}");
 }
 
 /// The guard must be on every route, not just the page. A snapshot leaks which
