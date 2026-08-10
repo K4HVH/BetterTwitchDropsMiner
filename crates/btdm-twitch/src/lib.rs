@@ -1,0 +1,34 @@
+//! Twitch API client: auth, GQL, spade heartbeat, PubSub.
+
+pub mod auth;
+pub mod client;
+pub mod gql;
+pub mod operations;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TwitchError {
+    #[error("network failure: {0}")]
+    Network(String),
+    #[error("authentication is no longer valid")]
+    Unauthorized,
+    #[error("rate limited by Twitch")]
+    RateLimited,
+    #[error("unexpected response shape: {0}")]
+    Malformed(String),
+    #[error("persisted query hash is stale")]
+    StaleQueryHash,
+    #[error("graphql errors: {0:?}")]
+    Gql(Vec<serde_json::Value>),
+}
+
+impl From<TwitchError> for btdm_core::api::ApiError {
+    fn from(e: TwitchError) -> Self {
+        use btdm_core::api::ApiError;
+        match e {
+            TwitchError::Unauthorized => ApiError::Unauthorized,
+            TwitchError::RateLimited => ApiError::RateLimited,
+            TwitchError::Network(m) => ApiError::Network(m),
+            other => ApiError::Malformed(other.to_string()),
+        }
+    }
+}

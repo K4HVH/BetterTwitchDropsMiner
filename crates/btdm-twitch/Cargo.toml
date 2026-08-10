@@ -1,0 +1,18 @@
+[package]
+name = "btdm-twitch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+btdm-core = { path = "../btdm-core" }
+chrono.workspace = true
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "gzip", "rustls", "form", "charset", "http2"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6.5"
