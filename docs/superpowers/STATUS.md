@@ -15,6 +15,10 @@ Built in one session, verified against a real Twitch account (`k4hvh`).
   before its deadline and chose a different one, unprompted.
 - **Dashboard** — serves on 127.0.0.1:8080, renders live snapshots and streams
   events over SSE.
+- **Watchdog** — on a channel that never confirmed anything, the ladder fired at
+  exactly the 360s threshold with `step=ResendWatch`. This is the case the tool
+  this replaces cannot even detect: it would have shown a moving progress bar
+  indefinitely.
 
 ## v1 scope
 
@@ -66,6 +70,14 @@ Found by adversarial review:
 9. **`Unauthorized` mid-session** churned for up to 30 minutes before reporting.
 10. **PubSub `LISTEN` was never acknowledged**, so a rejected subscription
     looked identical to a healthy socket.
+
+## Incident during the build
+
+`devdata/state.db`, containing a live OAuth token, was committed by a broad
+`git add -A`. Nothing had been pushed — `origin/main` was still at the
+pre-session commit — so the token never left the machine. History was rewritten,
+backup refs and reflog expired, and the token string verified absent from every
+remaining object. `devdata/`, `*.db` and `config.toml` are now in `.gitignore`.
 
 ## Known gaps
 
