@@ -136,6 +136,11 @@ check_concurrency = 8
 suspect_after_secs = 150
 stalled_after_secs = 360
 recovery_cooldown_secs = 60
+# Channels followed for stream state over the websocket. One is the channel
+# being watched, which is the only subscription that clearly pays for itself.
+followed_channels = 1
+# How often to reconsider while a campaign is close to being lost.
+urgent_reselect_mins = 2
 ```
 
 Anything the dashboard or `btdm control` changes is written back here, so

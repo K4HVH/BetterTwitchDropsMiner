@@ -72,10 +72,17 @@ resistance rather than secrecy.
 
 Honest list of what a serious miner could do that this does not.
 
-- **A channel pool larger than one connection.** 45 channels are followed for
-  stream state, which is what a single PubSub socket carries. The reference
-  implementation shards across 8 sockets to reach 199. Sharding is the
-  increment; nothing else needs to change.
+- **A large channel pool, deliberately.** The reference implementation
+  subscribes to hundreds of channels' stream state because it rebuilds its
+  channel list only once an hour and has no other liveness signal in between.
+  This miner re-queries the directory every ten minutes while mining and every
+  sixty seconds while idle, and that query returns only live channels — so the
+  extra subscriptions are largely redundant here. One is followed: the channel
+  being watched, without which a stream ending goes unnoticed for six minutes.
+  Deadline pressure, the case where reacting sooner genuinely matters, is
+  handled by reconsidering every two minutes while anything is at risk.
+  `followed_channels` raises the pool for anyone who wants it; the mechanism
+  handles up to what one connection carries.
 - **Per-campaign priority and per-drop targeting.** Priority and exclusion are
   keyed on games and whole campaigns; two campaigns for the same game cannot be
   ranked against each other, and "get me tier 1 and stop" cannot be expressed.
@@ -93,7 +100,7 @@ Honest list of what a serious miner could do that this does not.
 
 ## Test coverage, and where it is thin
 
-377 tests, no clippy warnings.
+381 tests, no clippy warnings.
 
 Well covered: the engine against a scripted Twitch (93 scenarios), strategies,
 eligibility and feasibility maths, the watchdog ladder, parsing, the control

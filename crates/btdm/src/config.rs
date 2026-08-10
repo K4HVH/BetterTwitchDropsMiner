@@ -82,6 +82,16 @@ pub struct Timing {
     pub stalled_after_secs: u32,
     /// Minimum gap between recovery rungs.
     pub recovery_cooldown_secs: u32,
+    /// How many channels to follow for stream state over the websocket.
+    ///
+    /// One is the channel being watched, which is the only subscription that
+    /// clearly pays for itself. Raise it to hear about other channels coming
+    /// online before the next scheduled re-evaluation.
+    pub followed_channels: u32,
+    /// How often to reconsider the channel while a campaign is at risk of
+    /// being lost. Deadline pressure is exactly when a ten-minute wait costs
+    /// something.
+    pub urgent_reselect_mins: u32,
 }
 
 impl Default for Timing {
@@ -98,6 +108,8 @@ impl Default for Timing {
             suspect_after_secs: 150,
             stalled_after_secs: 360,
             recovery_cooldown_secs: 60,
+            followed_channels: 1,
+            urgent_reselect_mins: 2,
         }
     }
 }
@@ -123,6 +135,8 @@ impl Timing {
         cfg.watchdog.stalled_after = Duration::seconds(self.stalled_after_secs.clamp(60, 7200) as i64);
         cfg.watchdog.cooldown =
             Duration::seconds(self.recovery_cooldown_secs.clamp(10, 3600) as i64);
+        cfg.urgent_reselect_interval =
+            Duration::minutes(self.urgent_reselect_mins.clamp(1, 120) as i64);
 
         // A stall threshold at or below the suspicion threshold would skip
         // straight to recovery on every quiet moment.
