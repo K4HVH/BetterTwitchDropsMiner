@@ -61,27 +61,35 @@ fn total_remaining_minutes(campaign: &DropCampaign, drop: &TimedDrop) -> u32 {
     fn walk(
         campaign: &DropCampaign,
         drop: &TimedDrop,
-        // Guards against a precondition cycle. Twitch should never send one,
-        // but a miner that hangs on malformed data is worse than one that
-        // slightly misjudges a deadline.
-        seen: &mut std::collections::HashSet<DropId>,
+        // The chain currently being followed. Cycle detection has to be
+        // per-path, not a set shared across the whole recursion: with a
+        // diamond (D behind B and C, both behind A) a shared set would mark A
+        // visited on the first branch and contribute nothing on the second,
+        // understating the total — and understating it makes a campaign look
+        // *more* feasible than it is, which is the error this maths exists to
+        // prevent.
+        path: &mut Vec<DropId>,
     ) -> u32 {
-        if !seen.insert(drop.id.clone()) {
+        if path.contains(&drop.id) {
             return 0;
         }
+        path.push(drop.id.clone());
+
         let worst_chain = drop
             .precondition_ids
             .iter()
             .filter_map(|id| campaign.drops.iter().find(|d| &d.id == id))
             // A precondition already claimed is behind us and costs nothing.
             .filter(|d| !d.is_claimed)
-            .map(|d| walk(campaign, d, seen))
+            .map(|d| walk(campaign, d, path))
             .max()
             .unwrap_or(0);
+
+        path.pop();
         drop.remaining_minutes().saturating_add(worst_chain)
     }
 
-    walk(campaign, drop, &mut std::collections::HashSet::new())
+    walk(campaign, drop, &mut Vec::new())
 }
 
 /// Minutes of watching still needed to finish everything left in the campaign.
@@ -366,5 +374,102 @@ mod remaining_minutes_tests {
             tier("d2", 300, 0, &["d1"]),
         ]);
         assert_eq!(remaining_minutes(&c), 315, "15 left on tier 1, then 300");
+    }
+}
+
+#[cfg(test)]
+mod diamond_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn tier(id: &str, required: u32, after: &[&str]) -> TimedDrop {
+        TimedDrop {
+            id: DropId::from(id),
+            name: id.into(),
+            benefits: vec![],
+            required_minutes: required,
+            current_minutes: 0,
+            claim_id: None,
+            is_claimed: false,
+            precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
+        }
+    }
+
+    fn with(drops: Vec<TimedDrop>) -> DropCampaign {
+        DropCampaign {
+            id: CampaignId::from("c1"),
+            name: "Camp".into(),
+            game: Game {
+                id: GameId::from("g1"),
+                name: "Game".into(),
+                slug: "game".into(),
+                box_art_url: None,
+            },
+            starts_at: Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0).unwrap(),
+            ends_at: Utc.with_ymd_and_hms(2026, 8, 10, 20, 0, 0).unwrap(),
+            is_account_linked: true,
+            allowed_channels: vec![],
+            account_link_url: None,
+            drops,
+        }
+    }
+
+    /// A shared visited set across the whole recursion marks a shared ancestor
+    /// as counted on the first branch it appears in, so the second branch
+    /// contributes nothing. That *understates* the work remaining, which makes
+    /// an impossible campaign look achievable — the exact failure this maths
+    /// exists to catch.
+    #[test]
+    fn a_diamond_dependency_counts_the_shared_ancestor_on_the_worst_branch() {
+        // D is behind B and C; both are behind A.
+        let c = with(vec![
+            tier("A", 100, &[]),
+            tier("B", 1, &["A"]),
+            tier("C", 50, &["A"]),
+            tier("D", 5, &["B", "C"]),
+        ]);
+
+        // Worst path is D -> C -> A: 5 + 50 + 100.
+        assert_eq!(
+            remaining_minutes(&c),
+            155,
+            "the shared ancestor must count on whichever branch is worst"
+        );
+    }
+
+    /// The same shape, with the long branch first, to prove the answer does
+    /// not depend on the order Twitch happens to list preconditions in.
+    #[test]
+    fn the_result_does_not_depend_on_precondition_order() {
+        let a = with(vec![
+            tier("A", 100, &[]),
+            tier("B", 1, &["A"]),
+            tier("C", 50, &["A"]),
+            tier("D", 5, &["B", "C"]),
+        ]);
+        let b = with(vec![
+            tier("A", 100, &[]),
+            tier("C", 50, &["A"]),
+            tier("B", 1, &["A"]),
+            tier("D", 5, &["C", "B"]),
+        ]);
+        assert_eq!(remaining_minutes(&a), remaining_minutes(&b));
+    }
+
+    #[test]
+    fn a_cycle_still_terminates() {
+        let c = with(vec![tier("a", 10, &["b"]), tier("b", 10, &["a"])]);
+        let _ = remaining_minutes(&c);
+    }
+
+    /// A deep chain must not be truncated by the cycle guard.
+    #[test]
+    fn a_long_chain_is_summed_in_full() {
+        let mut drops = vec![tier("t0", 10, &[])];
+        for i in 1..10 {
+            let prev = format!("t{}", i - 1);
+            drops.push(tier(&format!("t{i}"), 10, &[&prev]));
+        }
+        assert_eq!(remaining_minutes(&with(drops)), 100);
     }
 }

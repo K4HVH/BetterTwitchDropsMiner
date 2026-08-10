@@ -2088,3 +2088,77 @@ async fn an_event_campaign_can_be_mined_on_any_live_channel() {
         "an event campaign must be minable on a channel not streaming its game"
     );
 }
+
+/// Two campaigns sharing a game and an allow-listed channel must not resolve
+/// it twice, nor make it appear to serve the same campaign twice over.
+#[tokio::test]
+async fn a_shared_allow_listed_channel_is_resolved_once_and_counted_once() {
+    let fake = FakeTwitch::default();
+    let shared = channel("ch-small", "tinystreamer");
+    let mut a = campaign("c-a", true, vec![drop("d-a", 60, 0)]);
+    let mut b = campaign("c-b", true, vec![drop("d-b", 60, 0)]);
+    a.allowed_channels = vec![shared.clone()];
+    b.allowed_channels = vec![shared.clone()];
+    *fake.inventory.lock().unwrap() = vec![a, b];
+
+    // Live, but categorised under a different game, so the directory page for
+    // this campaign's game does not contain them — which is the whole reason
+    // direct lookup exists.
+    let mut elsewhere = stream("bc-1", true);
+    elsewhere.game = Some(Game {
+        id: GameId::from("g-other"),
+        name: "Something Else".into(),
+        slug: "something-else".into(),
+        box_art_url: None,
+    });
+    *fake.channels.lock().unwrap() = vec![(shared, elsewhere)];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-small".into(), vec![DropId::from("d-a"), DropId::from("d-b")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    assert_eq!(*e.api().stream_info_calls.lock().unwrap(), 1, "resolved once");
+    assert_eq!(
+        watch.campaigns.len(),
+        2,
+        "it genuinely advances two campaigns"
+    );
+    // The real regression: the same campaign listed twice would inflate the
+    // apparent coverage and corrupt the session's campaign list.
+    let mut unique = watch.campaigns.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), watch.campaigns.len(), "no duplicates");
+}
+
+/// A per-campaign cap is not a cap: twenty qualifying campaigns would each
+/// spend their own allowance and produce a request storm.
+#[tokio::test]
+async fn direct_lookups_are_capped_across_the_whole_pass() {
+    let fake = FakeTwitch::default();
+    let campaigns: Vec<_> = (0..20)
+        .map(|i| {
+            let mut c = campaign(&format!("c{i}"), true, vec![drop(&format!("d{i}"), 60, 0)]);
+            c.allowed_channels = (0..8)
+                .map(|j| channel(&format!("ch{i}-{j}"), &format!("streamer{i}-{j}")))
+                .collect();
+            c
+        })
+        .collect();
+    *fake.inventory.lock().unwrap() = campaigns;
+    *fake.channels.lock().unwrap() = vec![];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let calls = *e.api().stream_info_calls.lock().unwrap();
+    assert!(
+        calls <= 24,
+        "160 lookups in one pass is a request storm, made {calls}"
+    );
+}

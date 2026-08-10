@@ -64,6 +64,10 @@ pub struct EngineConfig {
     /// would be hundreds of requests, so the deeper directory page is used
     /// instead.
     pub max_direct_allow_list_lookups: usize,
+    /// A ceiling on those lookups across the whole pass. Without it, the
+    /// per-campaign limit is not a limit: twenty qualifying campaigns would
+    /// each spend their own allowance.
+    pub max_direct_lookups_per_pass: usize,
     /// Which selection strategy to use. See [`crate::strategy`].
     pub strategy: String,
     /// Channel logins to prefer when otherwise equal.
@@ -94,6 +98,7 @@ impl Default for EngineConfig {
             max_channels_per_campaign: 8,
             allow_list_channel_limit: 100,
             max_direct_allow_list_lookups: 8,
+            max_direct_lookups_per_pass: 24,
             strategy: "deadline".into(),
             favourites: Vec::new(),
             priority_games: Vec::new(),
@@ -1444,29 +1449,39 @@ impl<A: TwitchApi> Engine<A> {
         // handful of viewers. Asking about them by name is the only way to
         // find them, and these are exactly the exclusive campaigns users care
         // most about.
-        let direct: Vec<(usize, Channel)> = wants
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| {
-                !w.allowed.is_empty() && w.allowed.len() <= self.config.max_direct_allow_list_lookups
-            })
-            .flat_map(|(i, w)| {
-                let known: HashSet<&ChannelId> = channels_by_game
-                    .get(&w.game.id)
-                    .map(|list| list.iter().map(|(c, _)| &c.id).collect())
-                    .unwrap_or_default();
-                w.allowed_channels
-                    .iter()
-                    .filter(|c| !known.contains(&c.id))
-                    .filter(|c| !self.quarantine.is_quarantined(&c.id.0, now))
-                    .map(move |c| (i, c.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // Deduplicated by channel and globally capped. Two campaigns sharing
+        // a game and an allow-listed channel would otherwise resolve it twice
+        // and push it into that game's list twice — which then had the channel
+        // serving the same campaign twice over, inflating its apparent
+        // coverage. And a per-campaign cap is not a cap at all: twenty
+        // campaigns with eight allow-listed channels each is a hundred and
+        // sixty lookups.
+        let mut direct: BTreeMap<ChannelId, Channel> = BTreeMap::new();
+        for want in wants.iter() {
+            if want.allowed.is_empty()
+                || want.allowed.len() > self.config.max_direct_allow_list_lookups
+            {
+                continue;
+            }
+            let known: HashSet<&ChannelId> = channels_by_game
+                .get(&want.game.id)
+                .map(|list| list.iter().map(|(c, _)| &c.id).collect())
+                .unwrap_or_default();
+
+            for channel in &want.allowed_channels {
+                if known.contains(&channel.id)
+                    || self.quarantine.is_quarantined(&channel.id.0, now)
+                    || direct.len() >= self.config.max_direct_lookups_per_pass
+                {
+                    continue;
+                }
+                direct.insert(channel.id.clone(), channel.clone());
+            }
+        }
 
         if !direct.is_empty() {
-            let resolved: Vec<(usize, Channel, Option<Stream>)> =
-                futures_util::stream::iter(direct.into_iter().map(|(i, channel)| {
+            let resolved: Vec<(Channel, Option<Stream>)> =
+                futures_util::stream::iter(direct.into_values().map(|channel| {
                     let api = &self.api;
                     async move {
                         let stream = api.stream_info(&channel.login).await.unwrap_or_else(|e| {
@@ -1477,23 +1492,36 @@ impl<A: TwitchApi> Engine<A> {
                             );
                             None
                         });
-                        (i, channel, stream)
+                        (channel, stream)
                     }
                 }))
                 .buffer_unordered(self.config.check_concurrency.max(1))
                 .collect()
                 .await;
 
-            for (i, channel, stream) in resolved {
+            for (channel, stream) in resolved {
                 let Some(stream) = stream else { continue };
                 tracing::debug!(
                     channel = %channel.login,
                     "allow-listed channel found live outside the directory page"
                 );
-                channels_by_game
-                    .entry(wants[i].game.id.clone())
-                    .or_default()
-                    .push((channel, stream));
+                // Offered under whichever game it is actually streaming, if we
+                // are looking at that game; otherwise under every game whose
+                // allow-list names it. A channel resolved for one campaign
+                // must never be silently offered to an unrelated one.
+                let games: Vec<GameId> = wants
+                    .iter()
+                    .filter(|w| w.allowed.contains(&channel.id))
+                    .map(|w| w.game.id.clone())
+                    .collect();
+
+                for game in games {
+                    let list = channels_by_game.entry(game).or_default();
+                    if list.iter().any(|(c, _)| c.id == channel.id) {
+                        continue;
+                    }
+                    list.push((channel.clone(), stream.clone()));
+                }
             }
         }
 
