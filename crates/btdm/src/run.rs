@@ -207,11 +207,10 @@ pub async fn mine(
     }
 }
 
-/// Works one rung of the recovery ladder. Returns whether campaigns should be
-/// re-synced afterwards.
+/// Works one rung of the ladder.
 ///
-/// Every rung logs what it did and what it found, so a recovery is a readable
-/// story in the event log rather than an unexplained channel change.
+/// The mechanics live in the engine so they are testable against a fake; only
+/// the auth rung is handled here, because the engine holds no credentials.
 async fn work_recovery_rung(
     engine: &mut Engine<TwitchClient>,
     auth: &AuthClient,
@@ -219,57 +218,24 @@ async fn work_recovery_rung(
     step: RecoveryStep,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    tracing::warn!(?step, "no confirmed progress; working the recovery ladder");
+    let outcome = match engine.apply_recovery(step, now).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, ?step, "recovery rung failed");
+            return false;
+        }
+    };
 
-    match step {
-        RecoveryStep::ResendWatch => {
-            engine.force_next_watch();
-            false
-        }
-        RecoveryStep::RefreshStreamInfo => {
-            match engine.refresh_stream_info(now).await {
-                // The broadcast ID moved, so heartbeats were earning nothing.
-                Ok(true) => engine.force_next_watch(),
-                Ok(false) => tracing::debug!("stream info unchanged"),
-                Err(e) => tracing::warn!(error = %e, "could not refresh stream info"),
-            }
-            false
-        }
-        RecoveryStep::ReverifyEligibility => match engine.reverify_current_channel().await {
-            Ok(true) => {
-                tracing::info!("Twitch still says this channel progresses our drops");
-                false
-            }
-            Ok(false) => {
-                tracing::warn!("Twitch says this channel progresses nothing; leaving");
-                engine.quarantine_current(now);
-                true
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "re-verification failed");
-                false
-            }
-        },
-        RecoveryStep::SwitchChannel => {
-            engine.quarantine_current(now);
-            true
-        }
-        RecoveryStep::ResyncCampaigns => true,
-        RecoveryStep::ValidateAuth => {
-            match auth.validate(token).await {
-                Ok(v) => tracing::info!(login = %v.login, "token is still valid"),
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "token validation failed — mining cannot recover without a new login"
-                ),
-            }
-            false
-        }
-        RecoveryStep::QuarantineCampaign => {
-            engine.quarantine_current_campaign(now);
-            true
+    if outcome.validate_auth {
+        match auth.validate(token).await {
+            Ok(v) => tracing::info!(login = %v.login, "token is still valid"),
+            Err(e) => tracing::error!(
+                error = %e,
+                "token validation failed — mining cannot recover without a new login"
+            ),
         }
     }
+    outcome.resync
 }
 
 /// Owns the PubSub connection for the process lifetime, reconnecting forever

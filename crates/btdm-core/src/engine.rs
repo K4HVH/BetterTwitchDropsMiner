@@ -15,7 +15,7 @@ use crate::model::*;
 use crate::progress::ProgressTracker;
 use crate::snapshot::{self, RejectedView, Snapshot, Totals, WatchingView};
 use crate::strategy::{self, Candidate, Decision, MiningStrategy, WorldView};
-use crate::watchdog::{Quarantine, Verdict, Watchdog, WatchdogConfig};
+use crate::watchdog::{Quarantine, RecoveryStep, Verdict, Watchdog, WatchdogConfig};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 
@@ -57,6 +57,15 @@ impl Default for EngineConfig {
             watchdog: WatchdogConfig::default(),
         }
     }
+}
+
+/// What a recovery rung asks of the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    /// Campaigns should be re-fetched before the next selection.
+    pub resync: bool,
+    /// The caller should check the token; the engine cannot.
+    pub validate_auth: bool,
 }
 
 /// What the engine is currently doing, for display and for the watchdog.
@@ -282,6 +291,76 @@ impl<A: TwitchApi> Engine<A> {
             Err(e) => {
                 tracing::warn!(error = %e, "re-verification inconclusive");
                 Ok(true)
+            }
+        }
+    }
+
+    /// Works one rung of the recovery ladder.
+    ///
+    /// Everything the ladder does that only needs the Twitch API lives here so
+    /// it can be tested against a scripted fake; the caller handles only the
+    /// auth rung, which needs credentials the engine does not hold.
+    pub async fn apply_recovery(
+        &mut self,
+        step: RecoveryStep,
+        now: DateTime<Utc>,
+    ) -> Result<RecoveryOutcome, ApiError> {
+        tracing::warn!(?step, "no confirmed progress; working the recovery ladder");
+
+        match step {
+            RecoveryStep::ResendWatch => {
+                self.force_next_watch();
+                Ok(RecoveryOutcome::default())
+            }
+            RecoveryStep::RefreshStreamInfo => {
+                match self.refresh_stream_info(now).await {
+                    // The broadcast id moved, so heartbeats were earning nothing.
+                    Ok(true) => self.force_next_watch(),
+                    Ok(false) => tracing::debug!("stream info unchanged"),
+                    Err(e) => tracing::warn!(error = %e, "could not refresh stream info"),
+                }
+                Ok(RecoveryOutcome::default())
+            }
+            RecoveryStep::ReverifyEligibility => match self.reverify_current_channel().await {
+                Ok(true) => {
+                    tracing::info!("Twitch still says this channel progresses our drops");
+                    Ok(RecoveryOutcome::default())
+                }
+                Ok(false) => {
+                    tracing::warn!("Twitch says this channel progresses nothing; leaving");
+                    self.quarantine_current(now);
+                    Ok(RecoveryOutcome {
+                        resync: true,
+                        ..Default::default()
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "re-verification failed");
+                    Ok(RecoveryOutcome::default())
+                }
+            },
+            RecoveryStep::SwitchChannel => {
+                self.quarantine_current(now);
+                Ok(RecoveryOutcome {
+                    resync: true,
+                    ..Default::default()
+                })
+            }
+            RecoveryStep::ResyncCampaigns => Ok(RecoveryOutcome {
+                resync: true,
+                ..Default::default()
+            }),
+            // The engine holds no credentials, so the caller does this one.
+            RecoveryStep::ValidateAuth => Ok(RecoveryOutcome {
+                validate_auth: true,
+                ..Default::default()
+            }),
+            RecoveryStep::QuarantineCampaign => {
+                self.quarantine_current_campaign(now);
+                Ok(RecoveryOutcome {
+                    resync: true,
+                    ..Default::default()
+                })
             }
         }
     }

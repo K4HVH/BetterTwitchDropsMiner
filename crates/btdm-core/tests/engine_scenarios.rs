@@ -724,3 +724,168 @@ async fn unlinked_campaigns_are_still_reported_as_rejected() {
     assert!(snap.rejected.iter().all(|r| r.reason == "NotLinked"));
     assert_eq!(*e.api().detail_fetches.lock().unwrap(), 0, "still no requests spent");
 }
+
+// ---------------------------------------------------------------------------
+// Recovery ladder mechanics
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn resend_watch_forces_a_heartbeat_before_the_interval() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+    assert_eq!(e.api().watches_sent.lock().unwrap().len(), 1);
+
+    // Without the rung, no heartbeat is due for another minute.
+    e.apply_recovery(RecoveryStep::ResendWatch, now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+    assert_eq!(e.api().watches_sent.lock().unwrap().len(), 2);
+}
+
+/// A restarted broadcast keeps earning nothing while looking healthy, so the
+/// rung has to notice the id changed and re-send against the new one.
+#[tokio::test]
+async fn refreshing_stream_info_picks_up_a_restarted_broadcast() {
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    // The stream restarts under us with a new broadcast id.
+    *e.api().channels.lock().unwrap() =
+        vec![(channel("ch1", "streamer1"), stream("bc-RESTARTED", true))];
+
+    e.apply_recovery(RecoveryStep::RefreshStreamInfo, now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+    assert_eq!(
+        e.api().watches_sent.lock().unwrap().len(),
+        2,
+        "a changed broadcast id must trigger an immediate re-send"
+    );
+}
+
+#[tokio::test]
+async fn refreshing_stream_info_leaves_an_offline_channel() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    e.api().channels.lock().unwrap().clear(); // channel went offline
+    e.apply_recovery(RecoveryStep::RefreshStreamInfo, now()).await.unwrap();
+    assert!(e.current_channel().is_none());
+}
+
+#[tokio::test]
+async fn reverifying_leaves_a_channel_twitch_says_earns_nothing() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current_channel().is_some());
+
+    // Twitch changes its mind about this channel.
+    e.api().available.lock().unwrap().clear();
+
+    let outcome = e
+        .apply_recovery(RecoveryStep::ReverifyEligibility, now())
+        .await
+        .unwrap();
+    assert!(e.current_channel().is_none());
+    assert!(outcome.resync, "a fresh look at the world is needed");
+}
+
+#[tokio::test]
+async fn reverifying_keeps_a_channel_twitch_still_endorses() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    e.apply_recovery(RecoveryStep::ReverifyEligibility, now())
+        .await
+        .unwrap();
+    assert!(
+        e.current_channel().is_some(),
+        "an endorsed channel must not be abandoned"
+    );
+}
+
+/// An inconclusive check is not proof of failure, so it must not cost the
+/// channel its slot.
+#[tokio::test]
+async fn an_inconclusive_reverification_keeps_the_channel() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    *e.api().fail_available_drops.lock().unwrap() = true;
+    e.apply_recovery(RecoveryStep::ReverifyEligibility, now())
+        .await
+        .unwrap();
+    assert!(e.current_channel().is_some());
+}
+
+#[tokio::test]
+async fn switching_channel_quarantines_and_asks_for_a_resync() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let outcome = e.apply_recovery(RecoveryStep::SwitchChannel, now()).await.unwrap();
+    assert!(e.current_channel().is_none());
+    assert!(outcome.resync);
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "the quarantined channel must not be picked straight back up"
+    );
+}
+
+/// The engine holds no credentials, so this rung delegates rather than
+/// silently doing nothing.
+#[tokio::test]
+async fn the_auth_rung_asks_the_caller_to_check() {
+    let mut e = engine(happy_path());
+    let outcome = e.apply_recovery(RecoveryStep::ValidateAuth, now()).await.unwrap();
+    assert!(outcome.validate_auth);
+    assert!(!outcome.resync);
+}
+
+#[tokio::test]
+async fn quarantining_the_campaign_stops_it_being_reselected() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let outcome = e
+        .apply_recovery(RecoveryStep::QuarantineCampaign, now())
+        .await
+        .unwrap();
+    assert!(outcome.resync);
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+}
+
+/// End to end: a channel that confirms nothing is escalated, and the ladder
+/// eventually moves the miner off it entirely.
+#[tokio::test]
+async fn a_silent_channel_is_eventually_abandoned_by_the_ladder() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    let mut t = 400;
+    let mut rungs = 0;
+    while e.current_channel().is_some() && rungs < RecoveryStep::LADDER.len() {
+        let at = now() + chrono::Duration::seconds(t);
+        if let Verdict::Escalate(step) = e.assess_health(at) {
+            e.apply_recovery(step, at).await.unwrap();
+            rungs += 1;
+        }
+        t += 61;
+    }
+
+    assert!(
+        e.current_channel().is_none(),
+        "the ladder must not leave the miner parked on a channel earning nothing"
+    );
+}
