@@ -23,12 +23,17 @@ pub struct FakeTwitch {
     pub available: Mutex<HashMap<String, Vec<DropId>>>,
     pub progress: Mutex<Option<DropProgress>>,
     pub watches_sent: Mutex<Vec<ChannelId>>,
+    /// Successful claims only.
     pub claims: Mutex<Vec<String>>,
+    /// Every claim attempt, successful or not.
+    pub claim_attempts: Mutex<usize>,
     pub point_claims: Mutex<Vec<String>>,
     /// When set, every call fails with this error.
     pub fail_with: Mutex<Option<ApiError>>,
     /// When set, only `available_drops` fails.
     pub fail_available_drops: Mutex<bool>,
+    /// When set, only the campaign dashboard listing fails.
+    pub fail_campaign_list: Mutex<bool>,
     /// When set, Twitch refuses every claim.
     pub fail_claims: Mutex<bool>,
     pub detail_fetches: Mutex<usize>,
@@ -50,6 +55,9 @@ impl FakeTwitch {
 impl TwitchApi for FakeTwitch {
     async fn fetch_campaigns(&self) -> Result<Vec<DropCampaign>, ApiError> {
         self.guard()?;
+        if *self.fail_campaign_list.lock().unwrap() {
+            return Err(ApiError::Network("campaign dashboard exploded".into()));
+        }
         Ok(self.offered.lock().unwrap().clone())
     }
 
@@ -127,6 +135,7 @@ impl TwitchApi for FakeTwitch {
         claim_id: Option<&str>,
     ) -> Result<(), ApiError> {
         self.guard()?;
+        *self.claim_attempts.lock().unwrap() += 1;
         if *self.fail_claims.lock().unwrap() {
             return Err(ApiError::Malformed("Twitch refused the claim".into()));
         }

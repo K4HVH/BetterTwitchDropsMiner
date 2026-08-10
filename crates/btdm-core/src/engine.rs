@@ -194,6 +194,9 @@ pub struct Engine<A: TwitchApi> {
     reselect_forced: bool,
     /// The rung being worked, for display.
     recovery_step: Option<RecoveryStep>,
+    /// Drops whose claim Twitch has refused, and when to try again. Without
+    /// this, an `INELIGIBLE` verdict was re-sent on every tick forever.
+    claim_backoff: HashMap<DropId, (DateTime<Utc>, u32)>,
 }
 
 impl<A: TwitchApi> Engine<A> {
@@ -248,6 +251,7 @@ impl<A: TwitchApi> Engine<A> {
             last_selection: None,
             reselect_forced: false,
             recovery_step: None,
+            claim_backoff: HashMap::new(),
         }
     }
 
@@ -1054,10 +1058,12 @@ impl<A: TwitchApi> Engine<A> {
         let in_progress = merged.len();
 
         // The dashboard is advisory: if it fails we still mine what we know.
+        let mut dashboard_ok = true;
         let offered = match self.api.fetch_campaigns().await {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "campaign dashboard unavailable; using inventory only");
+                dashboard_ok = false;
                 Vec::new()
             }
         };
@@ -1164,7 +1170,13 @@ impl<A: TwitchApi> Engine<A> {
         // them grows without bound and stops matching anything. Drop entries
         // for campaigns Twitch no longer offers at all — the dashboard's
         // per-row "hide" button makes accumulating dead ids the normal path.
-        if !self.excluded_campaigns.is_empty() {
+        //
+        // Only ever from a *complete* view. A campaign the user excluded
+        // before ever watching it exists only in the dashboard listing, never
+        // in the inventory, so pruning after a failed `fetch_campaigns` would
+        // decide it had vanished and forget the exclusion — and the miner
+        // would then start mining something the user explicitly turned off.
+        if dashboard_ok && !self.excluded_campaigns.is_empty() {
             let known: HashSet<&str> = eligible
                 .iter()
                 .chain(recently_ended.iter())
@@ -1920,6 +1932,13 @@ impl<A: TwitchApi> Engine<A> {
             .chain(self.recently_ended.iter())
             .flat_map(|c| c.drops.iter().map(move |d| (c, d)))
             .filter(|(_, d)| d.is_claimable())
+            // A claim Twitch has already refused is rested rather than re-sent
+            // every minute for the life of the campaign.
+            .filter(|(_, d)| {
+                self.claim_backoff
+                    .get(&d.id)
+                    .is_none_or(|(until, _)| now >= *until)
+            })
             .map(|(c, d)| (c.id.clone(), d.id.clone(), d.claim_id.clone(), d.name.clone()))
             .collect();
 
@@ -1931,15 +1950,29 @@ impl<A: TwitchApi> Engine<A> {
                 .claim_drop(&drop_id, &campaign_id, claim_id.as_deref())
                 .await
             {
+                let strikes = self
+                    .claim_backoff
+                    .get(&drop_id)
+                    .map_or(1, |(_, n)| n.saturating_add(1));
+                // 1, 2, 4 ... minutes, capped. A refusal that is permanent
+                // must not become a permanent trickle of requests.
+                let wait = Duration::minutes((1i64 << strikes.min(8)).min(120));
+                self.claim_backoff
+                    .insert(drop_id.clone(), (now + wait, strikes));
+
                 tracing::warn!(
                     drop = %drop_id,
                     error = %e,
+                    retry_in_mins = wait.num_minutes(),
                     "claim refused; leaving it unclaimed so it is retried"
                 );
                 self.emit(
                     now,
                     EventKind::Notice {
-                        message: format!("Could not claim {name}: {e}. It will be retried."),
+                        message: format!(
+                            "Could not claim {name}: {e}. Retrying in {} minutes.",
+                            wait.num_minutes()
+                        ),
                         severity: Severity::Warn,
                     },
                 );
@@ -1958,6 +1991,7 @@ impl<A: TwitchApi> Engine<A> {
                     d.claim_id = None;
                 }
             }
+            self.claim_backoff.remove(&drop_id);
             self.emit(now, EventKind::DropClaimed { drop: drop_id, name });
         }
         Ok(())

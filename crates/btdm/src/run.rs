@@ -15,7 +15,7 @@ use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
 use btdm_web::Hub;
 use chrono::{Duration, Utc};
 use std::time::Duration as StdDuration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// How often the access token is re-validated.
 const AUTH_CHECK_INTERVAL: Duration = Duration::minutes(60);
@@ -178,9 +178,11 @@ pub async fn mine(
         report_status(&engine, now);
         publish(&engine, account, &validated.login, hub.as_ref());
 
+        // Never awaited: the supervisor stops polling this while it reconnects,
+        // and blocking the main loop here would stall mining and Ctrl-C alike.
         let watching = engine.current_channel().map(|c| c.id.clone());
         if watching != followed {
-            let _ = pubsub_follow.send(watching.clone()).await;
+            let _ = pubsub_follow.send(watching.clone());
             followed = watching;
         }
 
@@ -330,12 +332,22 @@ async fn work_recovery_rung(
 fn spawn_pubsub_supervisor(
     token: String,
     user_id: String,
-) -> (mpsc::Receiver<PubSubMessage>, mpsc::Sender<Option<ChannelId>>) {
+) -> (
+    mpsc::Receiver<PubSubMessage>,
+    watch::Sender<Option<ChannelId>>,
+) {
     let (tx, rx) = mpsc::channel(128);
-    // Which channel's stream state to follow. Sent by the main loop whenever
-    // the watched channel changes, so we hear the moment a stream ends rather
-    // than discovering it from the watchdog minutes later.
-    let (watch_tx, mut watch_rx) = mpsc::channel::<Option<ChannelId>>(8);
+    // Which channel's stream state to follow, so we hear the moment a stream
+    // ends rather than discovering it from the watchdog minutes later.
+    //
+    // A `watch` rather than a bounded queue, because only the latest value
+    // means anything and sending must never block. With a bounded `mpsc`, this
+    // receiver stops being polled during a reconnect backoff — and once eight
+    // channel changes had queued up during a PubSub outage, the main loop's
+    // `send().await` blocked forever, taking Ctrl-C down with it. That is the
+    // exact failure this supervisor was extracted to prevent, reintroduced
+    // through backpressure.
+    let (watch_tx, mut watch_rx) = watch::channel::<Option<ChannelId>>(None);
 
     tokio::spawn(async move {
         let base = vec![
@@ -343,8 +355,6 @@ fn spawn_pubsub_supervisor(
             Topic::UserPoints.as_str(&user_id),
         ];
         let mut backoff = StdDuration::from_secs(1);
-        // Survives reconnection, so the subscription is restored automatically.
-        let mut followed: Option<ChannelId> = None;
 
         loop {
             match pubsub::connect(pubsub::PUBSUB_URL, &token, base.clone()).await {
@@ -352,14 +362,21 @@ fn spawn_pubsub_supervisor(
                     tracing::info!("pubsub connected");
                     backoff = StdDuration::from_secs(1);
 
+                    // Whatever the miner wants followed *now*, which may have
+                    // changed several times while we were disconnected.
+                    let mut followed = watch_rx.borrow_and_update().clone();
                     if let Some(id) = &followed {
                         socket.listen(vec![Topic::StreamState.as_str(&id.0)]).await;
                     }
 
                     loop {
                         tokio::select! {
-                            change = watch_rx.recv() => {
-                                let Some(next) = change else { return };
+                            changed = watch_rx.changed() => {
+                                // An error means the miner has shut down.
+                                if changed.is_err() {
+                                    return;
+                                }
+                                let next = watch_rx.borrow_and_update().clone();
                                 if next == followed {
                                     continue;
                                 }

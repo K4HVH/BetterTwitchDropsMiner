@@ -576,9 +576,12 @@
     f2.style.marginBottom = "0";
     f2.append(el("label", null, "Pinned channel"));
     const pinRow = el("div", "row");
-    const submitPin = (value) => {
-      clearDraft("pin-input");
-      send(acct, { command: "pin", channel: value || null });
+    // The draft is only forgotten once the miner has accepted the command;
+    // clearing it first meant a failed submit silently lost what was typed.
+    const submitPin = async (value) => {
+      if (await send(acct, { command: "pin", channel: value || null })) {
+        clearDraft("pin-input");
+      }
     };
     const pin = draftInput("pin-input", "channel login", s.settings.pinned, submitPin);
     pin.style.flex = "1 1 140px";
@@ -925,10 +928,13 @@
     p1.append(chips);
 
     const addRow = el("div", "row");
-    const doAdd = (v) => {
+    const doAdd = async (v) => {
       if (!v) return;
-      clearDraft("priority-input");
-      send(acct, { command: "set_priority_games", games: [...s.settings.priority_games, v] });
+      const ok = await send(acct, {
+        command: "set_priority_games",
+        games: [...s.settings.priority_games, v],
+      });
+      if (ok) clearDraft("priority-input");
     };
     const gameInput = draftInput(
       "priority-input", "Game name, exactly as Twitch spells it", "", doAdd);
@@ -978,10 +984,11 @@
     p3.append(exChips);
 
     const exRow = el("div", "row");
-    const doExclude = (v) => {
+    const doExclude = async (v) => {
       if (!v) return;
-      clearDraft("exclude-input");
-      send(acct, { command: "set_game_excluded", game: v, excluded: true });
+      if (await send(acct, { command: "set_game_excluded", game: v, excluded: true })) {
+        clearDraft("exclude-input");
+      }
     };
     const exInput = draftInput("exclude-input", "Game name", "", doExclude);
     exInput.style.flex = "1 1 220px";
