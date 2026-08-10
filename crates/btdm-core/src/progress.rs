@@ -22,6 +22,9 @@ pub struct ConfirmedProgress {
 pub struct ProgressTracker {
     drops: HashMap<DropId, ConfirmedProgress>,
     last_advance: Option<DateTime<Utc>>,
+    /// Which drop last advanced. Displaying any other drop's numbers would be
+    /// a different flavour of the same lie this module exists to prevent.
+    last_drop: Option<DropId>,
     /// When the current watch session began, so a stall can be measured even
     /// before the first confirmation ever arrives.
     started_at: Option<DateTime<Utc>>,
@@ -48,6 +51,7 @@ impl ProgressTracker {
         };
 
         if advanced {
+            self.last_drop = Some(p.drop_id.clone());
             self.drops.insert(
                 p.drop_id,
                 ConfirmedProgress {
@@ -59,6 +63,13 @@ impl ProgressTracker {
             self.last_advance = Some(at);
         }
         advanced
+    }
+
+    /// The drop that most recently advanced, with its confirmed figures. This
+    /// is the only drop whose numbers are safe to display as "current".
+    pub fn active(&self) -> Option<(&DropId, &ConfirmedProgress)> {
+        let id = self.last_drop.as_ref()?;
+        Some((id, self.drops.get(id)?))
     }
 
     pub fn confirmed(&self, drop: &DropId) -> Option<&ConfirmedProgress> {
@@ -90,6 +101,7 @@ impl ProgressTracker {
     pub fn reset(&mut self) {
         self.drops.clear();
         self.last_advance = None;
+        self.last_drop = None;
         self.started_at = None;
     }
 }
@@ -181,6 +193,53 @@ mod tests {
         t.record(progress(5), at(1));
         assert!(!t.is_stalled(at(5), Duration::minutes(6)));
         assert!(t.is_stalled(at(8), Duration::minutes(6)));
+    }
+
+    /// Displaying a drop other than the one actually advancing is the same
+    /// class of lie as a progress bar that moves without progress. Observed
+    /// live: the status line showed 159/240 for one drop while the drop being
+    /// confirmed was at 161/180.
+    #[test]
+    fn active_reports_the_drop_that_most_recently_advanced() {
+        let mut t = ProgressTracker::new();
+        t.record(progress(5), at(0));
+        t.record(
+            DropProgress {
+                drop_id: DropId::from("d2"),
+                current_minutes: 161,
+                required_minutes: 180,
+            },
+            at(1),
+        );
+
+        let (id, confirmed) = t.active().expect("something has advanced");
+        assert_eq!(id, &DropId::from("d2"));
+        assert_eq!(confirmed.current_minutes, 161);
+        assert_eq!(confirmed.required_minutes, 180);
+    }
+
+    #[test]
+    fn active_is_none_before_anything_is_confirmed() {
+        let mut t = ProgressTracker::new();
+        t.begin(at(0));
+        assert!(t.active().is_none());
+    }
+
+    #[test]
+    fn a_rejected_reading_does_not_change_which_drop_is_active() {
+        let mut t = ProgressTracker::new();
+        t.record(progress(10), at(0));
+        t.record(
+            DropProgress {
+                drop_id: DropId::from("d2"),
+                current_minutes: 50,
+                required_minutes: 60,
+            },
+            at(1),
+        );
+        // A stale replay for d1 must not steal the active slot.
+        t.record(progress(4), at(2));
+        assert_eq!(t.active().unwrap().0, &DropId::from("d2"));
     }
 
     #[test]
