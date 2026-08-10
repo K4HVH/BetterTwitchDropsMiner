@@ -2,6 +2,7 @@
 //! engine above it is pure logic.
 
 use crate::gql::GqlClient;
+use crate::TwitchError;
 use crate::operations as ops;
 use crate::parse;
 use crate::watch::WatchClient;
@@ -9,6 +10,10 @@ use btdm_core::api::{ApiError, DropProgress, TwitchApi};
 use btdm_core::model::*;
 use serde_json::json;
 use tokio::sync::Mutex;
+
+/// Operations per batched request. The reference implementation uses the same
+/// figure, and Twitch closes a connection carrying much more.
+const BATCH_SIZE: usize = 20;
 
 pub struct TwitchClient {
     gql: GqlClient,
@@ -83,6 +88,93 @@ impl TwitchApi for TwitchClient {
             .run(&ops::AVAILABLE_DROPS, json!({ "channelID": channel.0 }))
             .await?;
         Ok(parse::parse_available_drops(&data))
+    }
+
+    /// Batched: one HTTP request for up to `BATCH_SIZE` campaigns.
+    async fn campaign_details_many(
+        &self,
+        ids: &[CampaignId],
+    ) -> Vec<(CampaignId, Result<Option<DropCampaign>, ApiError>)> {
+        let mut out = Vec::with_capacity(ids.len());
+
+        for group in ids.chunks(BATCH_SIZE) {
+            let batch: Vec<(&crate::gql::GqlOperation, serde_json::Value)> = group
+                .iter()
+                .map(|id| {
+                    (
+                        &ops::CAMPAIGN_DETAILS,
+                        json!({ "dropID": id.0, "channelLogin": self.login }),
+                    )
+                })
+                .collect();
+
+            match self.gql.run_many(&batch).await {
+                Ok(results) => {
+                    for (id, result) in group.iter().zip(results) {
+                        let parsed = match result {
+                            Ok(data) => parse::parse_campaign_details(&data).map_err(Into::into),
+                            Err(TwitchError::StaleQueryHash) => self.campaign_details(id).await,
+                            Err(e) => Err(e.into()),
+                        };
+                        out.push((id.clone(), parsed));
+                    }
+                }
+                Err(e) => {
+                    let error: ApiError = e.into();
+                    for id in group {
+                        out.push((id.clone(), Err(error.clone())));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Batched: one HTTP request for up to `BATCH_SIZE` channels.
+    async fn available_drops_many(
+        &self,
+        channels: &[ChannelId],
+    ) -> Vec<(ChannelId, Result<Vec<DropId>, ApiError>)> {
+        let mut out = Vec::with_capacity(channels.len());
+
+        for group in channels.chunks(BATCH_SIZE) {
+            let batch: Vec<(&crate::gql::GqlOperation, serde_json::Value)> = group
+                .iter()
+                .map(|c| {
+                    (
+                        &ops::AVAILABLE_DROPS,
+                        json!({ "channelID": c.0, "channelLogin": "" }),
+                    )
+                })
+                .collect();
+
+            match self.gql.run_many(&batch).await {
+                Ok(results) => {
+                    for (channel, result) in group.iter().zip(results) {
+                        let parsed = match result {
+                            Ok(data) => Ok(parse::parse_available_drops(&data)),
+                            // A stale persisted hash needs the raw-query
+                            // fallback, which only the single-operation path
+                            // has. Falling back for just this one is cheaper
+                            // than abandoning the batch.
+                            Err(TwitchError::StaleQueryHash) => {
+                                self.available_drops(channel).await
+                            }
+                            Err(e) => Err(e.into()),
+                        };
+                        out.push((channel.clone(), parsed));
+                    }
+                }
+                // The batch itself failed, so nothing in it was answered.
+                Err(e) => {
+                    let error: ApiError = e.into();
+                    for channel in group {
+                        out.push((channel.clone(), Err(error.clone())));
+                    }
+                }
+            }
+        }
+        out
     }
 
     async fn live_channels(

@@ -35,6 +35,62 @@ pub struct GqlClient {
     http: reqwest::Client,
     token: Option<String>,
     endpoint: String,
+    limiter: RateLimiter,
+}
+
+/// A token bucket over the whole client.
+///
+/// Twitch's GraphQL endpoint is, in the reference implementation's own words,
+/// "pretty volatile and breaks everything if one runs into their rate limit".
+/// A selection pass can fire well over a hundred requests, so this is the
+/// difference between being fast and being throttled.
+#[derive(Debug)]
+struct RateLimiter {
+    inner: tokio::sync::Mutex<Bucket>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    last: tokio::time::Instant,
+}
+
+/// Requests per second. The reference implementation uses the same figure and
+/// warns against changing it.
+const RATE_PER_SECOND: f64 = 5.0;
+/// How many may be spent at once before the rate applies.
+const BURST: f64 = 5.0;
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(Bucket {
+                tokens: BURST,
+                last: tokio::time::Instant::now(),
+            }),
+        }
+    }
+
+    /// Waits until a request may be sent.
+    async fn acquire(&self) {
+        loop {
+            let wait = {
+                let mut bucket = self.inner.lock().await;
+                let now = tokio::time::Instant::now();
+                let elapsed = now.duration_since(bucket.last).as_secs_f64();
+                bucket.last = now;
+                bucket.tokens = (bucket.tokens + elapsed * RATE_PER_SECOND).min(BURST);
+
+                if bucket.tokens >= 1.0 {
+                    bucket.tokens -= 1.0;
+                    return;
+                }
+                // How long until one token is available.
+                Duration::from_secs_f64((1.0 - bucket.tokens) / RATE_PER_SECOND)
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
 }
 
 impl GqlClient {
@@ -48,7 +104,55 @@ impl GqlClient {
             http,
             token,
             endpoint,
+            limiter: RateLimiter::new(),
         }
+    }
+
+    /// Runs several operations in one HTTP request.
+    ///
+    /// Twitch's endpoint accepts an array and answers with one in the same
+    /// order. A selection pass that checked 160 channels used to be 160
+    /// separate requests; batched, it is eight. Results are per operation, so
+    /// one failure does not discard the rest.
+    ///
+    /// A stale persisted hash is reported per item rather than retried here —
+    /// the caller re-runs just that operation through [`GqlClient::run`],
+    /// which has the raw-query fallback.
+    pub async fn run_many(
+        &self,
+        ops: &[(&GqlOperation, Value)],
+    ) -> Result<Vec<Result<Value, TwitchError>>, TwitchError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let body: Vec<Value> = ops
+            .iter()
+            .map(|(op, variables)| {
+                json!({
+                    "operationName": op.name,
+                    "variables": variables,
+                    "extensions": {
+                        "persistedQuery": { "version": 1, "sha256Hash": op.sha256 }
+                    },
+                })
+            })
+            .collect();
+
+        let response = self.post_raw(&Value::Array(body)).await?;
+        let array = response
+            .as_array()
+            .ok_or_else(|| TwitchError::Malformed("batched response was not an array".into()))?;
+
+        if array.len() != ops.len() {
+            return Err(TwitchError::Malformed(format!(
+                "asked for {} operations and got {} answers",
+                ops.len(),
+                array.len()
+            )));
+        }
+
+        Ok(array.iter().map(extract_data).collect())
     }
 
     /// Runs `op`, returning its `data` object.
@@ -114,7 +218,35 @@ impl GqlClient {
         }
     }
 
+    /// A single operation's response, unwrapped to its `data` object.
     async fn post_once(&self, body: &Value) -> Result<Value, TwitchError> {
+        extract_data(&self.post_raw_once(body).await?)
+    }
+
+    /// As [`GqlClient::post`], but returns the envelope untouched so a batched
+    /// array can be split apart by the caller.
+    async fn post_raw(&self, body: &Value) -> Result<Value, TwitchError> {
+        let mut delay = FIRST_RETRY_DELAY;
+        let mut attempt = 0usize;
+
+        loop {
+            match self.post_raw_once(body).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if attempt >= MAX_RETRIES || !is_transient(&e) {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    tracing::debug!(error = %e, attempt, "transient failure; retrying batch");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(MAX_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    async fn post_raw_once(&self, body: &Value) -> Result<Value, TwitchError> {
+        self.limiter.acquire().await;
         let mut req = self
             .http
             .post(&self.endpoint)
@@ -144,29 +276,32 @@ impl GqlClient {
             s => return Err(TwitchError::Network(format!("HTTP {s}"))),
         }
 
-        let json: Value = resp
-            .json()
+        resp.json()
             .await
-            .map_err(|e| TwitchError::Malformed(e.to_string()))?;
-
-        if let Some(errors) = json.get("errors").and_then(Value::as_array)
-            && !errors.is_empty()
-        {
-            let stale = errors.iter().any(|e| {
-                e.get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| m.contains("PersistedQueryNotFound"))
-            });
-            return Err(if stale {
-                TwitchError::StaleQueryHash
-            } else {
-                TwitchError::Gql(errors.to_vec())
-            });
-        }
-
-        json.get("data")
-            .filter(|v| !v.is_null())
-            .cloned()
-            .ok_or_else(|| TwitchError::Malformed("response had no `data`".into()))
+            .map_err(|e| TwitchError::Malformed(e.to_string()))
     }
+}
+
+/// Pulls `data` out of one GraphQL envelope, turning its `errors` into ours.
+fn extract_data(envelope: &Value) -> Result<Value, TwitchError> {
+    if let Some(errors) = envelope.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        let stale = errors.iter().any(|e| {
+            e.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("PersistedQueryNotFound"))
+        });
+        return Err(if stale {
+            TwitchError::StaleQueryHash
+        } else {
+            TwitchError::Gql(errors.to_vec())
+        });
+    }
+
+    envelope
+        .get("data")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .ok_or_else(|| TwitchError::Malformed("response had no `data`".into()))
 }

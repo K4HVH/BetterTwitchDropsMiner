@@ -131,3 +131,81 @@ async fn client_errors_are_not_retried() {
     assert!(api.fetch_inventory().await.is_err());
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Batching and rate limiting
+// ---------------------------------------------------------------------------
+
+/// A selection pass asks about every live channel. One request per channel is
+/// both slower and far likelier to be throttled.
+#[tokio::test]
+async fn availability_checks_are_batched_into_one_request() {
+    // Twenty answers in one array, matching the twenty operations sent.
+    let body: &'static str = Box::leak(
+        format!(
+            "[{}]",
+            (0..20)
+                .map(|_| r#"{"data":{"channel":{"viewerDropCampaigns":[]}}}"#)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .into_boxed_str(),
+    );
+
+    let (url, hits) = server(vec![], body).await;
+    let api = client(url);
+
+    let channels: Vec<btdm_core::model::ChannelId> = (0..20)
+        .map(|i| btdm_core::model::ChannelId::from(&format!("ch{i}")[..]))
+        .collect();
+
+    let answers = api.available_drops_many(&channels).await;
+
+    assert_eq!(answers.len(), 20, "every channel gets an answer");
+    assert!(answers.iter().all(|(_, r)| r.is_ok()));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "twenty channels must be one request, not twenty"
+    );
+}
+
+/// A batch that fails wholesale must report a failure for each channel in it
+/// rather than silently answering "no drops available", which would look like
+/// a channel that earns nothing and get it skipped.
+#[tokio::test]
+async fn a_failed_batch_reports_failure_per_channel() {
+    let (url, _) = server(vec![500, 500, 500, 500, 500, 500], "[]").await;
+    let api = client(url);
+
+    let channels: Vec<btdm_core::model::ChannelId> =
+        (0..3).map(|i| btdm_core::model::ChannelId::from(&format!("ch{i}")[..])).collect();
+
+    let answers = api.available_drops_many(&channels).await;
+    assert_eq!(answers.len(), 3);
+    assert!(
+        answers.iter().all(|(_, r)| r.is_err()),
+        "an unanswered check must not read as 'earns nothing'"
+    );
+}
+
+/// Twitch's GraphQL endpoint punishes bursts. The reference implementation
+/// caps at five a second and warns against changing it.
+#[tokio::test]
+async fn requests_are_rate_limited() {
+    let (url, hits) = server(vec![], EMPTY_INVENTORY).await;
+    let api = client(url);
+
+    let started = std::time::Instant::now();
+    for _ in 0..12 {
+        let _ = api.fetch_inventory().await;
+    }
+    let elapsed = started.elapsed();
+
+    assert_eq!(hits.load(Ordering::SeqCst), 12);
+    // Five of burst, then seven more at five a second: at least ~1.4s.
+    assert!(
+        elapsed.as_millis() >= 1_000,
+        "twelve requests went out in {elapsed:?}, which is faster than the cap"
+    );
+}

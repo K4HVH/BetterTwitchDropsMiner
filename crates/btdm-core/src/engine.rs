@@ -1120,6 +1120,7 @@ impl<A: TwitchApi> Engine<A> {
         };
 
         let mut fetched = 0usize;
+        let mut wanted_details: Vec<CampaignId> = Vec::new();
         let mut skipped_unlinked = 0usize;
         let mut unlinked: Vec<RejectedView> = Vec::new();
         for campaign in offered {
@@ -1152,14 +1153,19 @@ impl<A: TwitchApi> Engine<A> {
                 break;
             }
             fetched += 1;
+            wanted_details.push(campaign.id.clone());
+        }
 
-            match self.api.campaign_details(&campaign.id).await {
+        // Batched: against a real account this is a couple of dozen campaigns,
+        // and asking about them one at a time was most of a sync's wall time.
+        for (id, result) in self.api.campaign_details_many(&wanted_details).await {
+            match result {
                 Ok(Some(full)) => {
                     merged.insert(full.id.clone(), full);
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(campaign = %campaign.id, error = %e, "campaign details failed");
+                    tracing::warn!(campaign = %id, error = %e, "campaign details failed");
                 }
             }
         }
@@ -1680,24 +1686,32 @@ impl<A: TwitchApi> Engine<A> {
         work.truncate(budget);
         let checks = work.len();
 
-        // Run the checks concurrently.
+        // One request per twenty channels, rather than one per channel.
         //
-        // These were sequential, and against a real account 60 of them took 27
-        // seconds — during which the miner was watching nothing at all. They
-        // are independent read-only requests, so the only reason to serialise
-        // them was that nobody had made them concurrent. The cap keeps us from
-        // opening a hundred sockets at Twitch in one burst.
-        let results: Vec<(ChannelWork, Result<Vec<DropId>, ApiError>)> =
-            futures_util::stream::iter(work.into_iter().map(|item| {
-                let api = &self.api;
-                async move {
-                    let outcome = api.available_drops(&item.channel.id).await;
-                    (item, outcome)
-                }
-            }))
-            .buffer_unordered(self.config.check_concurrency.max(1))
-            .collect()
-            .await;
+        // These were sequential once, and 60 of them took 27 seconds against a
+        // real account — during which the miner watched nothing at all. They
+        // are independent read-only questions, so the transport answers them
+        // in batches and the rate limiter keeps the burst inside what Twitch
+        // tolerates.
+        let ids: Vec<ChannelId> = work.iter().map(|w| w.channel.id.clone()).collect();
+        let answers: HashMap<ChannelId, Result<Vec<DropId>, ApiError>> = self
+            .api
+            .available_drops_many(&ids)
+            .await
+            .into_iter()
+            .collect();
+
+        let results: Vec<(ChannelWork, Result<Vec<DropId>, ApiError>)> = work
+            .into_iter()
+            .map(|item| {
+                let outcome = answers.get(&item.channel.id).cloned().unwrap_or_else(|| {
+                    Err(ApiError::Malformed(
+                        "the availability check returned no answer for this channel".into(),
+                    ))
+                });
+                (item, outcome)
+            })
+            .collect();
 
         let mut verified = Vec::new();
         let mut fallbacks = Vec::new();
