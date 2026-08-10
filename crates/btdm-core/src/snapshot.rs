@@ -124,6 +124,7 @@ pub struct CampaignView {
     pub game: String,
     pub game_id: String,
     pub box_art_url: Option<String>,
+    pub account_link_url: Option<String>,
     pub starts_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     /// Minutes of watching still needed to finish every reachable tier.
@@ -175,6 +176,8 @@ pub struct RejectedView {
     /// A plain-English explanation. `NotLinked` means nothing to a user who
     /// does not know it refers to Twitch account linking.
     pub explanation: String,
+    /// Where to go and fix it, when there is somewhere to go.
+    pub action_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -261,6 +264,7 @@ pub fn campaign_view(c: &DropCampaign, ctx: &ViewContext) -> CampaignView {
         game: c.game.name.clone(),
         game_id: c.game.id.0.clone(),
         box_art_url: c.game.box_art_url.clone(),
+        account_link_url: c.account_link_url.clone(),
         starts_at: c.starts_at,
         ends_at: c.ends_at,
         remaining_minutes: remaining,
@@ -326,6 +330,7 @@ mod tests {
             ends_at: now() + ends_in,
             is_account_linked: true,
             allowed_channels: vec![],
+            account_link_url: None,
             drops: vec![TimedDrop {
                 id: DropId::from("d1"),
                 name: "Reward".into(),

@@ -814,6 +814,21 @@
             const tr = el("tr");
             tr.append(el("td", null, r.name || "(unnamed)"));
             tr.append(el("td", "sub", r.game));
+
+            // "Your account is not linked" without saying where to link it is
+            // a dead end, and this is by far the largest group of campaigns.
+            const fix = el("td");
+            if (r.action_url) {
+                const a = el("a", null, "Link account →");
+                a.href = r.action_url;
+                a.target = "_blank";
+                a.rel = "noreferrer noopener";
+                a.style.color = "var(--accent)";
+                a.style.whiteSpace = "nowrap";
+                fix.append(a);
+            }
+            tr.append(fix);
+
             const act = el("td");
             act.style.textAlign = "right";
             if (reason !== "excluded") {
