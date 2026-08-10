@@ -2162,3 +2162,105 @@ async fn direct_lookups_are_capped_across_the_whole_pass() {
         "160 lookups in one pass is a request storm, made {calls}"
     );
 }
+
+/// A campaign excluded before it was ever watched exists only in Twitch's
+/// dashboard listing, never in the inventory. Pruning exclusions from a sync
+/// where that listing failed would decide it had vanished — and the miner
+/// would then start mining something the user explicitly turned off.
+#[tokio::test]
+async fn an_exclusion_survives_a_failed_campaign_listing() {
+    let fake = FakeTwitch::default();
+    // Offered by the dashboard, never watched, so never in the inventory.
+    let listed = campaign("c-never-watched", true, vec![]);
+    let full = campaign("c-never-watched", true, vec![drop("d1", 60, 0)]);
+    *fake.offered.lock().unwrap() = vec![listed];
+    fake.details
+        .lock()
+        .unwrap()
+        .insert("c-never-watched".into(), full);
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c-never-watched"),
+            excluded: true,
+        },
+        now(),
+    );
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+
+    // The dashboard listing fails on the next sync; the inventory still works.
+    e.api().offered.lock().unwrap().clear();
+    *e.api().fail_campaign_list.lock().unwrap() = true;
+    e.sync(now()).await.unwrap();
+
+    assert_eq!(
+        e.settings().excluded_campaigns,
+        vec!["c-never-watched".to_string()],
+        "a degraded view must not be treated as proof the campaign is gone"
+    );
+
+    // And once the listing recovers, the campaign is still excluded.
+    *e.api().fail_campaign_list.lock().unwrap() = false;
+    *e.api().offered.lock().unwrap() = vec![campaign("c-never-watched", true, vec![])];
+    e.sync(now()).await.unwrap();
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "the miner must not start mining what the user turned off"
+    );
+}
+
+/// A claim Twitch permanently refuses must not be re-sent every minute for the
+/// life of the campaign.
+#[tokio::test]
+async fn a_refused_claim_backs_off_instead_of_retrying_every_tick() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+    *fake.fail_claims.lock().unwrap() = true;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    // Ten minutes of ticking, one a minute.
+    for minute in 0..10 {
+        e.tick(now() + chrono::Duration::minutes(minute)).await.unwrap();
+    }
+
+    let attempts = *e.api().claim_attempts.lock().unwrap();
+    assert!(
+        (1..=4).contains(&attempts),
+        "expected a handful of attempts over ten minutes, got {attempts}"
+    );
+}
+
+/// ...but a refusal that clears must not leave the drop rested forever.
+#[tokio::test]
+async fn a_claim_is_retried_once_the_backoff_elapses() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+    *fake.fail_claims.lock().unwrap() = true;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+    assert_eq!(*e.api().claim_attempts.lock().unwrap(), 1);
+    assert!(e.api().claims.lock().unwrap().is_empty(), "it was refused");
+
+    // Whatever was wrong is fixed, and the backoff has elapsed.
+    *e.api().fail_claims.lock().unwrap() = false;
+    e.tick(now() + chrono::Duration::hours(3)).await.unwrap();
+
+    assert_eq!(*e.api().claim_attempts.lock().unwrap(), 2);
+    assert_eq!(e.api().claims.lock().unwrap().len(), 1, "and it succeeded");
+    assert!(e.campaigns()[0].drops[0].is_claimed, "and it is claimed");
+}
