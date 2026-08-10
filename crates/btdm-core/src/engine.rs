@@ -175,6 +175,10 @@ pub struct Engine<A: TwitchApi> {
     /// A channel the user asked to watch next, honoured once.
     forced_channel: Option<String>,
     campaigns: Vec<DropCampaign>,
+    /// Campaigns that have not started yet but will soon, with when. Checked
+    /// each pass so mining begins the moment one opens rather than at the next
+    /// scheduled sync — launch day is when people care most.
+    upcoming: Vec<(CampaignId, DateTime<Utc>)>,
     /// Campaigns that have ended but whose earned drops can still be claimed.
     /// Twitch allows claiming for 24 hours after a campaign closes; dropping
     /// them at the moment they expired threw away rewards already worked for.
@@ -246,6 +250,7 @@ impl<A: TwitchApi> Engine<A> {
             forced_channel: None,
             config,
             campaigns: Vec::new(),
+            upcoming: Vec::new(),
             recently_ended: Vec::new(),
             rejected: Vec::new(),
             current: None,
@@ -599,7 +604,13 @@ impl<A: TwitchApi> Engine<A> {
             recovery_step: self.recovery_step.map(|s| s.describe().to_owned()),
             last_sync: self.last_sync,
             next_sync_in_seconds: self.last_sync.map(|t| {
-                (t + self.config.sync_interval - now).num_seconds().max(0)
+                let scheduled = (t + self.config.sync_interval - now).num_seconds().max(0);
+                // A campaign opening sooner than the next scheduled sync is
+                // what will actually wake it, so that is the honest countdown.
+                self.upcoming
+                    .first()
+                    .map(|(_, starts)| (*starts - now).num_seconds().max(0))
+                    .map_or(scheduled, |opens| scheduled.min(opens))
             }),
             quarantined_channels: self
                 .quarantine
@@ -1109,6 +1120,12 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Whether campaigns are due to be re-fetched.
     pub fn needs_sync(&self, now: DateTime<Utc>) -> bool {
+        // A campaign that has just opened is worth a sync of its own: waiting
+        // out the interval would give away the first minutes of a launch, and
+        // launch day is exactly when a drop is worth having.
+        if self.upcoming.iter().any(|(_, starts)| now >= *starts) {
+            return true;
+        }
         self.sync_forced
             || self
                 .last_sync
@@ -1209,6 +1226,7 @@ impl<A: TwitchApi> Engine<A> {
         let mut eligible = Vec::new();
         let mut rejected = Vec::new();
         let mut recently_ended = Vec::new();
+        let mut upcoming = Vec::new();
         for campaign in merged.into_values() {
             match eligibility::assess(&campaign, now) {
                 Ok(()) => eligible.push(campaign),
@@ -1220,6 +1238,13 @@ impl<A: TwitchApi> Engine<A> {
                         && campaign.drops.iter().any(|d| d.is_claimable())
                     {
                         recently_ended.push(campaign.clone());
+                    }
+                    // Worth waking for, if it opens soon enough to matter.
+                    if reason == RejectReason::NotStarted
+                        && campaign.is_account_linked
+                        && campaign.starts_at <= now + UPCOMING_HORIZON
+                    {
+                        upcoming.push((campaign.id.clone(), campaign.starts_at));
                     }
                     rejected.push(rejected_view(&campaign, reason));
                     self.emit(
@@ -1275,6 +1300,11 @@ impl<A: TwitchApi> Engine<A> {
             }
         }
 
+        upcoming.sort_by_key(|(_, starts)| *starts);
+        if let Some((_, next)) = upcoming.first() {
+            tracing::debug!(at = %next, "next campaign opens");
+        }
+        self.upcoming = upcoming;
         self.recently_ended = recently_ended;
         self.campaigns = eligible;
         self.last_sync = Some(now);
@@ -2102,6 +2132,10 @@ impl<A: TwitchApi> Engine<A> {
 /// How long after a campaign ends its earned drops can still be claimed.
 /// Twitch's own documented grace period.
 const CLAIM_GRACE: Duration = Duration::hours(24);
+
+/// How far ahead a campaign is worth waking up for. Beyond this the next
+/// scheduled sync will notice it long before it opens.
+const UPCOMING_HORIZON: Duration = Duration::hours(24);
 
 /// A campaign's requirements, resolved once per selection pass.
 struct Want {

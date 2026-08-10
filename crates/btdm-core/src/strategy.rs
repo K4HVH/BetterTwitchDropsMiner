@@ -332,12 +332,22 @@ pub struct Priority;
 /// above this, and unlisted games are separated among themselves by urgency.
 const UNLISTED_BASE: f64 = 0.0;
 
+/// Where a campaign sits in the user's priority list.
+///
+/// An entry matches a game by name, or a campaign by name — the latter as a
+/// substring, so "Ignite" covers "Ignite MSF 2026 Day 1" through "Day 4"
+/// without listing each. That is how two campaigns for the same game get
+/// ranked against each other, which naming games alone cannot express.
 fn priority_rank(candidate: &Candidate, world: &WorldView) -> Option<usize> {
     world
         .advanced_campaigns(candidate)
         .filter_map(|c| {
             let game = c.game.name.to_lowercase();
-            world.priority_games.iter().position(|g| *g == game)
+            let name = c.name.to_lowercase();
+            world
+                .priority_games
+                .iter()
+                .position(|entry| *entry == game || name.contains(entry.as_str()))
         })
         .min()
 }
@@ -1136,5 +1146,122 @@ mod tests {
         assert!(text.contains("deadline"), "names the strategy: {text}");
         assert!(text.contains("2 campaigns"), "counts campaigns: {text}");
         assert!(text.contains("favourite"), "mentions favourites: {text}");
+    }
+}
+
+#[cfg(test)]
+mod priority_naming_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap()
+    }
+
+    fn named(id: &str, name: &str, game_name: &str) -> DropCampaign {
+        DropCampaign {
+            id: CampaignId::from(id),
+            name: name.into(),
+            game: Game {
+                id: GameId::from(game_name),
+                name: game_name.into(),
+                slug: game_name.to_lowercase(),
+                box_art_url: None,
+            },
+            starts_at: now() - Duration::days(1),
+            ends_at: now() + Duration::days(5),
+            is_account_linked: true,
+            allowed_channels: vec![],
+            account_link_url: None,
+            drops: vec![TimedDrop {
+                id: DropId::from(&format!("{id}-d")[..]),
+                name: "d".into(),
+                benefits: vec![],
+                required_minutes: 60,
+                current_minutes: 0,
+                claim_id: None,
+                is_claimed: false,
+                precondition_ids: vec![],
+                starts_at: None,
+                ends_at: None,
+            }],
+        }
+    }
+
+    fn candidate_for(login: &str, campaign_id: &str) -> Candidate {
+        Candidate {
+            channel: Channel {
+                id: ChannelId::from(login),
+                login: login.into(),
+                display_name: login.into(),
+            },
+            stream: Stream {
+                broadcast_id: "b".into(),
+                game: None,
+                title: "t".into(),
+                viewers: 10,
+                drops_enabled: true,
+            },
+            advances: vec![Advance {
+                campaign: CampaignId::from(campaign_id),
+                drops: vec![DropId::from(&format!("{campaign_id}-d")[..])],
+            }],
+        }
+    }
+
+    /// Two campaigns for the same game cannot be ranked against each other by
+    /// naming the game. Naming the campaign can.
+    #[test]
+    fn a_priority_entry_can_name_a_campaign_rather_than_a_game() {
+        let campaigns = vec![
+            named("c-day1", "Ignite MSF 2026 Day 1", "Marvel Rivals"),
+            named("c-season", "Season 9.5 Twitch Drops", "Marvel Rivals"),
+        ];
+        let candidates = vec![
+            candidate_for("season", "c-season"),
+            candidate_for("ignite", "c-day1"),
+        ];
+        let favs = HashSet::new();
+        let priority = vec!["ignite".to_string()];
+        let w = WorldView {
+            now: now(),
+            campaigns: &campaigns,
+            candidates: &candidates,
+            favourites: &favs,
+            priority_games: &priority,
+            pinned: None,
+            current: None,
+        };
+
+        match choose(&Priority, &w) {
+            Decision::Watch(c) => assert_eq!(c.channel.login, "ignite"),
+            other => panic!("expected the named campaign, got {other:?}"),
+        }
+    }
+
+    /// A game name still matches, and still outranks an unlisted one.
+    #[test]
+    fn naming_a_game_still_works() {
+        let campaigns = vec![
+            named("c-a", "Some Campaign", "Deadlock"),
+            named("c-b", "Another", "Other Game"),
+        ];
+        let candidates = vec![candidate_for("b", "c-b"), candidate_for("a", "c-a")];
+        let favs = HashSet::new();
+        let priority = vec!["deadlock".to_string()];
+        let w = WorldView {
+            now: now(),
+            campaigns: &campaigns,
+            candidates: &candidates,
+            favourites: &favs,
+            priority_games: &priority,
+            pinned: None,
+            current: None,
+        };
+
+        match choose(&Priority, &w) {
+            Decision::Watch(c) => assert_eq!(c.channel.login, "a"),
+            other => panic!("expected the listed game, got {other:?}"),
+        }
     }
 }
