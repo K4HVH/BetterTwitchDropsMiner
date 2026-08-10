@@ -11,7 +11,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "btdm", about = "A Twitch drops miner that tells you the truth")]
+#[command(
+    name = "btdm",
+    version,
+    about = "A Twitch drops miner that tells you the truth"
+)]
 struct Args {
     /// Where state.db and config.toml live. Defaults to $XDG_DATA_HOME/btdm.
     #[arg(long, global = true)]

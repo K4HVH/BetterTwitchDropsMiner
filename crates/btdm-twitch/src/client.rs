@@ -30,10 +30,24 @@ pub fn generate_device_id() -> String {
 }
 
 pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .gzip(true)
-        .build()
+    build_http_client_with_proxy(None)
+}
+
+/// Builds the HTTP client, optionally through a proxy.
+///
+/// Per-account proxies are the mitigation for the one risk this project's own
+/// design notes accepted without an answer: several accounts mining from one
+/// IP address looks like exactly what it is.
+///
+/// A proxy that cannot be parsed is a hard error rather than a silent
+/// fallback to a direct connection — quietly ignoring it would send traffic
+/// from the address the user was trying to avoid.
+pub fn build_http_client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder().user_agent(USER_AGENT).gzip(true);
+    if let Some(url) = proxy.map(str::trim).filter(|u| !u.is_empty()) {
+        builder = builder.proxy(reqwest::Proxy::all(url)?);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
