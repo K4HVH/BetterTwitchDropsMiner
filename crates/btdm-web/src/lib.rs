@@ -8,4 +8,4 @@ mod hub;
 mod server;
 
 pub use hub::Hub;
-pub use server::{ServeError, serve};
+pub use server::{ServeError, serve, serve_announcing};

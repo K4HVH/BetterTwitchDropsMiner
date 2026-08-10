@@ -40,6 +40,19 @@ struct AppState {
 /// Binding to anything other than loopback requires `token`; callers are
 /// expected to generate one and show it to the user.
 pub async fn serve(hub: Hub, addr: SocketAddr, token: Option<String>) -> Result<(), ServeError> {
+    serve_announcing(hub, addr, token, |_| {}).await
+}
+
+/// As [`serve`], but calls `announce` with the dashboard URL *after* the socket
+/// is bound. Printing the URL before binding would advertise an address that
+/// may never work.
+pub async fn serve_announcing(
+    hub: Hub,
+    addr: SocketAddr,
+    token: Option<String>,
+    announce: impl FnOnce(String),
+) -> Result<(), ServeError> {
+    let app_token = token.clone();
     let state = AppState { hub, token };
 
     let app = Router::new()
@@ -56,7 +69,13 @@ pub async fn serve(hub: Hub, addr: SocketAddr, token: Option<String>) -> Result<
             source,
         })?;
 
+    let url = match &app_token {
+        Some(t) => format!("http://{addr}/?token={t}"),
+        None => format!("http://{addr}/"),
+    };
     tracing::info!(%addr, "dashboard listening");
+    announce(url);
+
     axum::serve(listener, app).await?;
     Ok(())
 }

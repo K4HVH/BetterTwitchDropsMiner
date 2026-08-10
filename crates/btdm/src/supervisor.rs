@@ -80,21 +80,19 @@ pub async fn run(
         // A dashboard reachable from the network exposes state derived from a
         // live Twitch session, so it is never left open.
         let token = (!is_loopback(&addr)).then(generate_token);
-        if let Some(t) = &token {
-            tracing::warn!(
-                %addr,
-                "dashboard is not on loopback; open it at http://{addr}/?token={t}"
-            );
-            println!("\n  Dashboard: http://{addr}/?token={t}\n");
-        } else {
-            println!("\n  Dashboard: http://{addr}/\n");
+        if token.is_some() {
+            tracing::warn!(%addr, "dashboard is not on loopback; a token is required");
         }
 
         let hub = hub.clone();
         tasks.spawn(async move {
-            let result = btdm_web::serve(hub, addr, token)
-                .await
-                .map_err(anyhow::Error::from);
+            // The URL is announced from inside, once the socket is bound, so a
+            // failed bind never leaves a working-looking URL on screen.
+            let result = btdm_web::serve_announcing(hub, addr, token, |url| {
+                println!("\n  Dashboard: {url}\n");
+            })
+            .await
+            .map_err(anyhow::Error::from);
             ("dashboard".to_string(), result)
         });
     }
