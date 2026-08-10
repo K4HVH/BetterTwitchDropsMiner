@@ -65,7 +65,11 @@ enum Command {
 #[derive(Subcommand)]
 enum ControlCommand {
     /// Show what every running account is doing.
-    Status,
+    Status {
+        /// Emit the raw snapshot instead, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop mining. Already-earned drops are still claimed.
     Pause,
     /// Start mining again.
@@ -115,7 +119,7 @@ enum ControlCommand {
 fn to_command(c: ControlCommand) -> Option<btdm_core::control::Command> {
     use btdm_core::control::Command as C;
     Some(match c {
-        ControlCommand::Status => return None,
+        ControlCommand::Status { .. } => return None,
         ControlCommand::Pause => C::Pause,
         ControlCommand::Resume => C::Resume,
         ControlCommand::Strategy { name } => C::SetStrategy { name },
@@ -199,10 +203,13 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Update { apply } => update::run(apply).await,
-        Command::Control(sub) => match to_command(sub) {
-            None => control_cli::show(&cfg).await,
-            Some(command) => control_cli::send(&cfg, &args.account, command).await,
-        },
+        Command::Control(sub) => {
+            let json = matches!(sub, ControlCommand::Status { json: true });
+            match to_command(sub) {
+                None => control_cli::show(&cfg, json).await,
+                Some(command) => control_cli::send(&cfg, &args.account, command).await,
+            }
+        }
         Command::Probe => {
             run::mine(
                 &storage,

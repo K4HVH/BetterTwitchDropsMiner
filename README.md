@@ -82,7 +82,7 @@ Every control on the dashboard is on the CLI, over the same API, taking effect
 immediately:
 
 ```sh
-btdm control status                    # what every account is doing
+btdm control status [--json]           # what every account is doing
 btdm control pause | resume
 btdm control strategy coverage
 btdm control watch somestreamer        # switch to a channel now
