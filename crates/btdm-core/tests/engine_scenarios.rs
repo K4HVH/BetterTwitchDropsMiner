@@ -2464,3 +2464,86 @@ async fn an_already_impossible_campaign_does_not_count_as_urgent() {
         "a campaign that is already lost is not a reason to poll hard forever"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Campaigns that have not started yet
+// ---------------------------------------------------------------------------
+
+/// Launch day is when a drop is worth having. Waiting out the sync interval
+/// gives away the first minutes of one.
+#[tokio::test]
+async fn a_campaign_opening_soon_triggers_a_sync_the_moment_it_opens() {
+    let fake = FakeTwitch::default();
+    // Opens inside the ordinary sync interval, so only the wake-up can
+    // explain a sync becoming due.
+    let mut soon = campaign("c-soon", true, vec![drop("d1", 60, 0)]);
+    soon.starts_at = now() + chrono::Duration::minutes(3);
+    soon.ends_at = now() + chrono::Duration::days(5);
+    *fake.inventory.lock().unwrap() = vec![soon];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.campaigns().is_empty(), "not started yet");
+    assert!(!e.needs_sync(now()), "and not due for a while");
+
+    assert!(
+        !e.needs_sync(now() + chrono::Duration::minutes(2)),
+        "still not open, and the scheduled sync is not due either"
+    );
+    assert!(
+        e.needs_sync(now() + chrono::Duration::minutes(4)),
+        "the moment it opens, it is worth a sync of its own"
+    );
+}
+
+#[tokio::test]
+async fn a_campaign_opening_next_month_is_not_woken_for() {
+    let fake = FakeTwitch::default();
+    let mut later = campaign("c-later", true, vec![drop("d1", 60, 0)]);
+    later.starts_at = now() + chrono::Duration::days(30);
+    later.ends_at = now() + chrono::Duration::days(60);
+    *fake.inventory.lock().unwrap() = vec![later];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(
+        !e.needs_sync(now() + chrono::Duration::minutes(5)),
+        "nothing opens soon, so only the scheduled sync applies"
+    );
+}
+
+/// The countdown must reflect what will actually happen next.
+#[tokio::test]
+async fn the_countdown_reports_the_campaign_opening_rather_than_the_scheduled_sync() {
+    let fake = FakeTwitch::default();
+    let mut soon = campaign("c-soon", true, vec![drop("d1", 60, 0)]);
+    soon.starts_at = now() + chrono::Duration::minutes(3);
+    soon.ends_at = now() + chrono::Duration::days(5);
+    *fake.inventory.lock().unwrap() = vec![soon];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let next = e.snapshot("main", None, now()).health.next_sync_in_seconds.unwrap();
+    assert!(
+        (170..=190).contains(&next),
+        "expected roughly three minutes, got {next}s"
+    );
+}
+
+/// A campaign nobody could mine is not worth waking for.
+#[tokio::test]
+async fn an_unlinked_upcoming_campaign_is_not_woken_for() {
+    let fake = FakeTwitch::default();
+    let mut soon = campaign("c-soon", false, vec![drop("d1", 60, 0)]);
+    soon.starts_at = now() + chrono::Duration::minutes(3);
+    soon.ends_at = now() + chrono::Duration::days(5);
+    *fake.offered.lock().unwrap() = vec![soon];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(
+        !e.needs_sync(now() + chrono::Duration::minutes(5)),
+        "a campaign nobody can mine is not worth waking for"
+    );
+}

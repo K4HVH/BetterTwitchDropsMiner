@@ -22,7 +22,11 @@ pub struct Config {
     pub bind: String,
     pub data_dir: Option<PathBuf>,
     /// Optional Discord webhook for drop claims and anything needing attention.
+    ///
+    /// Kept for existing configs; `[notify]` is the general form.
     pub discord_webhook: Option<String>,
+    /// Where alerts go. Several may be set at once.
+    pub notify: crate::notify::Notifiers,
     /// Route all Twitch traffic through this proxy. Applies to every account
     /// unless one overrides it.
     pub proxy: Option<String>,
@@ -44,6 +48,7 @@ impl Default for Config {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            notify: Default::default(),
             proxy: None,
             timing: Timing::default(),
             dashboard_token: None,
@@ -166,6 +171,10 @@ pub struct AccountConfig {
     /// Route this account's traffic through its own proxy, overriding the
     /// global one.
     pub proxy: Option<String>,
+    /// Alert destinations for this account alone, overriding the shared ones
+    /// per channel. Several accounts notifying the same Discord is usually
+    /// wrong — you cannot tell which one needs attention.
+    pub notify: crate::notify::Notifiers,
     /// Start paused. Set by the dashboard's pause button so the state survives
     /// a restart — a miner that silently resumed on reboot would be mining
     /// against the user's stated wish.
@@ -183,6 +192,7 @@ impl Default for AccountConfig {
             excluded_campaigns: Vec::new(),
             excluded_games: Vec::new(),
             proxy: None,
+            notify: Default::default(),
             paused: false,
         }
     }
@@ -203,6 +213,17 @@ impl AccountConfig {
 }
 
 impl Config {
+    /// Where this account's alerts go: the shared destinations, with anything
+    /// the account overrode taking precedence. The old `discord_webhook` key
+    /// still works and is treated as a shared Discord destination.
+    pub fn notifiers_for(&self, account: &str) -> crate::notify::Notifiers {
+        let mut shared = self.notify.clone();
+        if shared.discord.is_none() {
+            shared.discord = self.discord_webhook.clone();
+        }
+        shared.merged_with(&self.account(account).notify)
+    }
+
     /// Settings for one account, falling back to defaults when the account is
     /// not described in the file.
     pub fn account(&self, name: &str) -> AccountConfig {
@@ -327,6 +348,7 @@ mod tests {
             bind: "0.0.0.0:9000".into(),
             data_dir: None,
             discord_webhook: None,
+            notify: Default::default(),
             proxy: None,
             timing: Timing::default(),
             dashboard_token: None,
@@ -378,6 +400,7 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            notify: Default::default(),
             proxy: None,
             timing: Timing::default(),
             dashboard_token: None,
@@ -395,6 +418,7 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            notify: Default::default(),
             proxy: None,
             timing: Timing::default(),
             dashboard_token: None,
@@ -515,6 +539,7 @@ mod store_tests {
             bind: "0.0.0.0:9999".into(),
             data_dir: None,
             discord_webhook: Some("https://example.invalid/hook".into()),
+            notify: Default::default(),
             proxy: None,
             timing: Timing::default(),
             dashboard_token: None,

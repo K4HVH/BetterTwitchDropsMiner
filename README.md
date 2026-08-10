@@ -110,8 +110,13 @@ state lives in `state.db` beside it. Both are created mode `0600`.
 
 ```toml
 bind = "127.0.0.1:8080"
-# discord_webhook = "https://discord.com/api/webhooks/..."
 # proxy = "http://user:pass@host:port"   # all accounts, unless overridden
+
+# Alerts. Any combination; several accounts can also override these per account.
+[notify]
+# discord = "https://discord.com/api/webhooks/..."
+# ntfy    = "https://ntfy.sh/some-topic-only-you-know"   # no account, reaches a phone
+# webhook = "https://example.com/hook"                   # JSON POST, carries the raw event
 
 [[accounts]]
 name = "default"
@@ -121,6 +126,8 @@ favourite_channels = ["somestreamer"]
 # pinned_channel = "somestreamer"
 # excluded_games = ["Some Game I Own Everything For"]
 # proxy = "http://..."                   # this account only
+# [accounts.notify]                      # this account's own alerts
+# ntfy = "https://ntfy.sh/just-this-account"
 
 # Everything below has a working default. Tune it for a slow connection or a
 # very small box; values that would stop mining outright are clamped.
@@ -161,6 +168,11 @@ settings survive a restart.
 The choice is reconsidered periodically rather than only when idle, so a
 campaign that becomes urgent can take over — with hysteresis, so it does not
 thrash between two near-equal channels.
+
+A `priority_games` entry matches a game by name, or a campaign by name as a
+substring — so `"Ignite"` covers "Ignite MSF 2026 Day 1" through "Day 4"
+without listing each, and two campaigns for the same game can be ranked
+against each other.
 
 `favourite_channels` is not a strategy — it is a tie-break applied under all of
 them, so when two channels are equally good for drops the one you care about

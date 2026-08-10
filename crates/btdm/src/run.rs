@@ -1,7 +1,7 @@
 //! Wires config, storage, auth, PubSub and the engine into a running miner.
 
 use crate::config::{Config, ConfigStore};
-use crate::notify::Discord;
+use crate::notify::Notifier;
 use crate::storage::Storage;
 use btdm_core::api::TwitchApi;
 use btdm_core::control::Command;
@@ -121,10 +121,9 @@ pub async fn mine(
         hub.register(account, command_tx);
     }
 
-    let notifier = config
-        .discord_webhook
-        .as_ref()
-        .map(|w| Discord::new(build_http_client().unwrap_or_default(), w.clone()));
+    let targets = config.notifiers_for(account);
+    let notifier = (!targets.is_empty())
+        .then(|| Notifier::new(build_http_client().unwrap_or_default(), targets));
 
     let mut last_auth_check = Utc::now();
     let result = loop {
@@ -530,7 +529,7 @@ async fn drain_events<A: TwitchApi>(
     storage: &Storage,
     account: &str,
     hub: Option<&Hub>,
-    notifier: Option<&Discord>,
+    notifier: Option<&Notifier>,
 ) -> anyhow::Result<()> {
     for event in engine.drain_events() {
         tracing::info!(summary = %event.summary(), "event");
