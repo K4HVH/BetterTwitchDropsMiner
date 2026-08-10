@@ -127,6 +127,16 @@ impl Storage {
         Ok(row)
     }
 
+    /// Every account with a stored token, i.e. everything that can be mined.
+    pub fn linked_accounts(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT account FROM tokens ORDER BY account")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns whether a token was actually removed, so the caller cannot
     /// report a purge that never happened.
     pub fn clear_tokens(&self, account: &str) -> Result<bool, StorageError> {
@@ -240,6 +250,19 @@ mod tests {
         let s = Storage::open_in_memory().unwrap();
         s.put_tokens("main", &tokens()).unwrap();
         assert!(s.get_tokens("alt").unwrap().is_none());
+    }
+
+    #[test]
+    fn linked_accounts_lists_every_stored_token_in_order() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(s.linked_accounts().unwrap().is_empty());
+
+        s.put_tokens("zeta", &tokens()).unwrap();
+        s.put_tokens("alpha", &tokens()).unwrap();
+        assert_eq!(
+            s.linked_accounts().unwrap(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
     }
 
     #[test]

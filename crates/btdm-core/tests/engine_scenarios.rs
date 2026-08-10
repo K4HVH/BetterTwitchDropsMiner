@@ -674,3 +674,31 @@ async fn an_unrelated_drop_cannot_clear_a_stall() {
         "the stall must survive another campaign's progress"
     );
 }
+
+/// The dashboard reports the account link, so an unlinked campaign can be
+/// discarded without spending a detail request on it. Against a real account
+/// this is the difference between ~130 requests and a handful.
+#[tokio::test]
+async fn unlinked_campaigns_cost_no_detail_requests() {
+    let fake = FakeTwitch::default();
+    let mut offered = vec![];
+    for i in 0..50 {
+        offered.push(campaign(&format!("c{i}"), false, vec![]));
+    }
+    offered.push(campaign("c-linked", true, vec![]));
+    *fake.offered.lock().unwrap() = offered;
+    fake.details
+        .lock()
+        .unwrap()
+        .insert("c-linked".into(), campaign("c-linked", true, vec![drop("d1", 60, 0)]));
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    assert_eq!(
+        *e.api().detail_fetches.lock().unwrap(),
+        1,
+        "only the linked campaign is worth expanding"
+    );
+    assert_eq!(e.campaigns().len(), 1);
+}

@@ -386,12 +386,21 @@ impl<A: TwitchApi> Engine<A> {
         };
 
         let mut fetched = 0usize;
+        let mut skipped_unlinked = 0usize;
         for campaign in offered {
             if merged.contains_key(&campaign.id) {
                 continue;
             }
             // Skip anything already outside its window before spending a request.
             if now >= campaign.ends_at {
+                continue;
+            }
+            // The dashboard already reports the account link, and an unlinked
+            // campaign can never be mined. Filtering here turned 130 detail
+            // requests into a handful against a real account, which is what
+            // made the fetch cap stop truncating the campaign list.
+            if !campaign.is_account_linked {
+                skipped_unlinked += 1;
                 continue;
             }
             if fetched >= self.config.max_detail_fetches {
@@ -419,6 +428,7 @@ impl<A: TwitchApi> Engine<A> {
             total,
             in_progress,
             expanded = fetched,
+            skipped_unlinked,
             "merged campaign sources"
         );
 

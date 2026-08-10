@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twitch Drops Miner</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #14161a; --muted: #5c6472;
+    --line: #e3e6eb; --accent: #7d5bed; --ok: #1f9254; --warn: #b8860b;
+    --bad: #c0392b; --radius: 10px;
+  }
+  :root:not([data-theme="light"]) { }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a; --panel: #1c1f26; --ink: #e8eaee; --muted: #98a0ae;
+      --line: #2a2f39; --accent: #a08bf5; --ok: #45c07d; --warn: #e0b64a;
+      --bad: #ef6b5b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a; --panel: #1c1f26; --ink: #e8eaee; --muted: #98a0ae;
+    --line: #2a2f39; --accent: #a08bf5; --ok: #45c07d; --warn: #e0b64a;
+    --bad: #ef6b5b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px; max-width: 1100px; margin-inline: auto;
+  }
+  h1 { font-size: 1.35rem; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.07em;
+       color: var(--muted); margin: 26px 0 10px; font-weight: 600; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+           margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 0.88rem; }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: var(--radius); padding: 16px; }
+  .grid { display: grid; gap: 12px; }
+  @media (min-width: 720px) { .grid.two { grid-template-columns: 1fr 1fr; } }
+
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px;
+          font-size: 0.75rem; font-weight: 600; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+
+  .headline { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; }
+  .confirm { font-variant-numeric: tabular-nums; }
+  .stale { color: var(--bad); font-weight: 600; }
+
+  .bar { height: 7px; background: var(--line); border-radius: 999px;
+         overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th { text-align: left; font-weight: 600; color: var(--muted);
+       font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
+       padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--line);
+       vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .scroll { overflow-x: auto; }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  #log { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-height: 300px; overflow-y: auto; }
+  #log div { padding: 1px 0; border-bottom: 1px solid var(--line); }
+  #log time { color: var(--muted); margin-right: 8px; }
+  .empty { color: var(--muted); font-style: italic; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 0.88rem; }
+  footer { margin-top: 30px; color: var(--muted); font-size: 0.8rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Twitch Drops Miner</h1>
+  <span class="sub" id="conn">connecting…</span>
+</header>
+<p class="sub">Every figure below is confirmed by Twitch. Nothing here is a local timer.</p>
+
+<div id="accounts"></div>
+
+<h2>Activity</h2>
+<div class="panel" id="log"><div class="empty">Waiting for events…</div></div>
+
+<footer>Updates stream live. If “last confirmed” keeps climbing, mining has stalled — the miner is already working its recovery ladder.</footer>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (sel) => document.querySelector(sel);
+  const token = new URLSearchParams(location.search).get("token");
+  const api = (path) => path + (token ? "?token=" + encodeURIComponent(token) : "");
+
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+
+  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  function relative(seconds) {
+    if (seconds === null || seconds === undefined) return "never";
+    if (seconds < 60) return `${seconds}s ago`;
+    const m = Math.floor(seconds / 60);
+    if (m < 60) return `${m}m ago`;
+    return `${Math.floor(m / 60)}h ${m % 60}m ago`;
+  }
+
+  function untilText(iso) {
+    const ms = new Date(iso).getTime() - Date.now();
+    if (ms <= 0) return "expired";
+    const mins = Math.floor(ms / 60000);
+    if (mins < 60) return `${mins}m left`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 48) return `${hrs}h left`;
+    return `${Math.floor(hrs / 24)}d left`;
+  }
+
+  function watchingPanel(w) {
+    const panel = el("div", "panel");
+    if (!w) {
+      panel.append(el("div", "headline", "Idle"));
+      panel.append(el("div", "sub", "No channel is currently being watched."));
+      return panel;
+    }
+
+    const head = el("div");
+    head.append(el("span", "headline", w.channel_display_name || w.channel_login));
+    head.append(document.createTextNode(" "));
+    head.append(el("span", "pill " + (w.stalled ? "bad" : "ok"),
+                   w.stalled ? "STALLED" : "mining"));
+    panel.append(head);
+    panel.append(el("div", "sub", w.campaign));
+
+    const line = el("div", "confirm");
+    if (w.current_minutes === null || w.current_minutes === undefined) {
+      line.append(el("span", "sub", "No progress confirmed by Twitch yet"));
+    } else {
+      line.append(document.createTextNode(
+        `${w.drop_name ? w.drop_name + " — " : ""}${w.current_minutes}/${w.required_minutes} min confirmed`));
+    }
+    panel.append(line);
+
+    const since = el("div", "sub");
+    const stamp = el("span", w.stalled ? "stale" : "", relative(w.seconds_since_confirmation));
+    since.append(document.createTextNode("Last confirmed by Twitch: "));
+    since.append(stamp);
+    panel.append(since);
+
+    if (w.required_minutes) {
+      const bar = el("div", "bar");
+      const fill = el("i");
+      fill.style.width = Math.min(100, (w.current_minutes / w.required_minutes) * 100) + "%";
+      bar.append(fill);
+      panel.append(bar);
+    }
+    return panel;
+  }
+
+  function campaignTable(list) {
+    const wrap = el("div", "panel scroll");
+    if (!list.length) {
+      wrap.append(el("div", "empty", "No mineable campaigns."));
+      return wrap;
+    }
+    const table = el("table");
+    const thead = el("thead");
+    const hr = el("tr");
+    ["Campaign", "Game", "Remaining", "Slack", "Ends"].forEach((h) => {
+      hr.append(el("th", null, h));
+    });
+    thead.append(hr);
+    table.append(thead);
+
+    const tbody = el("tbody");
+    list.forEach((c) => {
+      const tr = el("tr");
+      const name = el("td");
+      name.append(document.createTextNode(c.name || "(unnamed)"));
+      if (c.at_risk) {
+        name.append(document.createTextNode(" "));
+        name.append(el("span", "pill warn", c.slack_minutes < 0 ? "impossible" : "at risk"));
+      }
+      tr.append(name);
+      tr.append(el("td", null, c.game));
+      tr.append(el("td", "num", `${c.remaining_minutes} min`));
+      tr.append(el("td", "num", `${c.slack_minutes} min`));
+      tr.append(el("td", "num", untilText(c.ends_at)));
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    wrap.append(table);
+    return wrap;
+  }
+
+  function rejectedPanel(list) {
+    const details = el("details");
+    details.append(el("summary", null,
+      `${plural(list.length, "campaign")} unavailable — reasons`));
+    const wrap = el("div", "panel scroll");
+    const table = el("table");
+    const tbody = el("tbody");
+    list.forEach((r) => {
+      const tr = el("tr");
+      tr.append(el("td", null, r.name || "(unnamed)"));
+      tr.append(el("td", null, r.game));
+      tr.append(el("td", null, r.reason));
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    wrap.append(table);
+    details.append(wrap);
+    return details;
+  }
+
+  function renderAccount(s) {
+    const box = el("section");
+    const h = el("h2", null,
+      `${s.account}${s.login ? " · " + s.login : ""} · ${s.strategy} · ${s.state}`);
+    box.append(h);
+    box.append(watchingPanel(s.watching));
+
+    const t = s.totals || {};
+    box.append(el("div", "sub",
+      `${t.campaigns_eligible ?? 0} of ${t.campaigns_known ?? 0} campaigns mineable · ` +
+      `${t.drops_claimed ?? 0} claimed · ${t.drops_remaining ?? 0} remaining`));
+
+    const atRisk = (s.eligible || []).filter((c) => c.at_risk);
+    if (atRisk.length) {
+      box.append(el("h2", null, "At risk"));
+      box.append(campaignTable(atRisk));
+    }
+
+    box.append(el("h2", null, "Mineable campaigns"));
+    box.append(campaignTable(s.eligible || []));
+
+    if ((s.rejected || []).length) {
+      box.append(el("h2", null, "Unavailable"));
+      box.append(rejectedPanel(s.rejected));
+    }
+    return box;
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch(api("/api/snapshots"));
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const list = await res.json();
+      const host = $("#accounts");
+      host.textContent = "";
+      if (!list.length) {
+        const p = el("div", "panel");
+        p.append(el("div", "empty", "No account has reported yet."));
+        host.append(p);
+      } else {
+        list.forEach((s) => host.append(renderAccount(s)));
+      }
+      $("#conn").textContent = "live";
+    } catch (e) {
+      $("#conn").textContent = "disconnected — retrying";
+    }
+  }
+
+  function startEvents() {
+    const src = new EventSource(api("/api/events"));
+    const log = $("#log");
+    src.onmessage = (msg) => {
+      let data;
+      try { data = JSON.parse(msg.data); } catch { return; }
+      if (log.firstChild && log.firstChild.className === "empty") log.textContent = "";
+      const row = el("div");
+      row.append(el("time", null, new Date(data.at).toLocaleTimeString()));
+      row.append(document.createTextNode(`[${data.account}] ${data.kind}`));
+      log.prepend(row);
+      while (log.childNodes.length > 300) log.removeChild(log.lastChild);
+      refresh();
+    };
+    src.onerror = () => { $("#conn").textContent = "reconnecting…"; };
+  }
+
+  refresh();
+  startEvents();
+  // Poll as a backstop, exactly as the miner does with Twitch.
+  setInterval(refresh, 15000);
+})();
+</script>
+</body>
+</html>

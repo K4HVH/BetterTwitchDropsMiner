@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/btdm-core", "crates/btdm-twitch", "crates/btdm"]
+members = ["crates/btdm-core", "crates/btdm-twitch", "crates/btdm-web", "crates/btdm"]
 
 [workspace.package]
 version = "0.1.0"
