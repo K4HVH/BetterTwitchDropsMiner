@@ -13,13 +13,20 @@ pub const CLIENT_URL: &str = "https://www.twitch.tv";
 /// Twitch expects an `X-Device-Id` on auth requests. It only has to be stable
 /// for a login session and unique per install, so it is generated once and
 /// persisted alongside the tokens.
+/// 128 bits of OS entropy as lowercase hex.
+///
+/// `RandomState::hash_one` was used here originally. It is seeded to resist
+/// hash flooding, not to produce secrets: the real entropy is far below the
+/// 128 bits the string length implies. Anything guarding a live session has to
+/// come from the OS.
+pub fn random_hex_128() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS must be able to provide entropy");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn generate_device_id() -> String {
-    use std::hash::{BuildHasher, RandomState};
-    // Each RandomState is independently seeded, giving two distinct 64-bit
-    // values — 32 hex characters in total.
-    let a = RandomState::new().hash_one("btdm-device-a");
-    let b = RandomState::new().hash_one("btdm-device-b");
-    format!("{a:016x}{b:016x}")
+    random_hex_128()
 }
 
 pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {

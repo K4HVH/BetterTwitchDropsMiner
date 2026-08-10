@@ -405,3 +405,62 @@ pub fn parse_current_progress(data: &Value) -> Option<(Option<ChannelId>, DropPr
         },
     ))
 }
+
+/// Whether Twitch actually granted a claim.
+///
+/// `ELIGIBLE_FOR_ALL` is the success path; `DROP_INSTANCE_ALREADY_CLAIMED`
+/// means the reward is already on the account, which is equally fine. Anything
+/// else — including a missing status — has to be treated as a failure, because
+/// marking a drop claimed locally means it is never retried.
+pub fn claim_granted(response: &Value) -> Result<(), String> {
+    let status = response
+        .get("claimDropRewards")
+        .filter(|v| !v.is_null())
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str);
+
+    match status {
+        Some("ELIGIBLE_FOR_ALL") | Some("DROP_INSTANCE_ALREADY_CLAIMED") => Ok(()),
+        Some(other) => Err(format!("Twitch refused the claim: {other}")),
+        None => Err("the claim response carried no status".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_granted_claim_is_accepted() {
+        assert!(claim_granted(&json!({"claimDropRewards": {"status": "ELIGIBLE_FOR_ALL"}})).is_ok());
+    }
+
+    /// Already claimed means the reward is on the account, which is what the
+    /// caller wanted.
+    #[test]
+    fn an_already_claimed_drop_is_not_an_error() {
+        assert!(
+            claim_granted(&json!({
+                "claimDropRewards": {"status": "DROP_INSTANCE_ALREADY_CLAIMED"}
+            }))
+            .is_ok()
+        );
+    }
+
+    /// The bug this exists to prevent: a refused claim reported as a success,
+    /// the drop marked claimed locally, and never retried.
+    #[test]
+    fn a_refused_claim_is_a_failure() {
+        let err = claim_granted(&json!({"claimDropRewards": {"status": "INELIGIBLE"}}))
+            .unwrap_err();
+        assert!(err.contains("INELIGIBLE"), "{err}");
+    }
+
+    #[test]
+    fn a_null_or_missing_payload_is_a_failure() {
+        assert!(claim_granted(&json!({"claimDropRewards": null})).is_err());
+        assert!(claim_granted(&json!({})).is_err());
+        assert!(claim_granted(&json!({"claimDropRewards": {}})).is_err());
+    }
+}

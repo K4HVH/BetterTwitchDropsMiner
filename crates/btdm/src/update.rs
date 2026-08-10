@@ -45,16 +45,36 @@ struct Asset {
     browser_download_url: String,
 }
 
+/// The target triple this binary was built for.
+///
+/// Composed from `cfg!` rather than hardcoded: the previous version always
+/// asked for a Linux musl asset, so a Windows or macOS build would have
+/// downloaded a Linux binary over itself.
+pub fn target_triple() -> &'static str {
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        "x86_64-unknown-linux-musl"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+        "aarch64-unknown-linux-musl"
+    } else if cfg!(all(target_arch = "arm", target_os = "linux")) {
+        "armv7-unknown-linux-musleabihf"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "windows")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        "aarch64-apple-darwin"
+    } else {
+        "unsupported"
+    }
+}
+
 /// The release asset name this build would install.
 ///
-/// Must match the names produced by the release workflow.
+/// Must match the names produced by the release workflow — there is a test
+/// below that reads the workflow and checks exactly that.
 pub fn asset_name() -> String {
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
-    format!("btdm-{arch}-unknown-linux-musl")
+    let suffix = if cfg!(target_os = "windows") { ".exe" } else { "" };
+    format!("btdm-{}{suffix}", target_triple())
 }
 
 /// Compares two release versions, tolerating a leading `v`.
@@ -275,11 +295,51 @@ mod tests {
         ));
     }
 
+    /// The updater downloads an asset by exact name. If the workflow stops
+    /// producing that name the feature silently breaks, and the only way to
+    /// find out is a user reporting that updates never arrive — so the two are
+    /// pinned together here.
     #[test]
-    fn the_asset_name_matches_the_release_workflow() {
+    fn every_target_we_build_for_is_one_the_updater_would_ask_for() {
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+
+        let built: Vec<&str> = workflow
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- target: "))
+            .collect();
+        assert!(!built.is_empty(), "the workflow builds nothing");
+
+        assert!(
+            built.contains(&target_triple()),
+            "this build is {}, which the release workflow does not produce; \
+             `btdm update` could never find an asset for it. Workflow builds: {built:?}",
+            target_triple()
+        );
+    }
+
+    /// The workflow must actually publish a release. It previously only
+    /// uploaded 90-day CI artifacts, so `/releases/latest` was always empty and
+    /// the self-updater had never once worked.
+    #[test]
+    fn the_workflow_publishes_a_release_rather_than_only_artifacts() {
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+        assert!(
+            workflow.contains("action-gh-release"),
+            "nothing publishes a GitHub release, so `btdm update` can never \
+             find one"
+        );
+        assert!(
+            workflow.contains(".sha256"),
+            "the updater verifies a checksum before installing; the release \
+             has to carry one"
+        );
+    }
+
+    #[test]
+    fn the_asset_name_is_platform_specific() {
         let name = asset_name();
-        assert!(name.starts_with("btdm-"));
-        assert!(name.ends_with("-unknown-linux-musl"));
+        assert!(name.starts_with("btdm-"), "{name}");
+        assert!(name.contains(target_triple()), "{name}");
     }
 
     #[test]

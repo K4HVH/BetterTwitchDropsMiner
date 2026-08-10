@@ -10,6 +10,7 @@ btdm-core = { path = "../btdm-core" }
 btdm-twitch = { path = "../btdm-twitch" }
 btdm-web = { version = "0.1.0", path = "../btdm-web" }
 chrono.workspace = true
+getrandom.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "gzip", "rustls", "form", "charset", "http2"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

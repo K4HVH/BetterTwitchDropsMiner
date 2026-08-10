@@ -12,11 +12,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Generates a bearer token for a dashboard bound to a non-loopback address.
+///
+/// This guards a page that reflects a live Twitch session on whatever network
+/// the miner is reachable from, so it comes from the OS rather than from a
+/// hasher seeded for collision resistance.
 fn generate_token() -> String {
-    use std::hash::{BuildHasher, RandomState};
-    let a = RandomState::new().hash_one("btdm-web-a");
-    let b = RandomState::new().hash_one("btdm-web-b");
-    format!("{a:016x}{b:016x}")
+    btdm_twitch::client::random_hex_128()
 }
 
 fn is_loopback(addr: &SocketAddr) -> bool {
@@ -85,10 +86,30 @@ pub async fn run(
 
         // A dashboard reachable from the network exposes state derived from a
         // live Twitch session, so it is never left open.
-        let token = (!is_loopback(&addr)).then(generate_token);
-        if token.is_some() {
+        //
+        // The token is kept in the config once generated. Minting a fresh one
+        // on every start invalidated whatever URL the user had bookmarked and
+        // left `btdm control` unable to authenticate at all.
+        let token = if is_loopback(&addr) {
+            None
+        } else {
+            let existing = config.dashboard_token.clone();
+            let token = match existing {
+                Some(t) if !t.is_empty() => t,
+                _ => {
+                    let fresh = generate_token();
+                    if let Err(e) = opts.config_store.save_dashboard_token(&fresh).await {
+                        tracing::warn!(
+                            error = %e,
+                            "could not save the dashboard token; it will change on restart"
+                        );
+                    }
+                    fresh
+                }
+            };
             tracing::warn!(%addr, "dashboard is not on loopback; a token is required");
-        }
+            Some(token)
+        };
 
         let hub = hub.clone();
         tasks.spawn(async move {

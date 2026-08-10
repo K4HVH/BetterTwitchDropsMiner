@@ -57,7 +57,18 @@ pub trait TwitchApi: Send + Sync {
     async fn current_progress(&self, channel: &ChannelId)
     -> Result<Option<DropProgress>, ApiError>;
 
-    async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError>;
+    /// Claims an earned drop.
+    ///
+    /// `claim_id` is Twitch's `dropInstanceID` when it supplied one. It does
+    /// not always, so the campaign and drop are passed too: the transport can
+    /// reconstruct the id from them, and a drop that is plainly earned is not
+    /// abandoned merely because one field was absent.
+    async fn claim_drop(
+        &self,
+        drop: &DropId,
+        campaign: &CampaignId,
+        claim_id: Option<&str>,
+    ) -> Result<(), ApiError>;
 
     /// Claims the channel-points bonus chest on a channel.
     async fn claim_points(&self, channel: &ChannelId, claim_id: &str) -> Result<(), ApiError>;

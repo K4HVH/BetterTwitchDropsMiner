@@ -1,5 +1,6 @@
 mod auth_flow;
 mod config;
+mod control_cli;
 mod notify;
 mod run;
 mod storage;
@@ -56,6 +57,91 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Drive a running miner. Everything the dashboard can do, from a shell.
+    #[command(subcommand)]
+    Control(ControlCommand),
+}
+
+/// Every one of these reaches a *running* miner over its HTTP API and takes
+/// effect immediately. None of them require a restart, and none of them need
+/// the config file to be edited by hand.
+#[derive(Subcommand)]
+enum ControlCommand {
+    /// Show what every running account is doing.
+    Status,
+    /// Stop mining. Already-earned drops are still claimed.
+    Pause,
+    /// Start mining again.
+    Resume,
+    /// Change the selection strategy.
+    Strategy {
+        /// One of: deadline, priority, coverage, completionist, manual.
+        name: String,
+    },
+    /// Watch only this channel, under the manual strategy.
+    Pin {
+        /// Channel login. Omit with --clear to unpin.
+        channel: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Switch to a specific channel now, without changing the strategy.
+    Watch { channel: String },
+    /// Leave the current channel and choose again.
+    Switch,
+    /// Re-fetch campaigns now.
+    Sync,
+    /// Prefer a channel when the choice is otherwise close.
+    Favourite {
+        channel: String,
+        /// Remove it instead.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Never mine a game's campaigns.
+    ExcludeGame {
+        game: String,
+        /// Undo the exclusion.
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Never mine a specific campaign, by id.
+    ExcludeCampaign {
+        id: String,
+        #[arg(long)]
+        undo: bool,
+    },
+    /// Forget every channel and campaign penalty and try them all again.
+    ClearPenalties,
+}
+
+fn to_command(c: ControlCommand) -> Option<btdm_core::control::Command> {
+    use btdm_core::control::Command as C;
+    Some(match c {
+        ControlCommand::Status => return None,
+        ControlCommand::Pause => C::Pause,
+        ControlCommand::Resume => C::Resume,
+        ControlCommand::Strategy { name } => C::SetStrategy { name },
+        ControlCommand::Pin { channel, clear } => C::Pin {
+            channel: if clear { None } else { channel },
+        },
+        ControlCommand::Watch { channel } => C::WatchChannel { login: channel },
+        ControlCommand::Switch => C::SwitchChannel,
+        ControlCommand::Sync => C::SyncNow,
+        ControlCommand::Favourite { channel, remove } => C::SetFavourite {
+            login: channel,
+            on: !remove,
+        },
+        ControlCommand::ExcludeGame { game, undo } => C::SetGameExcluded {
+            game,
+            excluded: !undo,
+        },
+        ControlCommand::ExcludeCampaign { id, undo } => C::SetCampaignExcluded {
+            campaign: btdm_core::model::CampaignId(id),
+            excluded: !undo,
+        },
+        ControlCommand::ClearPenalties => C::ClearQuarantine,
+    })
 }
 
 fn default_data_dir() -> PathBuf {
@@ -116,6 +202,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Update { apply } => update::run(apply).await,
+        Command::Control(sub) => match to_command(sub) {
+            None => control_cli::show(&cfg).await,
+            Some(command) => control_cli::send(&cfg, &args.account, command).await,
+        },
         Command::Probe => {
             run::mine(
                 &storage,

@@ -236,6 +236,54 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
   });
 
+  // --- regression: a snapshot arriving mid-typing must not wipe the box ---
+  check("typing survives a pushed snapshot", () => {
+    const settings = [...doc.querySelectorAll(".tabs button")].find((b) =>
+      b.textContent.startsWith("Settings"));
+    settings.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+
+    const box = doc.querySelector("#priority-input");
+    if (!box) throw new Error("no priority-game input");
+    box.focus();
+    box.value = "Deadl";
+    box.dispatchEvent(new window.Event("input"));
+
+    // The miner confirms a minute of progress, as it does every heartbeat.
+    const pushed = JSON.parse(JSON.stringify(s));
+    pushed.totals.drops_claimed += 1;
+    window.__es.emit("snapshot", pushed);
+
+    const after = doc.querySelector("#priority-input");
+    if (!after) throw new Error("the input vanished");
+    if (after.value !== "Deadl") {
+      throw new Error(`half-typed text was wiped: got ${JSON.stringify(after.value)}`);
+    }
+    if (doc.activeElement !== after) throw new Error("focus was lost mid-word");
+  });
+
+  check("the pin box keeps an edit instead of snapping back", () => {
+    const pin = doc.querySelector("#pin-input");
+    if (!pin) throw new Error("no pin input");
+    pin.value = "somestreamer";
+    pin.dispatchEvent(new window.Event("input"));
+    window.__es.emit("snapshot", JSON.parse(JSON.stringify(s)));
+    if (doc.querySelector("#pin-input").value !== "somestreamer") {
+      throw new Error("the pin edit was discarded");
+    }
+  });
+
+  check("a snapshot for another account does not rebuild the page", () => {
+    const other = JSON.parse(JSON.stringify(s));
+    other.account = "second-account";
+    const box = doc.querySelector("#pin-input");
+    box.focus();
+    window.__es.emit("snapshot", other);
+    // Rendering for a background account would blow away focus here.
+    if (doc.activeElement !== doc.querySelector("#pin-input")) {
+      throw new Error("a background account's update stole focus");
+    }
+  });
+
   console.log("");
   if (errors.length) {
     console.log(`FAILURES (${errors.length}):`);
