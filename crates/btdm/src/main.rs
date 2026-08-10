@@ -2,6 +2,7 @@ mod auth_flow;
 mod config;
 mod run;
 mod storage;
+mod supervisor;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -36,8 +37,15 @@ enum Command {
     Status,
     /// Remove a stored token.
     Logout,
-    /// Mine drops until interrupted.
-    Mine,
+    /// Mine drops until interrupted, with the dashboard.
+    Mine {
+        /// Do not start the web dashboard.
+        #[arg(long)]
+        headless: bool,
+        /// Mine only the --account given, rather than every linked account.
+        #[arg(long)]
+        only_this_account: bool,
+    },
     /// Run a single pass and report what the miner sees, then exit.
     Probe,
 }
@@ -84,11 +92,29 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Mine => {
-            run::mine(&storage, &args.account, &cfg, run::RunOptions { probe: false }).await
+        Command::Mine {
+            headless,
+            only_this_account,
+        } => {
+            supervisor::run(
+                std::sync::Arc::new(storage),
+                cfg,
+                supervisor::SupervisorOptions {
+                    headless,
+                    only: only_this_account.then(|| args.account.clone()),
+                },
+            )
+            .await
         }
         Command::Probe => {
-            run::mine(&storage, &args.account, &cfg, run::RunOptions { probe: true }).await
+            run::mine(
+                &storage,
+                &args.account,
+                &cfg,
+                run::RunOptions { probe: true },
+                None,
+            )
+            .await
         }
     }
 }

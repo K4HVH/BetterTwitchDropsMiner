@@ -1,0 +1,16 @@
+[package]
+name = "btdm-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+btdm-core = { path = "../btdm-core" }
+axum = "0.8"
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing.workspace = true

@@ -9,6 +9,7 @@ use btdm_twitch::auth::AuthClient;
 use btdm_twitch::client::build_http_client;
 use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
+use btdm_web::Hub;
 use chrono::{Duration, Utc};
 use std::time::Duration as StdDuration;
 
@@ -29,6 +30,7 @@ pub async fn mine(
     account: &str,
     config: &Config,
     opts: RunOptions,
+    hub: Option<Hub>,
 ) -> anyhow::Result<()> {
     let tokens = storage
         .get_tokens(account)?
@@ -138,8 +140,11 @@ pub async fn mine(
             }
         }
 
-        drain_events(&mut engine, storage, account)?;
+        drain_events(&mut engine, storage, account, hub.as_ref())?;
         report_status(&engine, now);
+        if let Some(hub) = &hub {
+            hub.publish(engine.snapshot(account, Some(&validated.login), now));
+        }
 
         if opts.probe {
             tracing::info!("probe mode: one pass complete");
@@ -166,7 +171,14 @@ pub async fn mine(
                     match msg {
                         Some(event) => {
                             handle_pubsub(&mut engine, event);
-                            drain_events(&mut engine, storage, account)?;
+                            drain_events(&mut engine, storage, account, hub.as_ref())?;
+                            if let Some(hub) = &hub {
+                                hub.publish(engine.snapshot(
+                                    account,
+                                    Some(&validated.login),
+                                    Utc::now(),
+                                ));
+                            }
                         }
                         // The supervisor retries forever, so this only happens
                         // if it stopped entirely.
@@ -329,10 +341,14 @@ fn drain_events<A: TwitchApi>(
     engine: &mut Engine<A>,
     storage: &Storage,
     account: &str,
+    hub: Option<&Hub>,
 ) -> anyhow::Result<()> {
     for event in engine.drain_events() {
         tracing::info!(kind = ?event.kind, "event");
         storage.append_event(account, &event)?;
+        if let Some(hub) = hub {
+            hub.emit(account, event);
+        }
     }
     Ok(())
 }
