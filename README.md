@@ -24,6 +24,19 @@ entirely, so it grinds at campaigns that can never progress.
 
 **Feasibility is computed.** A campaign needing four hours with three hours left
 is impossible; it is dropped with a reason instead of consuming the watch slot.
+Tiers locked behind unclaimed ones count towards the total, so a one-hour drop
+gating a five-hour one is judged on six hours, not one.
+
+**One channel, several campaigns.** Twitch runs multiple campaigns for the same
+game, and an hour of watching counts for all of them at once. Every strategy
+scores a channel on everything it advances, so a stream serving four campaigns
+beats one serving a single campaign — and the dashboard says which.
+
+**The dashboard is a control surface, not a status page.** Strategy, pause,
+pin, favourites, priority games, per-campaign and per-game exclusions, switch
+channel, watch a specific channel, resync — all live, no restart, written back
+to `config.toml`. Everything on it is also on the CLI, because a headless box
+should not need a browser.
 
 **Recovery is a ladder, not a restart.** On a confirmed stall: resend the
 heartbeat, re-fetch stream info (a restarted broadcast earns nothing while
@@ -54,7 +67,27 @@ finished binary, dashboard included.
 | `btdm logout` | Remove a stored token |
 | `btdm mine [--headless]` | Mine every linked account |
 | `btdm probe` | One diagnostic pass, then exit |
+| `btdm control <cmd>` | Drive a running miner — see below |
 | `btdm update [--apply]` | Check for a newer release; install only with `--apply` |
+
+### Controlling a running miner
+
+Every control on the dashboard is on the CLI, over the same API, taking effect
+immediately:
+
+```sh
+btdm control status                    # what every account is doing
+btdm control pause | resume
+btdm control strategy coverage
+btdm control watch somestreamer        # switch to a channel now
+btdm control switch                    # leave the current one and re-choose
+btdm control sync                      # re-fetch campaigns now
+btdm control favourite somestreamer [--remove]
+btdm control pin somestreamer [--clear]
+btdm control exclude-game "Some Game" [--undo]
+btdm control exclude-campaign <id> [--undo]
+btdm control clear-penalties           # forget every channel and campaign penalty
+```
 
 Add `--account <name>` to any command to manage a second account, and
 `--only-this-account` to `mine` to run just that one.
@@ -72,6 +105,7 @@ state lives in `state.db` beside it. Both are created mode `0600`.
 ```toml
 bind = "127.0.0.1:8080"
 # discord_webhook = "https://discord.com/api/webhooks/..."
+# proxy = "http://user:pass@host:port"   # all accounts, unless overridden
 
 [[accounts]]
 name = "default"
@@ -79,17 +113,43 @@ strategy = "deadline"
 priority_games = ["Deadlock", "Sea of Thieves"]
 favourite_channels = ["somestreamer"]
 # pinned_channel = "somestreamer"
+# excluded_games = ["Some Game I Own Everything For"]
+# proxy = "http://..."                   # this account only
+
+# Everything below has a working default. Tune it for a slow connection or a
+# very small box; values that would stop mining outright are clamped.
+[timing]
+watch_interval_secs = 60
+poll_interval_secs = 120
+sync_interval_mins = 10
+reselect_interval_mins = 10
+channels_per_game = 30
+max_channels_per_campaign = 8
+availability_checks = 160
+check_concurrency = 8
+suspect_after_secs = 150
+stalled_after_secs = 360
+recovery_cooldown_secs = 60
 ```
+
+Anything the dashboard or `btdm control` changes is written back here, so
+settings survive a restart.
 
 ### Strategies
 
 | Strategy | Behaviour |
 |---|---|
 | `deadline` *(default)* | Earliest deadline first over campaigns that can still be finished. Nothing achievable is lost to expiry. |
-| `priority` | Strict top-down ordering of `priority_games`. |
-| `coverage` | Prefer the channel advancing the most drops at once. |
-| `completionist` | Finish one campaign before starting another. |
+| `availability` | Least headroom first: time left measured against work left. Better than `deadline` across a mix of short and long campaigns. |
+| `priority` | `priority_games` first, top down, then everything else by urgency. Never sits idle. |
+| `priority-only` | Only the listed games, even if that means mining nothing. |
+| `coverage` | The channel advancing the most campaigns at once. |
+| `completionist` | Finish the campaign closest to done before starting another. |
 | `manual` | Watch `pinned_channel` and nothing else. |
+
+The choice is reconsidered periodically rather than only when idle, so a
+campaign that becomes urgent can take over — with hysteresis, so it does not
+thrash between two near-equal channels.
 
 `favourite_channels` is not a strategy — it is a tie-break applied under all of
 them, so when two channels are equally good for drops the one you care about
@@ -120,12 +180,16 @@ and VPN filters commonly block it — and it is the *only* endpoint that advance
 drop time. Every miner depends on it; most fail silently when it is blocked.
 This one says so.
 
-**A campaign shows as `NotLinked`.** Link your game account at
-<https://www.twitch.tv/drops/campaigns>. The miner will never mine an unlinked
-campaign, because doing so cannot earn anything.
+**A campaign says your account is not linked.** The dashboard's Unavailable tab
+links straight to the right page for each one. The miner will never mine an
+unlinked campaign, because doing so cannot earn anything.
 
-**A campaign shows as `Infeasible`.** It cannot be finished before it expires.
-This is a statement about the clock, not a bug.
+**A campaign says there is not enough time left.** It cannot be finished before
+it expires. This is a statement about the clock, not a bug.
+
+**Is it actually working?** `GET /api/health` returns 503 when any account has
+stalled, and carries no account names, channels or campaigns — it is the one
+unauthenticated route, and the Docker image uses it as its healthcheck.
 
 ## Security
 
@@ -134,7 +198,8 @@ like a password file. There is no keyring on a headless Pi, so this is a
 deliberate, documented trade-off rather than an oversight.
 
 The dashboard binds to loopback by default. Binding anywhere else generates a
-bearer token, printed once at startup and required thereafter.
+bearer token from OS entropy, stores it in `config.toml` so a restart does not
+invalidate your bookmark, and requires it on every route except `/api/health`.
 
 ## Architecture
 
@@ -150,6 +215,11 @@ a live account. A test that fails the build if a networking dependency enters
 | `btdm-twitch` | Auth, GraphQL transport, spade heartbeat, PubSub |
 | `btdm-web` | Dashboard: axum, SSE, embedded assets |
 | `btdm` | Config, storage, CLI, supervisor |
+
+The dashboard is a single hand-written HTML file with no build step. The cost
+is that `cargo test` cannot prove it renders, so `tools/render-check` loads it
+into jsdom against a real snapshot and drives every tab and control. Run it by
+hand when changing the page.
 
 Design and implementation notes live in `docs/superpowers/`.
 
