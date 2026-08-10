@@ -91,8 +91,10 @@ remaining object. `devdata/`, `*.db` and `config.toml` are now in `.gitignore`.
 
 ## Known gaps
 
-- `run.rs` remains the least-tested file. Its recovery ladder is exercised
-  through `btdm-core` tests, but the loop itself is verified by running it.
+- `run.rs` is the thinnest remaining untested surface: the outer loop's
+  sequencing and the PubSub supervisor are verified by running the binary
+  rather than by tests. The recovery mechanics it used to own now live in the
+  engine and are covered there.
 - Fixture JSON is hand-built from observed shapes. Captured real responses would
   be stronger.
 - Token refresh is not implemented. This turned out not to matter: Twitch
