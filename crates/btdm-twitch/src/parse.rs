@@ -5,6 +5,7 @@
 //! mysterious runtime behaviour.
 
 use crate::TwitchError;
+use btdm_core::api::DropProgress;
 use btdm_core::model::*;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -353,22 +354,39 @@ pub fn parse_available_drops(data: &Value) -> Vec<DropId> {
     ids
 }
 
-pub fn parse_current_progress(data: &Value) -> Option<btdm_core::api::DropProgress> {
+/// Returns the channel the session belongs to alongside the progress.
+///
+/// The channel matters: Twitch reports a single drop session per *account*,
+/// so if the user is also watching in a browser this query returns the
+/// browser's progress. Without the channel the miner cannot tell that apart
+/// from its own, and an unrelated session would keep resetting its stall clock
+/// while it earned nothing.
+pub fn parse_current_progress(data: &Value) -> Option<(Option<ChannelId>, DropProgress)> {
     let session = data
         .get("currentUser")
         .filter(|v| !v.is_null())
         .and_then(|u| u.get("dropCurrentSession"))
         .filter(|v| !v.is_null())?;
 
-    Some(btdm_core::api::DropProgress {
-        drop_id: DropId(session.get("dropID")?.as_str()?.to_owned()),
-        current_minutes: session
-            .get("currentMinutesWatched")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
-        required_minutes: session
-            .get("requiredMinutesWatched")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
-    })
+    let channel = session
+        .get("channel")
+        .filter(|c| !c.is_null())
+        .and_then(|c| c.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| ChannelId(s.to_owned()));
+
+    Some((
+        channel,
+        DropProgress {
+            drop_id: DropId(session.get("dropID")?.as_str()?.to_owned()),
+            current_minutes: session
+                .get("currentMinutesWatched")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            required_minutes: session
+                .get("requiredMinutesWatched")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+        },
+    ))
 }

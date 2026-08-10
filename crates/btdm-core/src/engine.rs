@@ -13,6 +13,7 @@ use crate::eligibility;
 use crate::event::{EventKind, MinerEvent, RejectReason};
 use crate::model::*;
 use crate::progress::ProgressTracker;
+use crate::snapshot::{self, RejectedView, Snapshot, Totals, WatchingView};
 use crate::strategy::{self, Candidate, Decision, MiningStrategy, WorldView};
 use crate::watchdog::{Quarantine, Verdict, Watchdog, WatchdogConfig};
 use chrono::{DateTime, Duration, Utc};
@@ -74,6 +75,8 @@ pub struct Engine<A: TwitchApi> {
     favourites: HashSet<String>,
     priority_games: Vec<String>,
     campaigns: Vec<DropCampaign>,
+    /// Why each unavailable campaign was rejected, for the dashboard.
+    rejected: Vec<RejectedView>,
     current: Option<(Channel, Stream, CampaignId)>,
     progress: ProgressTracker,
     watchdog: Watchdog,
@@ -112,6 +115,7 @@ impl<A: TwitchApi> Engine<A> {
             priority_games,
             config,
             campaigns: Vec::new(),
+            rejected: Vec::new(),
             current: None,
             progress: ProgressTracker::new(),
             events: Vec::new(),
@@ -122,6 +126,76 @@ impl<A: TwitchApi> Engine<A> {
 
     pub fn strategy_name(&self) -> &'static str {
         self.strategy.name()
+    }
+
+    /// A serialisable view of the current state, for the dashboard.
+    ///
+    /// Rejected campaigns are recomputed here rather than replayed from the
+    /// event log, so the dashboard always shows the *current* reason a
+    /// campaign is unavailable rather than a stale one.
+    pub fn snapshot(&self, account: &str, login: Option<&str>, now: DateTime<Utc>) -> Snapshot {
+        let watching = self.current.as_ref().map(|(channel, _, campaign)| {
+            let active = self.progress.active();
+            let drop_name = active.and_then(|(id, _)| {
+                self.campaigns
+                    .iter()
+                    .flat_map(|c| &c.drops)
+                    .find(|d| &d.id == id)
+                    .map(|d| d.name.clone())
+            });
+            let since = self.progress.since_last_confirmation(now);
+
+            WatchingView {
+                channel_login: channel.login.clone(),
+                channel_display_name: channel.display_name.clone(),
+                campaign: self
+                    .campaigns
+                    .iter()
+                    .find(|c| &c.id == campaign)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| campaign.0.clone()),
+                drop_name,
+                current_minutes: active.map(|(_, p)| p.current_minutes),
+                required_minutes: active.map(|(_, p)| p.required_minutes),
+                seconds_since_confirmation: since.map(|d| d.num_seconds()),
+                stalled: since.is_some_and(|d| d >= self.config.watchdog.stalled_after),
+            }
+        });
+
+        let eligible: Vec<_> = self
+            .campaigns
+            .iter()
+            .map(|c| snapshot::campaign_view(c, now))
+            .collect();
+
+        let totals = Totals {
+            campaigns_known: self.campaigns.len() + self.rejected.len(),
+            campaigns_eligible: self.campaigns.len(),
+            drops_claimed: self
+                .campaigns
+                .iter()
+                .flat_map(|c| &c.drops)
+                .filter(|d| d.is_claimed)
+                .count(),
+            drops_remaining: self
+                .campaigns
+                .iter()
+                .flat_map(|c| &c.drops)
+                .filter(|d| !d.is_claimed)
+                .count(),
+        };
+
+        Snapshot {
+            account: account.to_owned(),
+            login: login.map(str::to_owned),
+            strategy: self.strategy.name().to_owned(),
+            state: format!("{:?}", self.state()),
+            generated_at: now,
+            watching,
+            eligible,
+            rejected: self.rejected.clone(),
+            totals,
+        }
     }
 
     /// Ask the watchdog whether the current session is healthy.
@@ -349,18 +423,28 @@ impl<A: TwitchApi> Engine<A> {
         );
 
         let mut eligible = Vec::new();
+        let mut rejected = Vec::new();
         for campaign in merged.into_values() {
             match eligibility::assess(&campaign, now) {
                 Ok(()) => eligible.push(campaign),
-                Err(reason) => self.emit(
-                    now,
-                    EventKind::CampaignRejected {
-                        campaign: campaign.id.clone(),
-                        reason,
-                    },
-                ),
+                Err(reason) => {
+                    rejected.push(RejectedView {
+                        id: campaign.id.0.clone(),
+                        name: campaign.name.clone(),
+                        game: campaign.game.name.clone(),
+                        reason: format!("{reason:?}"),
+                    });
+                    self.emit(
+                        now,
+                        EventKind::CampaignRejected {
+                            campaign: campaign.id.clone(),
+                            reason,
+                        },
+                    );
+                }
             }
         }
+        self.rejected = rejected;
 
         // Deterministic order: soonest deadline first, so behaviour is
         // reproducible rather than dependent on hash iteration order.
@@ -622,8 +706,34 @@ impl<A: TwitchApi> Engine<A> {
         Ok(())
     }
 
+    /// Whether a drop belongs to the campaign currently being watched.
+    ///
+    /// Twitch reports drop events per *account*, not per session. If the user
+    /// is also watching in a browser, those events arrive here too. Letting
+    /// them count would reset the stall clock while this miner earned nothing
+    /// — the precise failure this project exists to prevent, so the check is
+    /// deliberately strict.
+    fn is_progress_for_current_campaign(&self, drop: &DropId) -> bool {
+        let Some((_, _, campaign_id)) = &self.current else {
+            return false;
+        };
+        self.campaigns
+            .iter()
+            .find(|c| &c.id == campaign_id)
+            .is_some_and(|c| c.drops.iter().any(|d| &d.id == drop))
+    }
+
     /// Records confirmed progress, whether it arrived by websocket or by poll.
+    ///
+    /// Progress for anything other than the campaign being watched is ignored.
     pub fn on_pushed_progress(&mut self, p: DropProgress, now: DateTime<Utc>) {
+        if !self.is_progress_for_current_campaign(&p.drop_id) {
+            tracing::debug!(
+                drop = %p.drop_id,
+                "ignoring progress for a drop this session is not mining"
+            );
+            return;
+        }
         if !self.progress.record(p.clone(), now) {
             return;
         }

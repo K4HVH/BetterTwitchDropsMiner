@@ -137,6 +137,12 @@ impl TwitchApi for TwitchClient {
 
         match self.watch.send(&url, channel, stream, &self.user_id).await {
             Ok(()) => Ok(()),
+            // A rate limit or auth problem says nothing about whether the
+            // cached URL is still correct. Rediscovering would fire two extra
+            // requests while already being throttled.
+            Err(e @ (crate::TwitchError::RateLimited | crate::TwitchError::Unauthorized)) => {
+                Err(e.into())
+            }
             Err(e) => {
                 // A rotated deployment invalidates the cached URL. Drop it so
                 // the next attempt rediscovers rather than failing forever.
@@ -148,10 +154,37 @@ impl TwitchApi for TwitchClient {
 
     async fn current_progress(
         &self,
-        _channel: &ChannelId,
+        channel: &ChannelId,
     ) -> Result<Option<DropProgress>, ApiError> {
-        let data = self.gql.run(&ops::CURRENT_DROP, json!({})).await?;
-        Ok(parse::parse_current_progress(&data))
+        // The variables are what scope this to our channel server-side. Sending
+        // none returns whatever session the account has open — including one
+        // from a browser the user happens to be watching in.
+        let data = self
+            .gql
+            .run(
+                &ops::CURRENT_DROP,
+                json!({ "channelID": channel.0, "channelLogin": "" }),
+            )
+            .await?;
+
+        let Some((session_channel, progress)) = parse::parse_current_progress(&data) else {
+            return Ok(None);
+        };
+
+        // Belt and braces: even scoped, confirm the session is ours before
+        // letting it count. Accepting another channel's progress would reset
+        // the stall clock while this channel earned nothing.
+        if let Some(actual) = session_channel
+            && &actual != channel
+        {
+            tracing::debug!(
+                session_channel = %actual,
+                watching = %channel,
+                "ignoring a drop session belonging to a different channel"
+            );
+            return Ok(None);
+        }
+        Ok(Some(progress))
     }
 
     async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError> {

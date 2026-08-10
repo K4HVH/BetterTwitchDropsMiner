@@ -305,6 +305,7 @@ async fn a_websocket_claim_notification_triggers_a_claim() {
 async fn pushed_progress_updates_the_campaign_view() {
     let mut e = engine(happy_path());
     e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
 
     e.on_pushed_progress(
         DropProgress {
@@ -582,4 +583,94 @@ async fn the_availability_check_budget_bounds_requests_per_pass() {
     e.sync(now()).await.unwrap();
     e.select_channel(now()).await.unwrap();
     // Budget respected; without it this would be 100 sequential requests.
+}
+
+
+/// Twitch reports drop events per *account*, not per session. If the user is
+/// also watching in a browser, those events arrive here too. Counting them
+/// would reset the stall clock while this miner earned nothing — the exact
+/// failure this project exists to prevent.
+#[tokio::test]
+async fn progress_for_a_drop_we_are_not_mining_is_ignored() {
+    let fake = happy_path();
+    *fake.inventory.lock().unwrap() = vec![
+        campaign("c1", true, vec![drop("d1", 60, 0)]),
+        campaign("c-elsewhere", true, vec![drop("d-elsewhere", 60, 0)]),
+    ];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.drain_events();
+
+    let later = now() + chrono::Duration::seconds(300);
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d-elsewhere"),
+            current_minutes: 42,
+            required_minutes: 60,
+        },
+        later,
+    );
+
+    assert!(
+        !e.drain_events()
+            .into_iter()
+            .any(|ev| matches!(ev.kind, EventKind::ProgressConfirmed { .. })),
+        "another campaign's progress must not be reported as ours"
+    );
+    assert_eq!(
+        e.since_last_confirmation(later),
+        Some(chrono::Duration::seconds(300)),
+        "the stall clock must keep running — this session has confirmed nothing"
+    );
+}
+
+#[tokio::test]
+async fn progress_arriving_while_idle_is_ignored() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    // Deliberately no select_channel: nothing is being watched.
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d1"),
+            current_minutes: 5,
+            required_minutes: 60,
+        },
+        now(),
+    );
+    assert!(e.active_drop().is_none());
+}
+
+/// A stall must not be cleared by unrelated progress.
+#[tokio::test]
+async fn an_unrelated_drop_cannot_clear_a_stall() {
+    let fake = happy_path();
+    *fake.inventory.lock().unwrap() = vec![
+        campaign("c1", true, vec![drop("d1", 60, 0)]),
+        campaign("c-other", true, vec![drop("d-other", 60, 0)]),
+    ];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let stalled = now() + chrono::Duration::seconds(400);
+    assert!(matches!(e.assess_health(stalled), Verdict::Escalate(_)));
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d-other"),
+            current_minutes: 10,
+            required_minutes: 60,
+        },
+        stalled,
+    );
+
+    let still_stalled = stalled + chrono::Duration::seconds(120);
+    assert!(
+        matches!(e.assess_health(still_stalled), Verdict::Escalate(_) | Verdict::Waiting),
+        "the stall must survive another campaign's progress"
+    );
 }

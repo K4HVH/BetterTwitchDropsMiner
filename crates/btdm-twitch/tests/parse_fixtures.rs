@@ -182,7 +182,12 @@ fn current_progress_parses_an_active_session() {
             "dropID": "drop-1"
         }}
     });
-    let p = parse_current_progress(&v).unwrap();
+    let (channel, p) = parse_current_progress(&v).unwrap();
+    assert_eq!(
+        channel,
+        Some(ChannelId::from("ch-1")),
+        "the session's channel is what lets the caller reject another session's progress"
+    );
     assert_eq!(p.drop_id, DropId::from("drop-1"));
     assert_eq!(p.current_minutes, 23);
     assert_eq!(p.required_minutes, 60);

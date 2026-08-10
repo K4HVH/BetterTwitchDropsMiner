@@ -87,6 +87,9 @@ pub const AVAILABLE_DROPS: GqlOperation = GqlOperation {
 pub const CURRENT_DROP: GqlOperation = GqlOperation {
     name: "DropCurrentSessionContext",
     sha256: "4d06b702d25d652afb9ef835d2a550031f1cf762b193523a92166f40ea3d142b",
+    // The persisted query takes channelID/channelLogin and scopes server-side;
+    // the raw fallback cannot express that, so it returns whatever session the
+    // account has open and the caller filters on the returned channel id.
     raw_query: r#"query DropCurrentSessionContext {
   currentUser {
     dropCurrentSession {
