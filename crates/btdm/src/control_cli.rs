@@ -105,7 +105,10 @@ pub async fn send(config: &Config, account: &str, command: Command) -> anyhow::R
 
 /// Prints what every running account is doing. The point is that this is the
 /// same data the dashboard renders, so the two can never disagree.
-pub async fn show(config: &Config) -> anyhow::Result<()> {
+///
+/// `json` emits the snapshot verbatim, for a monitoring script or a status
+/// bar — the human format is for reading, not for parsing.
+pub async fn show(config: &Config, json: bool) -> anyhow::Result<()> {
     let endpoint = Endpoint::from_config(config)?;
     let http = reqwest::Client::new();
 
@@ -118,6 +121,12 @@ pub async fn show(config: &Config) -> anyhow::Result<()> {
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         anyhow::bail!("the miner rejected the request: no valid token in config.toml");
     }
+    if json {
+        // Straight through, so a script sees exactly what the dashboard does.
+        println!("{}", res.text().await?);
+        return Ok(());
+    }
+
     let snapshots: Vec<Snapshot> = res.json().await?;
 
     if snapshots.is_empty() {
