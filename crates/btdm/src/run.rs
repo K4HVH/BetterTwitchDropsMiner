@@ -7,6 +7,7 @@ use btdm_core::engine::{Engine, EngineConfig, MiningState};
 use btdm_twitch::api_impl::TwitchClient;
 use btdm_twitch::auth::AuthClient;
 use btdm_twitch::client::build_http_client;
+use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
 use chrono::{Duration, Utc};
 use std::time::Duration as StdDuration;
@@ -15,8 +16,6 @@ use std::time::Duration as StdDuration;
 const SYNC_INTERVAL: Duration = Duration::minutes(30);
 /// How often the access token is re-validated.
 const AUTH_CHECK_INTERVAL: Duration = Duration::minutes(60);
-/// No confirmed progress for this long means the session is not mining.
-const STALL_THRESHOLD: Duration = Duration::seconds(360);
 /// Backoff ceiling for PubSub reconnection.
 const PUBSUB_MAX_BACKOFF: StdDuration = StdDuration::from_secs(180);
 
@@ -28,7 +27,7 @@ pub struct RunOptions {
 pub async fn mine(
     storage: &Storage,
     account: &str,
-    _config: &Config,
+    config: &Config,
     opts: RunOptions,
 ) -> anyhow::Result<()> {
     let tokens = storage
@@ -47,9 +46,22 @@ pub async fn mine(
         validated.login.clone(),
     );
 
-    let engine_config = EngineConfig::default();
+    let account_config = config.account(account);
+    let engine_config = EngineConfig {
+        strategy: account_config.strategy.clone(),
+        favourites: account_config.favourite_channels.clone(),
+        priority_games: account_config.priority_games.clone(),
+        pinned: account_config.pinned_channel.clone(),
+        ..EngineConfig::default()
+    };
     let watch_interval = engine_config.watch_interval.to_std()?;
     let mut engine = Engine::new(api, engine_config);
+    tracing::info!(
+        strategy = engine.strategy_name(),
+        favourites = account_config.favourite_channels.len(),
+        priority_games = account_config.priority_games.len(),
+        "engine configured"
+    );
 
     // Push channel for drop progress and claim notifications.
     let mut pubsub_rx = connect_pubsub(&tokens.access_token, &validated.user_id).await;
@@ -86,18 +98,26 @@ pub async fn mine(
         }
 
         // --- watchdog ---------------------------------------------------------
-        if engine.current_channel().is_some()
-            && let Some(since) = engine.since_last_confirmation(now)
-            && since >= STALL_THRESHOLD
-        {
-            tracing::warn!(
-                stalled_for_secs = since.num_seconds(),
-                state = ?engine.state(),
-                "no confirmed progress; abandoning this channel"
-            );
-            engine.switch_away(now);
-            // Force a fresh look at the world before choosing again.
-            last_sync = None;
+        match engine.assess_health(now) {
+            Verdict::Healthy | Verdict::Waiting => {}
+            Verdict::Suspect => {
+                tracing::debug!(
+                    quiet_secs = engine.since_last_confirmation(now).map(|d| d.num_seconds()),
+                    "quiet for longer than expected"
+                );
+            }
+            Verdict::Escalate(step) => {
+                if work_recovery_rung(&mut engine, &auth, &tokens.access_token, step, now).await {
+                    last_sync = None;
+                }
+            }
+            Verdict::Exhausted => {
+                tracing::error!(
+                    "recovery exhausted; quarantining this campaign and looking elsewhere"
+                );
+                engine.quarantine_current_campaign(now);
+                last_sync = None;
+            }
         }
 
         // --- token liveness ----------------------------------------------------
@@ -162,6 +182,71 @@ pub async fn mine(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Works one rung of the recovery ladder. Returns whether campaigns should be
+/// re-synced afterwards.
+///
+/// Every rung logs what it did and what it found, so a recovery is a readable
+/// story in the event log rather than an unexplained channel change.
+async fn work_recovery_rung(
+    engine: &mut Engine<TwitchClient>,
+    auth: &AuthClient,
+    token: &str,
+    step: RecoveryStep,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    tracing::warn!(?step, "no confirmed progress; working the recovery ladder");
+
+    match step {
+        RecoveryStep::ResendWatch => {
+            engine.force_next_watch();
+            false
+        }
+        RecoveryStep::RefreshStreamInfo => {
+            match engine.refresh_stream_info(now).await {
+                // The broadcast ID moved, so heartbeats were earning nothing.
+                Ok(true) => engine.force_next_watch(),
+                Ok(false) => tracing::debug!("stream info unchanged"),
+                Err(e) => tracing::warn!(error = %e, "could not refresh stream info"),
+            }
+            false
+        }
+        RecoveryStep::ReverifyEligibility => match engine.reverify_current_channel().await {
+            Ok(true) => {
+                tracing::info!("Twitch still says this channel progresses our drops");
+                false
+            }
+            Ok(false) => {
+                tracing::warn!("Twitch says this channel progresses nothing; leaving");
+                engine.quarantine_current(now);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "re-verification failed");
+                false
+            }
+        },
+        RecoveryStep::SwitchChannel => {
+            engine.quarantine_current(now);
+            true
+        }
+        RecoveryStep::ResyncCampaigns => true,
+        RecoveryStep::ValidateAuth => {
+            match auth.validate(token).await {
+                Ok(v) => tracing::info!(login = %v.login, "token is still valid"),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "token validation failed — mining cannot recover without a new login"
+                ),
+            }
+            false
+        }
+        RecoveryStep::QuarantineCampaign => {
+            engine.quarantine_current_campaign(now);
+            true
         }
     }
 }
