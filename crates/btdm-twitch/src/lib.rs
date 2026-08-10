@@ -5,6 +5,7 @@ pub mod auth;
 pub mod client;
 pub mod gql;
 pub mod operations;
+pub mod endpoints;
 pub mod parse;
 pub mod pubsub;
 pub mod watch;

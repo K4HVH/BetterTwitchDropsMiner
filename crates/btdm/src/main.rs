@@ -1,12 +1,4 @@
-mod auth_flow;
-mod config;
-mod control_cli;
-mod enrol;
-mod notify;
-mod run;
-mod storage;
-mod supervisor;
-mod update;
+use btdm::{auth_flow, config, control_cli, run, storage, supervisor, update};
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

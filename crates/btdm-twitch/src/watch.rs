@@ -15,7 +15,11 @@ use std::sync::LazyLock;
 pub const MOBILE_BASE_URL: &str = "https://m.twitch.tv";
 
 static SPADE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r#""spade_?[Uu]rl"\s*:\s*"(https://[.\w\-/]+)""#).expect("valid regex")
+    // `http` as well as `https`: the page carrying this was itself fetched
+    // over TLS, so refusing a plain-http value buys nothing — and it is what
+    // makes the heartbeat, the single request that advances drop time,
+    // testable against a local fake rather than only observable in production.
+    regex::Regex::new(r#""spade_?[Uu]rl"\s*:\s*"(https?://[.\w\-/:]+)""#).expect("valid regex")
 });
 
 static SETTINGS_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -101,7 +105,7 @@ impl WatchClient {
 
     /// Walks the chain: channel page -> (settings JS) -> spade URL.
     pub async fn discover_spade_url(&self, channel_login: &str) -> Result<String, TwitchError> {
-        let page_url = format!("{MOBILE_BASE_URL}/{channel_login}");
+        let page_url = format!("{}/{channel_login}", crate::endpoints::mobile_base());
         let html = self
             .http
             .get(&page_url)

@@ -92,9 +92,9 @@ impl AuthClient {
         Self {
             http,
             device_id,
-            device_url: DEVICE_URL.to_owned(),
-            token_url: TOKEN_URL.to_owned(),
-            validate_url: VALIDATE_URL.to_owned(),
+            device_url: crate::endpoints::device(),
+            token_url: crate::endpoints::token(),
+            validate_url: crate::endpoints::validate(),
         }
     }
 

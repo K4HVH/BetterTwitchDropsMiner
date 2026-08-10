@@ -380,7 +380,7 @@ fn spawn_pubsub_supervisor(
         let mut backoff = StdDuration::from_secs(1);
 
         loop {
-            match pubsub::connect(pubsub::PUBSUB_URL, &token, base.clone()).await {
+            match pubsub::connect(&btdm_twitch::endpoints::pubsub(), &token, base.clone()).await {
                 Ok(mut socket) => {
                     tracing::info!("pubsub connected");
                     backoff = StdDuration::from_secs(1);
