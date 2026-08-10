@@ -3,6 +3,11 @@
 //! Accounts share nothing but the dashboard. A crash, a revoked token or a
 //! stalled campaign on one account cannot affect another, which is exactly
 //! what "independent miners, shared UI" has to mean to be worth anything.
+//!
+//! That principle used to stop at the supervisor: the first task to finish
+//! ended the process, so a single expired token took down every other
+//! account's miner *and* the dashboard — the one thing that could have told
+//! you what happened, or let you fix it.
 
 use crate::config::{Config, ConfigStore};
 use crate::run::{self, RunOptions};
@@ -10,6 +15,7 @@ use crate::storage::Storage;
 use btdm_web::Hub;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Generates a bearer token for a dashboard bound to a non-loopback address.
 ///
@@ -49,7 +55,10 @@ pub async fn run(
         None => linked,
     };
 
-    if accounts.is_empty() {
+    // With a dashboard there is somewhere to log in, so no linked account is a
+    // starting state rather than a fatal one. Headless, it is fatal: nothing
+    // would ever happen and nobody would be told why.
+    if accounts.is_empty() && opts.headless {
         anyhow::bail!("no accounts are linked. Run: btdm login");
     }
     tracing::info!(accounts = ?accounts, "starting miners");
@@ -58,14 +67,21 @@ pub async fn run(
     // The dashboard reads the stored log through this, so a page opened after
     // a restart shows what happened while nobody was looking.
     hub.set_history(Arc::new(StoredHistory(Arc::clone(&storage))));
-    let mut tasks = tokio::task::JoinSet::new();
 
-    for account in accounts {
+    let (start_tx, mut start_rx) = mpsc::channel::<String>(8);
+    hub.set_enrolment(Arc::new(crate::enrol::Enroller::new(
+        Arc::clone(&storage),
+        hub.clone(),
+        start_tx.clone(),
+    )));
+
+    let mut miners = tokio::task::JoinSet::new();
+    let spawn_miner = |miners: &mut tokio::task::JoinSet<_>, account: String| {
         let storage = Arc::clone(&storage);
         let config = config.clone();
         let hub = hub.clone();
         let config_store = opts.config_store.clone();
-        tasks.spawn(async move {
+        miners.spawn(async move {
             let result = run::mine(
                 &storage,
                 &account,
@@ -79,69 +95,118 @@ pub async fn run(
             .await;
             (account, result)
         });
+    };
+
+    for account in accounts {
+        spawn_miner(&mut miners, account);
     }
 
-    if !opts.headless {
-        let addr: SocketAddr = config
-            .bind
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {e}", config.bind))?;
+    // The dashboard is kept out of the miner set on purpose: it is the thing
+    // that survives them.
+    let mut dashboard = if opts.headless {
+        None
+    } else {
+        Some(spawn_dashboard(&config, &opts, hub.clone()).await?)
+    };
 
-        // A dashboard reachable from the network exposes state derived from a
-        // live Twitch session, so it is never left open.
-        //
-        // The token is kept in the config once generated. Minting a fresh one
-        // on every start invalidated whatever URL the user had bookmarked and
-        // left `btdm control` unable to authenticate at all.
-        let token = if is_loopback(&addr) {
-            None
-        } else {
-            let existing = config.dashboard_token.clone();
-            let token = match existing {
-                Some(t) if !t.is_empty() => t,
-                _ => {
-                    let fresh = generate_token();
-                    if let Err(e) = opts.config_store.save_dashboard_token(&fresh).await {
+    loop {
+        tokio::select! {
+            joined = miners.join_next(), if !miners.is_empty() => {
+                let Some(joined) = joined else { continue };
+                match joined {
+                    Ok((who, Err(e))) => {
+                        tracing::error!(account = %who, error = %e, "miner stopped");
+                        hub.set_account_error(&who, &e.to_string());
+                        if dashboard.is_none() && miners.is_empty() {
+                            // Headless, with nothing left running and nowhere
+                            // to fix it. Exiting with the reason beats sitting
+                            // there doing nothing.
+                            return Err(e.context(format!("{who} failed")));
+                        }
                         tracing::warn!(
-                            error = %e,
-                            "could not save the dashboard token; it will change on restart"
+                            account = %who,
+                            "other accounts keep mining; re-authorise from the dashboard \
+                             or run: btdm login --force --account {who}"
                         );
                     }
-                    fresh
+                    Ok((who, Ok(()))) => {
+                        tracing::info!(account = %who, "miner finished");
+                        // A clean finish is Ctrl-C, which means all of them.
+                        break;
+                    }
+                    Err(e) => tracing::error!(error = %e, "miner panicked"),
                 }
-            };
-            tracing::warn!(%addr, "dashboard is not on loopback; a token is required");
-            Some(token)
-        };
-
-        let hub = hub.clone();
-        tasks.spawn(async move {
-            // The URL is announced from inside, once the socket is bound, so a
-            // failed bind never leaves a working-looking URL on screen.
-            let result = btdm_web::serve_announcing(hub, addr, token, |url| {
-                println!("\n  Dashboard: {url}\n");
-            })
-            .await
-            .map_err(anyhow::Error::from);
-            ("dashboard".to_string(), result)
-        });
-    }
-
-    // The first task to finish ends the process: a miner only returns on a
-    // fatal, unrecoverable error, and the dashboard only on a bind failure.
-    // Reporting which one, and why, beats exiting silently.
-    if let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((who, Err(e))) => {
-                tracing::error!(task = %who, error = %e, "task failed");
-                return Err(e.context(format!("{who} failed")));
             }
-            Ok((who, Ok(()))) => tracing::info!(task = %who, "task finished"),
-            Err(e) => tracing::error!(error = %e, "task panicked"),
+            Some(account) = start_rx.recv() => {
+                tracing::info!(%account, "starting miner after login");
+                hub.clear_account_error(&account);
+                spawn_miner(&mut miners, account);
+            }
+            result = async { dashboard.as_mut().unwrap().await }, if dashboard.is_some() => {
+                // The dashboard only ends on a bind failure, which is fatal:
+                // without it there is no way to see or fix anything.
+                return match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e.context("the dashboard stopped")),
+                    Err(e) => Err(anyhow::anyhow!("the dashboard panicked: {e}")),
+                };
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down");
+                break;
+            }
         }
     }
-    tasks.shutdown().await;
+
+    miners.shutdown().await;
     Ok(())
+}
+
+async fn spawn_dashboard(
+    config: &Config,
+    opts: &SupervisorOptions,
+    hub: Hub,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let addr: SocketAddr = config
+        .bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address '{}': {e}", config.bind))?;
+
+    // A dashboard reachable from the network exposes state derived from a
+    // live Twitch session, so it is never left open.
+    //
+    // The token is kept in the config once generated. Minting a fresh one on
+    // every start invalidated whatever URL the user had bookmarked and left
+    // `btdm control` unable to authenticate at all.
+    let token = if is_loopback(&addr) {
+        None
+    } else {
+        let token = match config.dashboard_token.clone() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                let fresh = generate_token();
+                if let Err(e) = opts.config_store.save_dashboard_token(&fresh).await {
+                    tracing::warn!(
+                        error = %e,
+                        "could not save the dashboard token; it will change on restart"
+                    );
+                }
+                fresh
+            }
+        };
+        tracing::warn!(%addr, "dashboard is not on loopback; a token is required");
+        Some(token)
+    };
+
+    Ok(tokio::spawn(async move {
+        // The URL is announced from inside, once the socket is bound, so a
+        // failed bind never leaves a working-looking URL on screen.
+        btdm_web::serve_announcing(hub, addr, token, |url| {
+            println!("\n  Dashboard: {url}\n");
+        })
+        .await
+        .map_err(anyhow::Error::from)
+    }))
 }
 
 /// Adapts the miner's SQLite log to what the dashboard reads.

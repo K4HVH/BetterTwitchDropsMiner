@@ -32,6 +32,12 @@ game, and an hour of watching counts for all of them at once. Every strategy
 scores a channel on everything it advances, so a stream serving four campaigns
 beats one serving a single campaign — and the dashboard says which.
 
+**One account failing does not stop the others.** A revoked token used to end
+the whole process — every other account's miner and the dashboard with it. Now
+the account stops, says why, and offers a sign-in link; everything else keeps
+mining. You can link a new account or re-authorise a dead one from the
+dashboard without restarting anything.
+
 **The dashboard is a control surface, not a status page.** Strategy, pause,
 pin, favourites, priority games, per-campaign and per-game exclusions, switch
 channel, watch a specific channel, resync — all live, no restart, written back
@@ -62,7 +68,7 @@ finished binary, dashboard included.
 
 | Command | Purpose |
 |---|---|
-| `btdm login [--force]` | Link an account via the device-code flow |
+| `btdm login [--force]` | Link an account via the device-code flow (also possible from the dashboard) |
 | `btdm status` | Whether the stored token still works |
 | `btdm logout` | Remove a stored token |
 | `btdm mine [--headless]` | Mine every linked account |
