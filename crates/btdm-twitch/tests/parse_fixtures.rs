@@ -1,0 +1,224 @@
+use btdm_core::model::*;
+use btdm_twitch::parse::*;
+
+fn fixture(name: &str) -> serde_json::Value {
+    let raw = match name {
+        "inventory" => include_str!("fixtures/inventory.json"),
+        "directory" => include_str!("fixtures/directory.json"),
+        other => panic!("unknown fixture {other}"),
+    };
+    serde_json::from_str(raw).expect("fixture is valid JSON")
+}
+
+fn inventory() -> Vec<DropCampaign> {
+    parse_inventory(&fixture("inventory")).unwrap()
+}
+
+#[test]
+fn parses_the_well_formed_campaigns_and_skips_the_broken_one() {
+    // camp-3 has a null game and must be skipped without failing the whole sync.
+    let inv = inventory();
+    assert_eq!(inv.len(), 2);
+    assert!(inv.iter().all(|c| c.id != CampaignId::from("camp-3")));
+}
+
+#[test]
+fn parses_drop_progress_and_requirements() {
+    let c = &inventory()[0];
+    assert_eq!(c.id, CampaignId::from("camp-1"));
+    assert_eq!(c.game.slug, "deadlock");
+    assert_eq!(c.drops.len(), 2);
+    assert_eq!(c.drops[0].required_minutes, 60);
+    assert_eq!(c.drops[0].current_minutes, 23);
+    assert_eq!(c.drops[0].remaining_minutes(), 37);
+}
+
+#[test]
+fn a_drop_instance_id_becomes_a_claim_id() {
+    let c = &inventory()[0];
+    assert_eq!(c.drops[0].claim_id, None, "not yet earned");
+    assert_eq!(c.drops[1].claim_id.as_deref(), Some("inst-2"));
+    assert!(c.drops[1].is_claimable());
+}
+
+#[test]
+fn benefit_kinds_are_mapped() {
+    let inv = inventory();
+    assert_eq!(inv[0].drops[0].benefits[0].kind, BenefitKind::Entitlement);
+    assert_eq!(inv[0].drops[1].benefits[0].kind, BenefitKind::Emote);
+    assert_eq!(inv[1].drops[0].benefits[0].kind, BenefitKind::Badge);
+}
+
+#[test]
+fn precondition_tiers_are_parsed() {
+    let c = &inventory()[0];
+    assert_eq!(c.drops[1].precondition_ids, vec![DropId::from("drop-1")]);
+    assert!(c.drops[0].precondition_ids.is_empty());
+}
+
+#[test]
+fn account_link_state_is_taken_from_the_server_never_assumed() {
+    let inv = inventory();
+    assert!(inv[0].is_account_linked);
+    assert!(!inv[1].is_account_linked, "server says unlinked");
+}
+
+/// A missing `self` block must read as unlinked. Guessing optimistically here
+/// produces a miner that grinds at campaigns it can never progress.
+#[test]
+fn a_campaign_with_no_self_block_is_treated_as_unlinked() {
+    let v = serde_json::json!({
+        "id": "c9", "name": "No self",
+        "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+        "game": { "id": "g", "name": "G", "slug": "g" },
+        "timeBasedDrops": []
+    });
+    assert!(!parse_campaign(&v).unwrap().is_account_linked);
+}
+
+#[test]
+fn allowed_channels_are_parsed() {
+    let inv = inventory();
+    assert_eq!(inv[0].allowed_channels.len(), 1);
+    assert_eq!(inv[0].allowed_channels[0].login, "streamer1");
+    assert!(inv[1].allowed_channels.is_empty(), "empty means any channel");
+}
+
+#[test]
+fn a_missing_game_slug_is_derived_from_the_name() {
+    let v = serde_json::json!({
+        "id": "c9", "name": "X",
+        "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+        "game": { "id": "g", "name": "Sea of Thieves" },
+        "self": { "isAccountConnected": true },
+        "timeBasedDrops": []
+    });
+    assert_eq!(parse_campaign(&v).unwrap().game.slug, "sea-of-thieves");
+}
+
+#[test]
+fn malformed_input_errors_rather_than_panicking() {
+    assert!(parse_inventory(&serde_json::json!({ "currentUser": null })).is_err());
+    assert!(parse_inventory(&serde_json::json!({})).is_err());
+}
+
+#[test]
+fn directory_parses_channels_and_their_drops_tag() {
+    let channels = parse_directory(&fixture("directory")).unwrap();
+    // The node with a null broadcaster is skipped rather than fatal.
+    assert_eq!(channels.len(), 2);
+
+    let (c1, s1) = &channels[0];
+    assert_eq!(c1.login, "streamer1");
+    assert_eq!(s1.broadcast_id, "bc-1");
+    assert_eq!(s1.viewers, 1234);
+    assert!(s1.drops_enabled, "DropsEnabled tag present");
+
+    let (_, s2) = &channels[1];
+    assert!(!s2.drops_enabled, "no DropsEnabled tag");
+}
+
+#[test]
+fn stream_info_reports_an_offline_channel_as_none() {
+    let offline = serde_json::json!({
+        "user": { "id": "1", "login": "s", "displayName": "S", "stream": null }
+    });
+    assert!(parse_stream_info(&offline).unwrap().is_none());
+
+    let no_user = serde_json::json!({ "user": null });
+    assert!(parse_stream_info(&no_user).unwrap().is_none());
+}
+
+#[test]
+fn stream_info_parses_a_live_channel() {
+    let live = serde_json::json!({
+        "user": {
+            "id": "1", "login": "s", "displayName": "S",
+            "stream": { "id": "bc-7", "viewersCount": 42 },
+            "broadcastSettings": { "title": "hello", "game": { "id": "g", "name": "Deadlock", "slug": "deadlock" } }
+        }
+    });
+    let (channel, stream) = parse_stream_info(&live).unwrap().unwrap();
+    assert_eq!(channel.login, "s");
+    assert_eq!(stream.broadcast_id, "bc-7");
+    assert_eq!(stream.game.unwrap().name, "Deadlock");
+}
+
+#[test]
+fn available_drops_flattens_every_campaign() {
+    let v = serde_json::json!({
+        "channel": { "viewerDropCampaigns": [
+            { "id": "c1", "timeBasedDrops": [{ "id": "d1" }, { "id": "d2" }] },
+            { "id": "c2", "timeBasedDrops": [{ "id": "d3" }] }
+        ]}
+    });
+    assert_eq!(
+        parse_available_drops(&v),
+        vec![
+            DropId::from("d1"),
+            DropId::from("d2"),
+            DropId::from("d3")
+        ]
+    );
+}
+
+#[test]
+fn available_drops_is_empty_when_the_channel_progresses_nothing() {
+    let empty = serde_json::json!({ "channel": { "viewerDropCampaigns": [] } });
+    assert!(parse_available_drops(&empty).is_empty());
+
+    let null_channel = serde_json::json!({ "channel": null });
+    assert!(parse_available_drops(&null_channel).is_empty());
+}
+
+#[test]
+fn current_progress_parses_an_active_session() {
+    let v = serde_json::json!({
+        "currentUser": { "dropCurrentSession": {
+            "channel": { "id": "ch-1" },
+            "game": { "id": "g", "name": "Deadlock", "slug": "deadlock" },
+            "currentMinutesWatched": 23,
+            "requiredMinutesWatched": 60,
+            "dropID": "drop-1"
+        }}
+    });
+    let p = parse_current_progress(&v).unwrap();
+    assert_eq!(p.drop_id, DropId::from("drop-1"));
+    assert_eq!(p.current_minutes, 23);
+    assert_eq!(p.required_minutes, 60);
+}
+
+#[test]
+fn current_progress_is_none_when_there_is_no_session() {
+    assert!(
+        parse_current_progress(&serde_json::json!({
+            "currentUser": { "dropCurrentSession": null }
+        }))
+        .is_none()
+    );
+}
+
+#[test]
+fn campaign_details_unwraps_the_nested_shape() {
+    let v = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Camp",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g", "name": "Deadlock", "slug": "deadlock" },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [{
+                "id": "d1", "name": "R", "requiredMinutesWatched": 60,
+                "benefitEdges": [], "self": { "currentMinutesWatched": 0, "isClaimed": false }
+            }]
+        }}
+    });
+    let c = parse_campaign_details(&v).unwrap().unwrap();
+    assert_eq!(c.id, CampaignId::from("c1"));
+    assert_eq!(c.drops.len(), 1);
+
+    assert!(
+        parse_campaign_details(&serde_json::json!({ "user": null }))
+            .unwrap()
+            .is_none()
+    );
+}
