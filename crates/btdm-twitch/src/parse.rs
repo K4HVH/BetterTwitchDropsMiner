@@ -202,6 +202,11 @@ pub fn parse_campaign(v: &Value) -> Result<DropCampaign, TwitchError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         allowed_channels,
+        account_link_url: v
+            .get("accountLinkURL")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned),
     })
 }
 

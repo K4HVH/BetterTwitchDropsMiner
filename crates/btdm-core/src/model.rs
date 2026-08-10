@@ -118,6 +118,13 @@ pub struct DropCampaign {
     pub is_account_linked: bool,
     /// Channel allow-list. Empty means any channel streaming the game qualifies.
     pub allowed_channels: Vec<Channel>,
+    /// Where to link the Twitch account to this campaign's game.
+    ///
+    /// Telling someone "your account is not linked" without saying where to
+    /// link it is a dead end, and unlinked campaigns are the largest group by
+    /// far — 70 of 86 against a real account.
+    #[serde(default)]
+    pub account_link_url: Option<String>,
 }
 
 impl DropCampaign {
@@ -170,6 +177,7 @@ mod tests {
             drops,
             is_account_linked: true,
             allowed_channels: vec![],
+            account_link_url: None,
         }
     }
 

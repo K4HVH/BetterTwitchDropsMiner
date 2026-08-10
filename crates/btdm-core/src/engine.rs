@@ -49,6 +49,15 @@ pub struct EngineConfig {
     /// working options the extra requests buy nothing — the strategy only
     /// picks one.
     pub max_channels_per_campaign: usize,
+    /// How deep into a game's directory to look when a campaign restricts
+    /// itself to specific channels. Allow-listed streamers are usually small,
+    /// so the default page of most-relevant channels rarely contains them.
+    pub allow_list_channel_limit: u32,
+    /// An allow-list no longer than this is resolved channel by channel, which
+    /// finds streamers the directory never surfaces at all. Above it, that
+    /// would be hundreds of requests, so the deeper directory page is used
+    /// instead.
+    pub max_direct_allow_list_lookups: usize,
     /// Which selection strategy to use. See [`crate::strategy`].
     pub strategy: String,
     /// Channel logins to prefer when otherwise equal.
@@ -77,6 +86,8 @@ impl Default for EngineConfig {
             max_availability_checks: 160,
             check_concurrency: 8,
             max_channels_per_campaign: 8,
+            allow_list_channel_limit: 100,
+            max_direct_allow_list_lookups: 8,
             strategy: "deadline".into(),
             favourites: Vec::new(),
             priority_games: Vec::new(),
@@ -1338,6 +1349,7 @@ impl<A: TwitchApi> Engine<A> {
                     .iter()
                     .map(|c| c.id.clone())
                     .collect(),
+                allowed_channels: campaign.allowed_channels.clone(),
                 drops,
             });
         }
@@ -1377,20 +1389,87 @@ impl<A: TwitchApi> Engine<A> {
         }
 
         // --- one directory query per distinct game --------------------------
-        let mut games: Vec<Game> = Vec::new();
+        //
+        // A campaign restricted to specific channels needs a deeper page:
+        // allow-listed streamers are typically small, and the default page of
+        // most-relevant channels does not contain them.
+        let mut games: Vec<(Game, u32)> = Vec::new();
         for w in &wants {
-            if !games.iter().any(|g| g.id == w.game.id) {
-                games.push(w.game.clone());
+            let limit = if w.allowed.is_empty() {
+                self.config.channel_limit
+            } else {
+                self.config.allow_list_channel_limit
+            };
+            match games.iter_mut().find(|(g, _)| g.id == w.game.id) {
+                Some((_, existing)) => *existing = (*existing).max(limit),
+                None => games.push((w.game.clone(), limit)),
             }
         }
 
         let mut channels_by_game: HashMap<GameId, Vec<(Channel, Stream)>> = HashMap::new();
-        for game in games {
-            let found = self
-                .api
-                .live_channels(&game, self.config.channel_limit)
-                .await?;
+        for (game, limit) in games {
+            let found = self.api.live_channels(&game, limit).await?;
             channels_by_game.insert(game.id.clone(), found);
+        }
+
+        // --- resolve short allow-lists directly -----------------------------
+        //
+        // A campaign locked to one small streamer is invisible to the
+        // directory: they will not be on any page of it while they have a
+        // handful of viewers. Asking about them by name is the only way to
+        // find them, and these are exactly the exclusive campaigns users care
+        // most about.
+        let direct: Vec<(usize, Channel)> = wants
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| {
+                !w.allowed.is_empty() && w.allowed.len() <= self.config.max_direct_allow_list_lookups
+            })
+            .flat_map(|(i, w)| {
+                let known: HashSet<&ChannelId> = channels_by_game
+                    .get(&w.game.id)
+                    .map(|list| list.iter().map(|(c, _)| &c.id).collect())
+                    .unwrap_or_default();
+                w.allowed_channels
+                    .iter()
+                    .filter(|c| !known.contains(&c.id))
+                    .filter(|c| !self.quarantine.is_quarantined(&c.id.0, now))
+                    .map(move |c| (i, c.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if !direct.is_empty() {
+            let resolved: Vec<(usize, Channel, Option<Stream>)> =
+                futures_util::stream::iter(direct.into_iter().map(|(i, channel)| {
+                    let api = &self.api;
+                    async move {
+                        let stream = api.stream_info(&channel.login).await.unwrap_or_else(|e| {
+                            tracing::debug!(
+                                channel = %channel.login,
+                                error = %e,
+                                "allow-listed channel lookup failed"
+                            );
+                            None
+                        });
+                        (i, channel, stream)
+                    }
+                }))
+                .buffer_unordered(self.config.check_concurrency.max(1))
+                .collect()
+                .await;
+
+            for (i, channel, stream) in resolved {
+                let Some(stream) = stream else { continue };
+                tracing::debug!(
+                    channel = %channel.login,
+                    "allow-listed channel found live outside the directory page"
+                );
+                channels_by_game
+                    .entry(wants[i].game.id.clone())
+                    .or_default()
+                    .push((channel, stream));
+            }
         }
 
         // --- map each channel to every campaign it could serve --------------
@@ -1831,6 +1910,8 @@ struct Want {
     /// Spare time before the deadline; drives where the check budget goes.
     slack: Duration,
     allowed: HashSet<ChannelId>,
+    /// The allow-listed channels themselves, for direct lookup.
+    allowed_channels: Vec<Channel>,
     drops: HashSet<DropId>,
 }
 
@@ -1871,5 +1952,10 @@ fn rejected_view(campaign: &DropCampaign, reason: RejectReason) -> RejectedView 
         game: campaign.game.name.clone(),
         reason: reason.label().to_owned(),
         explanation: reason.explain().to_owned(),
+        // Only offer the link where it is the actual remedy.
+        action_url: match reason {
+            RejectReason::NotLinked => campaign.account_link_url.clone(),
+            _ => None,
+        },
     }
 }

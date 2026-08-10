@@ -124,6 +124,7 @@ mod tests {
             ends_at: at(20),
             is_account_linked: linked,
             allowed_channels: vec![],
+            account_link_url: None,
             drops: vec![TimedDrop {
                 id: DropId::from("d1"),
                 name: "Drop".into(),
@@ -277,6 +278,7 @@ mod remaining_minutes_tests {
             ends_at: at(20),
             is_account_linked: true,
             allowed_channels: vec![],
+            account_link_url: None,
             drops,
         }
     }

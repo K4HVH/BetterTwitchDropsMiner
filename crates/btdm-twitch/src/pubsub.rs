@@ -105,6 +105,39 @@ pub fn parse_pubsub_frame(raw: &str) -> Option<PubSubMessage> {
     }
 }
 
+/// A live PubSub connection: decoded messages, plus a way to change what is
+/// subscribed without reconnecting.
+pub struct Connection {
+    pub messages: mpsc::Receiver<PubSubMessage>,
+    control: mpsc::Sender<ControlFrame>,
+}
+
+enum ControlFrame {
+    Listen(Vec<String>),
+    Unlisten(Vec<String>),
+}
+
+impl Connection {
+    /// Subscribes to more topics on the existing socket.
+    ///
+    /// This exists so the miner can follow the channel it is *currently*
+    /// watching. Without it, `video-playback-by-id` was defined, parsed and
+    /// handled but never actually subscribed, so the miner learned a stream
+    /// had ended only from the watchdog minutes later — heartbeating a dead
+    /// broadcast the whole time.
+    pub async fn listen(&self, topics: Vec<String>) -> bool {
+        !topics.is_empty() && self.control.send(ControlFrame::Listen(topics)).await.is_ok()
+    }
+
+    pub async fn unlisten(&self, topics: Vec<String>) -> bool {
+        !topics.is_empty() && self.control.send(ControlFrame::Unlisten(topics)).await.is_ok()
+    }
+
+    pub async fn recv(&mut self) -> Option<PubSubMessage> {
+        self.messages.recv().await
+    }
+}
+
 /// Connects, subscribes, and streams decoded messages until the socket dies.
 ///
 /// Emits [`PubSubMessage::Disconnected`] on exit so the caller always learns
@@ -113,7 +146,7 @@ pub async fn connect(
     url: &str,
     token: &str,
     topics: Vec<String>,
-) -> Result<mpsc::Receiver<PubSubMessage>, TwitchError> {
+) -> Result<Connection, TwitchError> {
     use tokio_tungstenite::tungstenite::Message;
 
     let (stream, _) = tokio_tungstenite::connect_async(url)
@@ -168,6 +201,8 @@ pub async fn connect(
     }
 
     let (tx, rx) = mpsc::channel(64);
+    let (control_tx, mut control_rx) = mpsc::channel::<ControlFrame>(16);
+    let auth = token.to_owned();
 
     tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -185,6 +220,22 @@ pub async fn connect(
             };
 
             tokio::select! {
+                change = control_rx.recv() => {
+                    let Some(change) = change else { break };
+                    let (kind, topics) = match change {
+                        ControlFrame::Listen(t) => ("LISTEN", t),
+                        ControlFrame::Unlisten(t) => ("UNLISTEN", t),
+                    };
+                    let frame = json!({
+                        "type": kind,
+                        "nonce": "btdm-live",
+                        "data": { "topics": topics, "auth_token": auth },
+                    });
+                    if write.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        break;
+                    }
+                    tracing::debug!(kind, count = topics.len(), "pubsub subscription changed");
+                }
                 _ = ping.tick() => {
                     if write.send(Message::Text(r#"{"type":"PING"}"#.into())).await.is_err() {
                         break;
@@ -226,7 +277,10 @@ pub async fn connect(
         let _ = tx.send(PubSubMessage::Disconnected).await;
     });
 
-    Ok(rx)
+    Ok(Connection {
+        messages: rx,
+        control: control_tx,
+    })
 }
 
 #[cfg(test)]
@@ -340,5 +394,63 @@ mod tests {
     fn an_unknown_message_type_is_ignored_not_fatal() {
         let raw = frame("user-drop-events.999", json!({ "type": "some-new-thing" }));
         assert!(parse_pubsub_frame(&raw).is_none());
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+
+    /// The stream-state topic was defined, parsed and handled — but never
+    /// subscribed, so the whole path was unreachable and the miner kept
+    /// heartbeating streams that had already ended.
+    #[test]
+    fn the_stream_state_topic_is_addressable_per_channel() {
+        let topic = Topic::StreamState.as_str("12345");
+        assert_eq!(topic, "video-playback-by-id.12345");
+    }
+
+    #[tokio::test]
+    async fn a_subscription_change_is_queued_for_the_socket() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (_msg_tx, msg_rx) = mpsc::channel(1);
+        let conn = Connection {
+            messages: msg_rx,
+            control: tx,
+        };
+
+        assert!(conn.listen(vec!["video-playback-by-id.1".into()]).await);
+        assert!(matches!(rx.recv().await, Some(ControlFrame::Listen(t)) if t.len() == 1));
+
+        assert!(conn.unlisten(vec!["video-playback-by-id.1".into()]).await);
+        assert!(matches!(rx.recv().await, Some(ControlFrame::Unlisten(t)) if t.len() == 1));
+    }
+
+    /// Asking for nothing must not put an empty frame on the wire.
+    #[tokio::test]
+    async fn an_empty_change_is_a_no_op() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (_msg_tx, msg_rx) = mpsc::channel(1);
+        let conn = Connection {
+            messages: msg_rx,
+            control: tx,
+        };
+
+        assert!(!conn.listen(vec![]).await);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A dead socket must report failure rather than silently swallowing the
+    /// change and leaving the miner blind to stream endings.
+    #[tokio::test]
+    async fn a_closed_socket_reports_the_failure() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let (_msg_tx, msg_rx) = mpsc::channel(1);
+        let conn = Connection {
+            messages: msg_rx,
+            control: tx,
+        };
+        assert!(!conn.listen(vec!["video-playback-by-id.1".into()]).await);
     }
 }

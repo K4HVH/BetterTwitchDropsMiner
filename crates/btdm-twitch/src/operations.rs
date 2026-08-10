@@ -19,7 +19,7 @@ pub const INVENTORY: GqlOperation = GqlOperation {
   currentUser {
     inventory {
       dropCampaignsInProgress {
-        id name status startAt endAt
+        id name status startAt endAt accountLinkURL
         game { id name slug boxArtURL }
         self { isAccountConnected }
         allow { channels { id name displayName } }
@@ -42,7 +42,7 @@ pub const CAMPAIGNS: GqlOperation = GqlOperation {
     raw_query: r#"query ViewerDropsDashboard {
   currentUser {
     dropCampaigns {
-      id name status startAt endAt
+      id name status startAt endAt accountLinkURL
       game { id name slug boxArtURL }
       self { isAccountConnected }
     }
@@ -56,7 +56,7 @@ pub const CAMPAIGN_DETAILS: GqlOperation = GqlOperation {
     raw_query: r#"query DropCampaignDetails($dropID: ID!, $channelLogin: String!) {
   user(login: $channelLogin) {
     dropCampaign(id: $dropID) {
-      id name status startAt endAt
+      id name status startAt endAt accountLinkURL
       game { id name slug boxArtURL }
       self { isAccountConnected }
       allow { channels { id name displayName } }

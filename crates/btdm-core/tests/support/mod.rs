@@ -32,6 +32,7 @@ pub struct FakeTwitch {
     /// When set, Twitch refuses every claim.
     pub fail_claims: Mutex<bool>,
     pub detail_fetches: Mutex<usize>,
+    pub stream_info_calls: Mutex<usize>,
 }
 
 impl FakeTwitch {
@@ -95,6 +96,7 @@ impl TwitchApi for FakeTwitch {
 
     async fn stream_info(&self, login: &str) -> Result<Option<Stream>, ApiError> {
         self.guard()?;
+        *self.stream_info_calls.lock().unwrap() += 1;
         Ok(self
             .channels
             .lock()
@@ -182,6 +184,7 @@ pub fn campaign(id: &str, linked: bool, drops: Vec<TimedDrop>) -> DropCampaign {
         drops,
         is_account_linked: linked,
         allowed_channels: vec![],
+        account_link_url: None,
     }
 }
 

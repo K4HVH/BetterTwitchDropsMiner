@@ -1391,7 +1391,11 @@ async fn the_snapshot_carries_everything_the_controls_need() {
 
     let snap = e.snapshot("main", Some("someone"), now());
 
-    assert_eq!(snap.strategies.len(), 5, "the picker is built from this");
+    assert_eq!(
+        snap.strategies.len(),
+        btdm_core::strategy::ALL_STRATEGIES.len(),
+        "the picker is built from this"
+    );
     assert!(snap.strategies.iter().any(|s| s.selected));
     assert!(
         snap.strategies.iter().all(|s| !s.description.is_empty()),
@@ -1936,4 +1940,86 @@ async fn a_finished_primary_campaign_does_not_make_the_session_look_stalled() {
         later,
     );
     assert_eq!(e.since_last_confirmation(later).unwrap().num_seconds(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Allow-listed campaigns
+//
+// These are the exclusive, high-value ones. Their channels are usually small,
+// so the game directory's most-relevant page never contains them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_small_allow_listed_channel_is_found_even_when_the_directory_misses_it() {
+    let fake = FakeTwitch::default();
+    let mut c = campaign("c1", true, vec![drop("d1", 60, 0)]);
+    c.allowed_channels = vec![channel("ch-small", "tinystreamer")];
+    *fake.inventory.lock().unwrap() = vec![c];
+
+    // The directory only knows about big channels, none of them allow-listed.
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch-big", "hugestreamer"), stream("bc-big", true)),
+        // The allow-listed one is live, but reachable only by name.
+        (channel("ch-small", "tinystreamer"), stream("bc-small", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-small".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap();
+
+    assert_eq!(
+        watch.map(|w| w.channel.login),
+        Some("tinystreamer".to_string()),
+        "an exclusive campaign must not be invisible just because its \
+         streamer is small"
+    );
+}
+
+/// A long allow-list must not turn into hundreds of individual lookups.
+#[tokio::test]
+async fn a_long_allow_list_is_not_resolved_channel_by_channel() {
+    let fake = FakeTwitch::default();
+    let mut c = campaign("c1", true, vec![drop("d1", 60, 0)]);
+    c.allowed_channels = (0..50)
+        .map(|i| channel(&format!("ch{i}"), &format!("streamer{i}")))
+        .collect();
+    *fake.inventory.lock().unwrap() = vec![c];
+    // Nobody at all is live.
+    *fake.channels.lock().unwrap() = vec![];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    assert!(
+        *e.api().stream_info_calls.lock().unwrap() <= 8,
+        "fifty lookups for one campaign is a request storm, made {} calls",
+        e.api().stream_info_calls.lock().unwrap()
+    );
+}
+
+/// A quarantined channel stays quarantined even when it is allow-listed.
+#[tokio::test]
+async fn direct_lookup_respects_quarantine() {
+    let fake = FakeTwitch::default();
+    let mut c = campaign("c1", true, vec![drop("d1", 60, 0)]);
+    c.allowed_channels = vec![channel("ch1", "streamer1")];
+    *fake.inventory.lock().unwrap() = vec![c];
+    *fake.channels.lock().unwrap() =
+        vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.quarantine_current(now());
+
+    assert!(e.select_channel(now()).await.unwrap().is_none());
 }

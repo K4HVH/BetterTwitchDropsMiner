@@ -6,6 +6,7 @@ use crate::storage::Storage;
 use btdm_core::api::TwitchApi;
 use btdm_core::control::Command;
 use btdm_core::engine::{Engine, EngineConfig, MiningState};
+use btdm_core::model::ChannelId;
 use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::api_impl::TwitchClient;
 use btdm_twitch::auth::AuthClient;
@@ -76,8 +77,11 @@ pub async fn mine(
 
     // Push channel for drop progress and claim notifications. The supervisor
     // owns reconnection, so the main loop never blocks on it.
-    let mut pubsub_rx =
+    let (mut pubsub_rx, pubsub_follow) =
         spawn_pubsub_supervisor(tokens.access_token.clone(), validated.user_id.clone());
+    // The channel currently subscribed for stream-state, so we only ask for a
+    // change when there has actually been one.
+    let mut followed: Option<ChannelId> = None;
 
     // Commands from the dashboard. Registered before the first tick so a
     // control pressed during startup is queued rather than rejected.
@@ -165,6 +169,12 @@ pub async fn mine(
         drain_events(&mut engine, storage, account, hub.as_ref(), notifier.as_ref()).await?;
         report_status(&engine, now);
         publish(&engine, account, &validated.login, hub.as_ref());
+
+        let watching = engine.current_channel().map(|c| c.id.clone());
+        if watching != followed {
+            let _ = pubsub_follow.send(watching.clone()).await;
+            followed = watching;
+        }
 
         if opts.probe {
             tracing::info!("probe mode: one pass complete");
@@ -299,30 +309,66 @@ async fn work_recovery_rung(
 /// loop meant a slow connect blocked watch heartbeats and Ctrl-C, and a single
 /// failed attempt disabled push events permanently — the retry could only be
 /// triggered by a disconnect message that could no longer arrive.
-fn spawn_pubsub_supervisor(token: String, user_id: String) -> mpsc::Receiver<PubSubMessage> {
+fn spawn_pubsub_supervisor(
+    token: String,
+    user_id: String,
+) -> (mpsc::Receiver<PubSubMessage>, mpsc::Sender<Option<ChannelId>>) {
     let (tx, rx) = mpsc::channel(128);
+    // Which channel's stream state to follow. Sent by the main loop whenever
+    // the watched channel changes, so we hear the moment a stream ends rather
+    // than discovering it from the watchdog minutes later.
+    let (watch_tx, mut watch_rx) = mpsc::channel::<Option<ChannelId>>(8);
 
     tokio::spawn(async move {
-        let topics = vec![
+        let base = vec![
             Topic::UserDrops.as_str(&user_id),
             Topic::UserPoints.as_str(&user_id),
         ];
         let mut backoff = StdDuration::from_secs(1);
+        // Survives reconnection, so the subscription is restored automatically.
+        let mut followed: Option<ChannelId> = None;
 
         loop {
-            match pubsub::connect(pubsub::PUBSUB_URL, &token, topics.clone()).await {
+            match pubsub::connect(pubsub::PUBSUB_URL, &token, base.clone()).await {
                 Ok(mut socket) => {
                     tracing::info!("pubsub connected");
                     backoff = StdDuration::from_secs(1);
 
-                    while let Some(msg) = socket.recv().await {
-                        if matches!(msg, PubSubMessage::Disconnected) {
-                            break;
-                        }
-                        // The consumer going away means the miner is shutting
-                        // down; stop rather than reconnecting into the void.
-                        if tx.send(msg).await.is_err() {
-                            return;
+                    if let Some(id) = &followed {
+                        socket.listen(vec![Topic::StreamState.as_str(&id.0)]).await;
+                    }
+
+                    loop {
+                        tokio::select! {
+                            change = watch_rx.recv() => {
+                                let Some(next) = change else { return };
+                                if next == followed {
+                                    continue;
+                                }
+                                if let Some(old) = &followed {
+                                    socket
+                                        .unlisten(vec![Topic::StreamState.as_str(&old.0)])
+                                        .await;
+                                }
+                                if let Some(new) = &next {
+                                    socket
+                                        .listen(vec![Topic::StreamState.as_str(&new.0)])
+                                        .await;
+                                }
+                                followed = next;
+                            }
+                            msg = socket.recv() => {
+                                let Some(msg) = msg else { break };
+                                if matches!(msg, PubSubMessage::Disconnected) {
+                                    break;
+                                }
+                                // The consumer going away means the miner is
+                                // shutting down; stop rather than reconnecting
+                                // into the void.
+                                if tx.send(msg).await.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                     tracing::warn!(
@@ -344,7 +390,7 @@ fn spawn_pubsub_supervisor(token: String, user_id: String) -> mpsc::Receiver<Pub
         }
     });
 
-    rx
+    (rx, watch_tx)
 }
 
 async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {

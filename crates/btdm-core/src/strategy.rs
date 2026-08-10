@@ -316,11 +316,42 @@ impl MiningStrategy for Deadline {
     }
 }
 
-/// Strict top-down ordering of the user's chosen games.
+/// The user's chosen games first, then everything else by urgency.
 ///
 /// A channel is ranked by the best-placed game it advances, so one stream
 /// serving both the top pick and a lower one is never penalised for the latter.
+///
+/// Games that are not on the list are still mined, ranked below every listed
+/// one. The strict variant used to be the only behaviour, and it meant a user
+/// whose listed games happened to have nobody streaming them sat idle earning
+/// nothing while dozens of other campaigns ticked away — see [`PriorityOnly`]
+/// for when that is genuinely what you want.
 pub struct Priority;
+
+/// The rank of a game not on the priority list. Everything listed scores
+/// above this, and unlisted games are separated among themselves by urgency.
+const UNLISTED_BASE: f64 = 0.0;
+
+fn priority_rank(candidate: &Candidate, world: &WorldView) -> Option<usize> {
+    world
+        .advanced_campaigns(candidate)
+        .filter_map(|c| {
+            let game = c.game.name.to_lowercase();
+            world.priority_games.iter().position(|g| *g == game)
+        })
+        .min()
+}
+
+/// Urgency as a small tie-break for unlisted games: soonest deadline first,
+/// scaled to stay well below any listed game's score.
+fn urgency_fraction(candidate: &Candidate, world: &WorldView) -> f64 {
+    world
+        .advanced_campaigns(candidate)
+        .map(|c| slack(c, world.now))
+        .min()
+        .map(|d| 1.0 / (1.0 + (d.num_minutes().max(0) as f64 / 1440.0)))
+        .unwrap_or(0.0)
+}
 
 impl MiningStrategy for Priority {
     fn name(&self) -> &'static str {
@@ -328,15 +359,62 @@ impl MiningStrategy for Priority {
     }
 
     fn score(&self, candidate: &Candidate, world: &WorldView) -> Option<f64> {
-        let best_rank = world
+        match priority_rank(candidate, world) {
+            // Earlier in the list scores higher; every listed game outranks
+            // every unlisted one.
+            Some(rank) => Some(1000.0 + (world.priority_games.len() - rank) as f64 * 100.0),
+            None => Some(UNLISTED_BASE + urgency_fraction(candidate, world)),
+        }
+    }
+}
+
+/// Only the user's chosen games, and nothing else — even if that means idling.
+pub struct PriorityOnly;
+
+impl MiningStrategy for PriorityOnly {
+    fn name(&self) -> &'static str {
+        "priority-only"
+    }
+
+    fn score(&self, candidate: &Candidate, world: &WorldView) -> Option<f64> {
+        let rank = priority_rank(candidate, world)?;
+        Some((world.priority_games.len() - rank) as f64 * 100.0)
+    }
+}
+
+/// Least headroom first: time left divided by watching still needed.
+///
+/// Where `deadline` compares absolute spare time, this compares it *relative*
+/// to the work outstanding — so a campaign with six hours left and five hours
+/// of watching to do outranks one with two days left and ten minutes to do.
+/// Across a mix of short and long campaigns that is the better question.
+pub struct Availability;
+
+impl MiningStrategy for Availability {
+    fn name(&self) -> &'static str {
+        "availability"
+    }
+
+    fn score(&self, candidate: &Candidate, world: &WorldView) -> Option<f64> {
+        let tightest = world
             .advanced_campaigns(candidate)
-            .filter_map(|c| {
-                let game = c.game.name.to_lowercase();
-                world.priority_games.iter().position(|g| *g == game)
+            .map(|c| {
+                let needed = eligibility::remaining_minutes(c) as f64;
+                let left = (c.ends_at - world.now).num_minutes() as f64;
+                if needed <= 0.0 {
+                    f64::INFINITY
+                } else {
+                    left / needed
+                }
             })
-            .min()?;
-        // Earlier in the list scores higher.
-        Some((world.priority_games.len() - best_rank) as f64 * 100.0)
+            .fold(f64::INFINITY, f64::min);
+
+        if !tightest.is_finite() {
+            // Nothing left to earn here; never the best use of the slot.
+            return Some(0.0);
+        }
+        // Less headroom scores higher.
+        Some(1000.0 - tightest)
     }
 }
 
@@ -402,7 +480,9 @@ impl MiningStrategy for Manual {
 pub fn by_name(name: &str) -> Option<Box<dyn MiningStrategy>> {
     match name.to_lowercase().as_str() {
         "deadline" => Some(Box::new(Deadline)),
+        "availability" => Some(Box::new(Availability)),
         "priority" => Some(Box::new(Priority)),
+        "priority-only" | "priority_only" => Some(Box::new(PriorityOnly)),
         "coverage" => Some(Box::new(Coverage)),
         "completionist" => Some(Box::new(Completionist)),
         "manual" => Some(Box::new(Manual)),
@@ -410,9 +490,11 @@ pub fn by_name(name: &str) -> Option<Box<dyn MiningStrategy>> {
     }
 }
 
-pub const ALL_STRATEGIES: [&str; 5] = [
+pub const ALL_STRATEGIES: [&str; 7] = [
     "deadline",
+    "availability",
     "priority",
+    "priority-only",
     "coverage",
     "completionist",
     "manual",
@@ -422,7 +504,11 @@ pub const ALL_STRATEGIES: [&str; 5] = [
 pub fn describe(name: &str) -> &'static str {
     match name {
         "deadline" => "Never lose an achievable campaign — always mine whatever expires soonest.",
-        "priority" => "Follow your game list from the top down, ignoring everything not on it.",
+        "availability" => {
+            "Mine whatever has the least breathing room: time left measured against work left."
+        }
+        "priority" => "Your game list first, top down, then everything else by urgency.",
+        "priority-only" => "Only your listed games. Sits idle rather than mining anything else.",
         "coverage" => "Mine the channel that advances the most campaigns simultaneously.",
         "completionist" => "Finish the campaign closest to done before starting another.",
         "manual" => "Watch only the channel you pinned.",
@@ -457,6 +543,7 @@ mod tests {
             ends_at: now() + ends_in,
             is_account_linked: true,
             allowed_channels: vec![],
+            account_link_url: None,
             drops: vec![TimedDrop {
                 id: DropId::from(&format!("{id}-d1")[..]),
                 name: "d".into(),
@@ -593,14 +680,114 @@ mod tests {
     }
 
     #[test]
-    fn priority_ignores_games_not_on_the_list() {
+    fn priority_only_ignores_games_not_on_the_list() {
         let campaigns = vec![campaign("c-x", "Unlisted", Duration::days(5), 60)];
         let candidates = vec![candidate("x", "c-x", 1)];
         let favs = HashSet::new();
         let priority = vec!["alpha".to_string()];
         let w = world(&campaigns, &candidates, &favs, &priority);
 
-        assert!(matches!(choose(&Priority, &w), Decision::Idle(_)));
+        assert!(matches!(choose(&PriorityOnly, &w), Decision::Idle(_)));
+    }
+
+    /// The default must never sit idle earning nothing just because the games
+    /// on the list happen to have nobody streaming them.
+    #[test]
+    fn priority_still_mines_unlisted_games_rather_than_idling() {
+        let campaigns = vec![campaign("c-x", "Unlisted", Duration::days(5), 60)];
+        let candidates = vec![candidate("x", "c-x", 1)];
+        let favs = HashSet::new();
+        let priority = vec!["alpha".to_string()];
+        let w = world(&campaigns, &candidates, &favs, &priority);
+
+        assert_eq!(watched(&choose(&Priority, &w)), "x");
+    }
+
+    /// ...but a listed game always beats an unlisted one, however urgent.
+    #[test]
+    fn a_listed_game_outranks_any_unlisted_one() {
+        let campaigns = vec![
+            campaign("c-listed", "Alpha", Duration::days(30), 60),
+            campaign("c-unlisted", "Whatever", Duration::hours(3), 60),
+        ];
+        let candidates = vec![
+            candidate("listed", "c-listed", 1),
+            candidate("unlisted", "c-unlisted", 1),
+        ];
+        let favs = HashSet::new();
+        let priority = vec!["alpha".to_string()];
+        let w = world(&campaigns, &candidates, &favs, &priority);
+
+        assert_eq!(watched(&choose(&Priority, &w)), "listed");
+    }
+
+    /// Among unlisted games, the one closest to being lost wins.
+    #[test]
+    fn unlisted_games_are_ordered_by_urgency() {
+        let campaigns = vec![
+            campaign("c-later", "Beta", Duration::days(20), 60),
+            campaign("c-sooner", "Gamma", Duration::hours(5), 60),
+        ];
+        let candidates = vec![
+            candidate("later", "c-later", 1),
+            candidate("sooner", "c-sooner", 1),
+        ];
+        let favs = HashSet::new();
+        let priority = vec!["alpha".to_string()];
+        let w = world(&campaigns, &candidates, &favs, &priority);
+
+        assert_eq!(watched(&choose(&Priority, &w)), "sooner");
+    }
+
+    /// Availability compares headroom *relative to the work left*, which is
+    /// the difference from `deadline`.
+    #[test]
+    fn availability_prefers_the_campaign_with_the_least_headroom() {
+        let campaigns = vec![
+            // Two days left, ten minutes of watching: loads of headroom.
+            campaign("c-easy", "G", Duration::days(2), 10),
+            // Six hours left, five hours of watching: tight.
+            campaign("c-tight", "G", Duration::hours(6), 300),
+        ];
+        let candidates = vec![
+            candidate("easy", "c-easy", 1),
+            candidate("tight", "c-tight", 1),
+        ];
+        let favs = HashSet::new();
+        let w = world(&campaigns, &candidates, &favs, &[]);
+
+        assert_eq!(watched(&choose(&Availability, &w)), "tight");
+    }
+
+    /// Where the two strategies actually disagree, and why `availability`
+    /// exists at all.
+    ///
+    /// - `quick` ends in 100 minutes and needs 10: 90 minutes of slack, but
+    ///   ten times more time than it needs.
+    /// - `grind` ends in 1000 minutes and needs 900: more slack in absolute
+    ///   terms, but almost none relative to the work.
+    ///
+    /// `deadline` protects the nearer wall-clock deadline; `availability`
+    /// protects the one that will actually be tight to finish.
+    #[test]
+    fn availability_and_deadline_disagree_on_headroom_versus_slack() {
+        let campaigns = vec![
+            campaign("c-quick", "G", Duration::minutes(100), 10),
+            campaign("c-grind", "G", Duration::minutes(1000), 900),
+        ];
+        let candidates = vec![
+            candidate("quick", "c-quick", 1),
+            candidate("grind", "c-grind", 1),
+        ];
+        let favs = HashSet::new();
+        let w = world(&campaigns, &candidates, &favs, &[]);
+
+        assert_eq!(watched(&choose(&Deadline, &w)), "quick", "90 min of slack beats 100");
+        assert_eq!(
+            watched(&choose(&Availability, &w)),
+            "grind",
+            "a ratio of 1.1 is far tighter than one of 10"
+        );
     }
 
     #[test]
