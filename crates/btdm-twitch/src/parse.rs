@@ -64,8 +64,19 @@ fn parse_game(v: &Value) -> Result<Game, TwitchError> {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| slugify(&name)),
+        box_art_url: v
+            .get("boxArtURL")
+            .and_then(Value::as_str)
+            .map(size_template),
         name,
     })
+}
+
+/// Twitch returns image URLs as templates like
+/// `.../ttv-boxart/12345-{width}x{height}.jpg`. Handing that to an `<img>`
+/// tag renders a broken image, so the placeholders are filled in.
+fn size_template(url: &str) -> String {
+    url.replace("{width}", "144").replace("{height}", "192")
 }
 
 fn parse_channel(v: &Value) -> Result<Channel, TwitchError> {
@@ -104,6 +115,10 @@ fn parse_drop(v: &Value) -> Result<TimedDrop, TwitchError> {
                                 .and_then(Value::as_str)
                                 .unwrap_or(""),
                         ),
+                        image_url: b
+                            .get("imageAssetURL")
+                            .and_then(Value::as_str)
+                            .map(size_template),
                     })
                 })
                 .collect()

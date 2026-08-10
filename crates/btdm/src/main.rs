@@ -110,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 supervisor::SupervisorOptions {
                     headless,
                     only: only_this_account.then(|| args.account.clone()),
+                    config_store: config::ConfigStore::new(config_path),
                 },
             )
             .await
@@ -120,7 +121,10 @@ async fn main() -> anyhow::Result<()> {
                 &storage,
                 &args.account,
                 &cfg,
-                run::RunOptions { probe: true },
+                run::RunOptions {
+                    probe: true,
+                    config_store: None,
+                },
                 None,
             )
             .await

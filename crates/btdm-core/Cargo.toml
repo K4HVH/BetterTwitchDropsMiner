@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+# Future combinators only — runtime-agnostic, and specifically not an async
+# runtime or an I/O library. See tests/dependencies.rs for what is forbidden.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

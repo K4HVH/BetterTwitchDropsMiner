@@ -3,13 +3,14 @@
 //! Assets are compiled in, so `cargo build` alone produces the finished binary
 //! and there is no JavaScript toolchain in the build.
 
-use crate::hub::Hub;
-use axum::extract::State;
+use crate::hub::{CommandError, Hub, Update};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use btdm_core::control::Command;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use tokio_stream::{Stream, StreamExt};
@@ -60,6 +61,7 @@ pub async fn serve_announcing(
         .route("/api/snapshots", get(snapshots))
         .route("/api/events", get(events))
         .route("/api/health", get(health))
+        .route("/api/accounts/{account}/command", post(command))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -111,11 +113,7 @@ fn unauthorised() -> Response {
         .into_response()
 }
 
-async fn index(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-) -> Response {
+async fn index(State(state): State<AppState>, headers: HeaderMap, uri: axum::http::Uri) -> Response {
     if !authorised(&state, &headers, uri.query()) {
         return unauthorised();
     }
@@ -137,6 +135,48 @@ async fn snapshots(
     Json(state.hub.snapshots()).into_response()
 }
 
+/// Applies one command to one account.
+///
+/// The reply carries the miner's own confirmation text rather than a bare 200,
+/// so the page can tell the user what actually happened instead of assuming
+/// the click worked.
+async fn command(
+    State(state): State<AppState>,
+    Path(account): Path<String>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: String,
+) -> Response {
+    if !authorised(&state, &headers, uri.query()) {
+        return unauthorised();
+    }
+
+    let command: Command = match serde_json::from_str(&body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    match state.hub.send_command(&account, command) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e @ CommandError::UnknownAccount(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn events(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -146,26 +186,53 @@ async fn events(
         return unauthorised();
     }
 
+    // Send the current state immediately so a page that has just loaded is
+    // never blank while it waits for the first change.
+    let initial: Vec<Update> = state
+        .hub
+        .snapshots()
+        .into_iter()
+        .map(|s| Update::Snapshot(Box::new(s)))
+        .collect();
+
     let rx = state.hub.subscribe();
-    let stream = event_stream(rx);
+    let stream = tokio_stream::iter(initial.into_iter().map(|u| Ok(encode(&u))))
+        .chain(event_stream(rx));
+
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
+/// Named SSE events, so the page can route a snapshot and a log line to
+/// different handlers rather than sniffing the payload.
+fn encode(update: &Update) -> Event {
+    match update {
+        Update::Snapshot(s) => Event::default()
+            .event("snapshot")
+            .data(serde_json::to_string(s).unwrap_or_else(|_| "{}".into())),
+        Update::Event(item) => {
+            let payload = serde_json::json!({
+                "account": item.account,
+                "at": item.event.at,
+                "summary": item.event.summary(),
+                "severity": item.event.severity(),
+                "kind": item.event.kind,
+            });
+            Event::default().event("log").data(payload.to_string())
+        }
+    }
+}
+
 fn event_stream(
-    rx: tokio::sync::broadcast::Receiver<crate::hub::AccountEvent>,
+    rx: tokio::sync::broadcast::Receiver<Update>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| {
-        // A lagging subscriber drops events rather than killing the stream;
-        // the snapshot poll fills any gap.
+        // A lagging subscriber drops updates rather than killing the stream;
+        // the next snapshot is a full state replacement, so the page recovers
+        // on its own without needing to re-fetch.
         let item = item.ok()?;
-        let payload = serde_json::json!({
-            "account": item.account,
-            "at": item.event.at,
-            "kind": format!("{:?}", item.event.kind),
-        });
-        Some(Ok(Event::default().data(payload.to_string())))
+        Some(Ok(encode(&item)))
     })
 }
 
@@ -238,9 +305,45 @@ mod tests {
     #[test]
     fn the_page_is_compiled_in() {
         assert!(INDEX_HTML.contains("<!doctype html>"));
-        assert!(
-            !INDEX_HTML.contains("http://") && !INDEX_HTML.contains("https://"),
-            "the page must not reference external resources"
-        );
+    }
+
+    /// The page must work with no network beyond the miner itself, so it may
+    /// not pull scripts, styles or fonts from anywhere. Twitch artwork is the
+    /// single exception: it is `<img>` content, cannot execute, and degrades
+    /// to a missing picture rather than a broken page.
+    #[test]
+    fn the_page_loads_no_external_code() {
+        for line in INDEX_HTML.lines() {
+            let l = line.trim();
+            if !l.contains("http://") && !l.contains("https://") {
+                continue;
+            }
+            assert!(
+                l.contains("static-cdn.jtvnw.net") || l.contains("twitch.tv"),
+                "the page must not reference external resources: {l}"
+            );
+            assert!(
+                !l.contains("<script") && !l.contains("stylesheet"),
+                "the page must not load external code: {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_encodes_as_its_own_sse_event_type() {
+        let hub = Hub::new();
+        let _ = hub;
+        let update = Update::Event(crate::hub::AccountEvent {
+            account: "main".into(),
+            event: btdm_core::event::MinerEvent {
+                at: chrono::Utc::now(),
+                kind: btdm_core::event::EventKind::AuthExpired,
+            },
+        });
+        // Encoding must not panic, and must produce a readable summary rather
+        // than a debug dump.
+        let encoded = format!("{:?}", encode(&update));
+        assert!(encoded.contains("log"), "{encoded}");
+        assert!(encoded.contains("sign in again"), "{encoded}");
     }
 }

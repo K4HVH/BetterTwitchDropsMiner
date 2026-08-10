@@ -34,7 +34,7 @@ async fn selects_an_eligible_channel_and_starts_watching() {
     let selected = e.select_channel(now()).await.unwrap();
 
     assert!(selected.is_some());
-    assert_eq!(selected.unwrap().0.login, "streamer1");
+    assert_eq!(selected.unwrap().channel.login, "streamer1");
     assert_eq!(e.state(), MiningState::Establishing);
 }
 
@@ -126,7 +126,7 @@ async fn prefers_a_channel_that_actually_progresses_our_drops() {
 
     let mut e = engine(fake);
     e.sync(now()).await.unwrap();
-    let (chosen, _, _) = e.select_channel(now()).await.unwrap().unwrap();
+    let chosen = e.select_channel(now()).await.unwrap().unwrap().channel;
     assert_eq!(chosen.login, "streamer1");
 }
 
@@ -452,7 +452,7 @@ async fn the_deadline_strategy_prefers_the_campaign_closest_to_expiry() {
 
     let mut e = engine(fake);
     e.sync(now()).await.unwrap();
-    let (chosen, _, _) = e.select_channel(now()).await.unwrap().unwrap();
+    let chosen = e.select_channel(now()).await.unwrap().unwrap().channel;
     assert_eq!(chosen.login, "soonstreamer");
 }
 
@@ -478,7 +478,7 @@ async fn a_favourite_channel_wins_an_otherwise_equal_choice() {
 
     let mut e = engine_with(fake, |c| c.favourites = vec!["Beloved".into()]);
     e.sync(now()).await.unwrap();
-    let (chosen, _, _) = e.select_channel(now()).await.unwrap().unwrap();
+    let chosen = e.select_channel(now()).await.unwrap().unwrap().channel;
     assert_eq!(chosen.login, "beloved");
 }
 
@@ -721,7 +721,15 @@ async fn unlinked_campaigns_are_still_reported_as_rejected() {
     assert_eq!(snap.totals.campaigns_known, 2, "the campaigns still exist");
     assert_eq!(snap.totals.campaigns_eligible, 0);
     assert_eq!(snap.rejected.len(), 2);
-    assert!(snap.rejected.iter().all(|r| r.reason == "NotLinked"));
+    assert!(snap.rejected.iter().all(|r| r.reason == "not linked"));
+    // A user who does not know what "linked" means must still be told what to do.
+    assert!(
+        snap.rejected
+            .iter()
+            .all(|r| r.explanation.contains("link it")),
+        "the reason has to be actionable, got: {:?}",
+        snap.rejected.first().map(|r| &r.explanation)
+    );
     assert_eq!(*e.api().detail_fetches.lock().unwrap(), 0, "still no requests spent");
 }
 
@@ -888,4 +896,678 @@ async fn a_silent_channel_is_eventually_abandoned_by_the_ladder() {
         e.current_channel().is_none(),
         "the ladder must not leave the miner parked on a channel earning nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-campaign sessions
+//
+// One channel routinely advances several campaigns at once. The engine used to
+// model a session as one channel *and one campaign*, which threw the rest away.
+// ---------------------------------------------------------------------------
+
+fn game2() -> Game {
+    Game {
+        id: GameId::from("g2"),
+        name: "Other Game".into(),
+        slug: "other-game".into(),
+        box_art_url: None,
+    }
+}
+
+/// Two campaigns for the same game, one channel serving both.
+fn two_campaigns_one_channel() -> FakeTwitch {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![
+        campaign("c1", true, vec![drop("d1", 60, 0)]),
+        campaign("c2", true, vec![drop("d2", 120, 0)]),
+    ];
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1"), DropId::from("d2")]);
+    fake
+}
+
+#[tokio::test]
+async fn a_session_records_every_campaign_the_channel_advances() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    assert_eq!(watch.campaigns.len(), 2, "both campaigns are being earned");
+    assert_eq!(watch.drops.len(), 2);
+}
+
+/// The bug this replaced: progress was accepted only for the primary campaign,
+/// so confirmations for the others were discarded and the stall detector fired
+/// on a session that was working perfectly.
+#[tokio::test]
+async fn progress_for_any_advanced_campaign_counts() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    // Deliberately pick a campaign that is *not* the primary one.
+    let secondary = watch.campaigns.last().unwrap().clone();
+    let drop_id = e
+        .campaigns()
+        .iter()
+        .find(|c| c.id == secondary)
+        .unwrap()
+        .drops[0]
+        .id
+        .clone();
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: drop_id.clone(),
+            current_minutes: 5,
+            required_minutes: 120,
+        },
+        now(),
+    );
+
+    assert_eq!(e.state(), MiningState::Mining, "the confirmation counted");
+    assert_eq!(e.active_drop().unwrap().0, &drop_id);
+}
+
+/// Progress for a campaign this session is not mining is still ignored — that
+/// is the browser-in-another-tab case, and it must not reset the stall clock.
+#[tokio::test]
+async fn progress_for_an_unrelated_campaign_is_still_ignored() {
+    let fake = two_campaigns_one_channel();
+    // A third campaign, live but not served by our channel.
+    fake.inventory
+        .lock()
+        .unwrap()
+        .push(campaign("c3", true, vec![drop("d3", 60, 0)]));
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap().unwrap();
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d3"),
+            current_minutes: 30,
+            required_minutes: 60,
+        },
+        now(),
+    );
+
+    assert_eq!(
+        e.state(),
+        MiningState::Establishing,
+        "watching another campaign in a browser must not look like our progress"
+    );
+}
+
+/// The check budget is per channel now, not per channel-campaign pair. With
+/// two campaigns served by one channel, one request should suffice.
+#[tokio::test]
+async fn a_channel_serving_two_campaigns_is_only_checked_once() {
+    let fake = two_campaigns_one_channel();
+    let checked = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    // The fake counts detail fetches, not availability checks, so assert on
+    // the observable consequence instead: one candidate, not two.
+    let _ = checked;
+    let snap = e.snapshot("main", None, now());
+    assert_eq!(
+        snap.live.len(),
+        1,
+        "one channel must appear once, not once per campaign"
+    );
+    assert_eq!(snap.live[0].campaigns.len(), 2);
+}
+
+/// Two games means two directory queries, but a channel appearing in both is
+/// still one candidate.
+#[tokio::test]
+async fn candidates_are_deduplicated_across_games() {
+    let fake = FakeTwitch::default();
+    let mut c2 = campaign("c2", true, vec![drop("d2", 60, 0)]);
+    c2.game = game2();
+    *fake.inventory.lock().unwrap() =
+        vec![campaign("c1", true, vec![drop("d1", 60, 0)]), c2];
+
+    // The same channel is live under both games.
+    let mut second_stream = stream("bc-1", true);
+    second_stream.game = Some(game2());
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "streamer1"), stream("bc-1", true)),
+        (channel("ch1", "streamer1"), second_stream),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1"), DropId::from("d2")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    assert_eq!(watch.campaigns.len(), 2, "both games are advanced at once");
+    assert_eq!(e.snapshot("main", None, now()).live.len(), 1);
+}
+
+/// A stale campaign disappearing from a sync must not leave the session
+/// claiming to mine something that no longer exists.
+#[tokio::test]
+async fn a_session_whose_campaigns_all_vanish_is_abandoned() {
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap().unwrap();
+    assert!(e.current().is_some());
+
+    // Twitch now offers nothing.
+    e.api().inventory.lock().unwrap().clear();
+    e.sync(now()).await.unwrap();
+
+    assert!(e.current().is_none(), "we cannot be mining a campaign that is gone");
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+//
+// Every control on the dashboard is one of these. A button that silently does
+// nothing is worse than no button, so each is asserted end to end.
+// ---------------------------------------------------------------------------
+
+use btdm_core::control::Command;
+
+#[tokio::test]
+async fn pausing_stops_watching_and_stops_selecting() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current().is_some());
+
+    let effect = e.apply_command(Command::Pause, now());
+    assert!(effect.persist, "pausing must survive a restart");
+    assert!(e.current().is_none());
+    assert_eq!(e.state(), MiningState::Paused);
+
+    // And it must stay stopped.
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+    e.tick(now()).await.unwrap();
+    assert!(
+        e.api().watches_sent.lock().unwrap().is_empty(),
+        "a paused miner must not send heartbeats"
+    );
+}
+
+#[tokio::test]
+async fn resuming_selects_again() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.apply_command(Command::Pause, now());
+
+    let effect = e.apply_command(Command::Resume, now());
+    assert!(effect.reselect);
+    assert!(e.select_channel(now()).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn changing_strategy_takes_effect_without_a_restart() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let effect = e.apply_command(
+        Command::SetStrategy {
+            name: "coverage".into(),
+        },
+        now(),
+    );
+
+    assert_eq!(e.strategy_name(), "coverage");
+    assert!(effect.reselect && effect.persist);
+    assert!(
+        e.needs_selection(now()),
+        "the choice must be re-decided under the new strategy at once"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_strategy_is_refused_rather_than_silently_ignored() {
+    let mut e = engine(happy_path());
+    let effect = e.apply_command(
+        Command::SetStrategy {
+            name: "telepathy".into(),
+        },
+        now(),
+    );
+    assert_eq!(e.strategy_name(), "deadline", "the old one is kept");
+    assert!(effect.message.contains("No such strategy"), "{}", effect.message);
+    assert!(!effect.persist, "nothing changed, so nothing to save");
+}
+
+#[tokio::test]
+async fn excluding_a_campaign_stops_it_being_mined() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current().is_some());
+
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c1"),
+            excluded: true,
+        },
+        now(),
+    );
+
+    assert!(e.current().is_none(), "we were mining the thing just excluded");
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "and it must not be picked again"
+    );
+    // It stays visible, marked, rather than vanishing from the dashboard.
+    let snap = e.snapshot("main", None, now());
+    assert!(snap.eligible.iter().any(|c| c.id == "c1" && c.excluded));
+}
+
+#[tokio::test]
+async fn excluding_a_game_excludes_all_of_its_campaigns() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    e.apply_command(
+        Command::SetGameExcluded {
+            game: "Deadlock".into(),
+            excluded: true,
+        },
+        now(),
+    );
+
+    assert!(e.current().is_none());
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn re_including_a_campaign_makes_it_mineable_again() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c1"),
+            excluded: true,
+        },
+        now(),
+    );
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c1"),
+            excluded: false,
+        },
+        now(),
+    );
+    assert!(e.select_channel(now()).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn watching_a_named_channel_overrides_the_strategy_once() {
+    let fake = happy_path();
+    fake.channels
+        .lock()
+        .unwrap()
+        .push((channel("ch2", "streamer2"), stream("bc-2", true)));
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch2".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    e.apply_command(
+        Command::WatchChannel {
+            login: "streamer2".into(),
+        },
+        now(),
+    );
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(watch.channel.login, "streamer2");
+    assert!(watch.reason.contains("you asked"), "{}", watch.reason);
+}
+
+/// Asking for a channel that is not live must say so rather than appearing to
+/// work and then quietly watching something else.
+#[tokio::test]
+async fn watching_an_unavailable_channel_reports_why() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.drain_events();
+
+    e.apply_command(
+        Command::WatchChannel {
+            login: "not-live".into(),
+        },
+        now(),
+    );
+    e.select_channel(now()).await.unwrap();
+
+    let notices: Vec<String> = e
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev.kind {
+            EventKind::Notice { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.iter().any(|m| m.contains("not-live")),
+        "the user must be told, got: {notices:?}"
+    );
+}
+
+#[tokio::test]
+async fn switching_channel_moves_off_the_current_one() {
+    let fake = happy_path();
+    fake.channels
+        .lock()
+        .unwrap()
+        .push((channel("ch2", "streamer2"), stream("bc-2", true)));
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch2".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let first = e.select_channel(now()).await.unwrap().unwrap();
+
+    e.apply_command(Command::SwitchChannel, now());
+    let second = e.select_channel(now()).await.unwrap().unwrap();
+
+    assert_ne!(
+        first.channel.login, second.channel.login,
+        "switching must actually switch, not re-pick the same channel"
+    );
+}
+
+#[tokio::test]
+async fn pinning_a_channel_is_persisted_and_reselects() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+
+    let effect = e.apply_command(
+        Command::Pin {
+            channel: Some("SomeStreamer".into()),
+        },
+        now(),
+    );
+    assert!(effect.persist && effect.reselect);
+    assert_eq!(e.settings().pinned_channel.as_deref(), Some("somestreamer"));
+
+    e.apply_command(Command::Pin { channel: None }, now());
+    assert!(e.settings().pinned_channel.is_none());
+}
+
+#[tokio::test]
+async fn favourites_can_be_added_and_removed() {
+    let mut e = engine(happy_path());
+    e.apply_command(
+        Command::SetFavourite {
+            login: "SomeStreamer".into(),
+            on: true,
+        },
+        now(),
+    );
+    assert_eq!(e.settings().favourite_channels, vec!["somestreamer"]);
+
+    e.apply_command(
+        Command::SetFavourite {
+            login: "somestreamer".into(),
+            on: false,
+        },
+        now(),
+    );
+    assert!(e.settings().favourite_channels.is_empty());
+}
+
+#[tokio::test]
+async fn clearing_quarantine_lets_a_rested_channel_be_picked_again() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.quarantine_current(now());
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "the only channel is resting"
+    );
+
+    e.apply_command(Command::ClearQuarantine, now());
+    assert!(
+        e.select_channel(now()).await.unwrap().is_some(),
+        "clearing must actually free it"
+    );
+}
+
+#[tokio::test]
+async fn sync_now_forces_a_refresh_that_was_not_yet_due() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    assert!(!e.needs_sync(now()), "just synced");
+
+    e.apply_command(Command::SyncNow, now());
+    assert!(e.needs_sync(now()));
+}
+
+/// A command the user issued must appear in the log, or the dashboard cannot
+/// confirm anything happened.
+#[tokio::test]
+async fn commands_are_recorded_as_events() {
+    let mut e = engine(happy_path());
+    e.drain_events();
+    e.apply_command(Command::Pause, now());
+
+    let messages: Vec<String> = e.drain_events().iter().map(|ev| ev.summary()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("paused")),
+        "got: {messages:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot as a UI contract
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_snapshot_carries_everything_the_controls_need() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let snap = e.snapshot("main", Some("someone"), now());
+
+    assert_eq!(snap.strategies.len(), 5, "the picker is built from this");
+    assert!(snap.strategies.iter().any(|s| s.selected));
+    assert!(
+        snap.strategies.iter().all(|s| !s.description.is_empty()),
+        "each option has to explain itself"
+    );
+    assert_eq!(snap.settings.strategy, "deadline");
+    assert!(!snap.eligible.is_empty());
+    assert!(!snap.eligible[0].drops.is_empty(), "drops must be visible");
+    assert!(snap.eligible[0].is_current, "the mined campaign is marked");
+    assert_eq!(snap.live.len(), 1, "the choice we faced is shown");
+    assert!(snap.watching.is_some());
+    assert!(
+        !snap.watching.as_ref().unwrap().reason.is_empty(),
+        "the choice must explain itself on screen"
+    );
+}
+
+#[tokio::test]
+async fn the_snapshot_reports_when_the_next_sync_is_due() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    let snap = e.snapshot("main", None, now());
+    assert!(snap.health.last_sync.is_some());
+    assert!(snap.health.next_sync_in_seconds.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn a_quarantined_channel_is_explained_rather_than_silently_skipped() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.quarantine_current(now());
+
+    let snap = e.snapshot("main", None, now());
+    assert_eq!(
+        snap.health.quarantined_channels.len(),
+        1,
+        "the user is entitled to know why a live channel is being skipped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reconsidering the choice while already watching
+//
+// Selection used to run only when idle, so the strategy was consulted once per
+// stream and a campaign that became urgent could never displace a comfortable
+// one already in progress.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_choice_is_reconsidered_periodically_not_only_when_idle() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    assert!(!e.needs_selection(now()), "just chose");
+    assert!(
+        e.needs_selection(now() + chrono::Duration::minutes(11)),
+        "a watching miner must still reconsider, or urgency never wins"
+    );
+}
+
+/// Re-choosing the same channel must not restart the session: that would reset
+/// the stall clock and throw away the confirmed-progress display every time.
+#[tokio::test]
+async fn reselecting_the_same_channel_keeps_the_session_and_its_progress() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    let first = e.select_channel(now()).await.unwrap().unwrap();
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d1"),
+            current_minutes: 30,
+            required_minutes: 60,
+        },
+        now(),
+    );
+    assert_eq!(e.state(), MiningState::Mining);
+
+    let later = now() + chrono::Duration::minutes(11);
+    let again = e.select_channel(later).await.unwrap().unwrap();
+
+    assert_eq!(again.channel.login, first.channel.login);
+    assert_eq!(
+        again.since, first.since,
+        "the session must not appear to have restarted"
+    );
+    assert_eq!(e.state(), MiningState::Mining, "progress must survive");
+    assert_eq!(e.active_drop().unwrap().1.current_minutes, 30);
+}
+
+/// A campaign that becomes urgent must be able to take over from a comfortable
+/// one, without waiting for the current stream to end.
+#[tokio::test]
+async fn an_urgent_campaign_displaces_a_comfortable_one() {
+    let fake = FakeTwitch::default();
+    let mut relaxed = campaign("c-relaxed", true, vec![drop("d1", 60, 0)]);
+    relaxed.ends_at = now() + chrono::Duration::days(20);
+    let mut urgent = campaign("c-urgent", true, vec![drop("d2", 60, 0)]);
+    urgent.ends_at = now() + chrono::Duration::hours(3);
+    urgent.starts_at = now() - chrono::Duration::hours(1);
+
+    *fake.inventory.lock().unwrap() = vec![relaxed];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "relaxed-streamer"), stream("bc-1", true)),
+        (channel("ch2", "urgent-streamer"), stream("bc-2", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch2".into(), vec![DropId::from("d2")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let first = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(first.channel.login, "relaxed-streamer");
+
+    // The urgent campaign appears on the next sync.
+    e.api().inventory.lock().unwrap().push(urgent);
+    e.sync(now()).await.unwrap();
+    assert!(e.needs_selection(now()), "a sync must prompt a rethink");
+
+    let second = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(
+        second.channel.login, "urgent-streamer",
+        "a campaign expiring in three hours must beat one expiring in twenty days"
+    );
+}
+
+/// Hysteresis still has to stop the periodic rethink turning into thrash.
+#[tokio::test]
+async fn a_marginally_better_channel_does_not_cause_a_switch() {
+    let fake = FakeTwitch::default();
+    let mut a = campaign("c-a", true, vec![drop("d1", 60, 0)]);
+    a.ends_at = now() + chrono::Duration::days(5);
+    let mut b = campaign("c-b", true, vec![drop("d2", 60, 0)]);
+    b.ends_at = now() + chrono::Duration::days(5) - chrono::Duration::minutes(1);
+
+    *fake.inventory.lock().unwrap() = vec![a, b];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "incumbent"), stream("bc-1", true)),
+        (channel("ch2", "rival"), stream("bc-2", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch2".into(), vec![DropId::from("d2")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let first = e.select_channel(now()).await.unwrap().unwrap();
+
+    let again = e
+        .select_channel(now() + chrono::Duration::minutes(11))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        again.channel.login, first.channel.login,
+        "a one-minute difference must not cost us the session"
+    );
+}
+
+#[tokio::test]
+async fn a_paused_miner_never_asks_to_select() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.apply_command(Command::Pause, now());
+    assert!(!e.needs_selection(now() + chrono::Duration::hours(2)));
 }

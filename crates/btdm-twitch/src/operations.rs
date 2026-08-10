@@ -20,12 +20,12 @@ pub const INVENTORY: GqlOperation = GqlOperation {
     inventory {
       dropCampaignsInProgress {
         id name status startAt endAt
-        game { id name slug }
+        game { id name slug boxArtURL }
         self { isAccountConnected }
         allow { channels { id name displayName } }
         timeBasedDrops {
           id name requiredMinutesWatched
-          benefitEdges { benefit { id name distributionType } }
+          benefitEdges { benefit { id name distributionType imageAssetURL } }
           self { currentMinutesWatched isClaimed dropInstanceID }
           preconditionDrops { id }
         }
@@ -43,7 +43,7 @@ pub const CAMPAIGNS: GqlOperation = GqlOperation {
   currentUser {
     dropCampaigns {
       id name status startAt endAt
-      game { id name slug }
+      game { id name slug boxArtURL }
       self { isAccountConnected }
     }
   }
@@ -57,12 +57,12 @@ pub const CAMPAIGN_DETAILS: GqlOperation = GqlOperation {
   user(login: $channelLogin) {
     dropCampaign(id: $dropID) {
       id name status startAt endAt
-      game { id name slug }
+      game { id name slug boxArtURL }
       self { isAccountConnected }
       allow { channels { id name displayName } }
       timeBasedDrops {
         id name requiredMinutesWatched
-        benefitEdges { benefit { id name distributionType } }
+        benefitEdges { benefit { id name distributionType imageAssetURL } }
         self { currentMinutesWatched isClaimed dropInstanceID }
         preconditionDrops { id }
       }
@@ -94,7 +94,7 @@ pub const CURRENT_DROP: GqlOperation = GqlOperation {
   currentUser {
     dropCurrentSession {
       channel { id }
-      game { id name slug }
+      game { id name slug boxArtURL }
       currentMinutesWatched requiredMinutesWatched dropID
     }
   }
@@ -111,7 +111,7 @@ pub const GAME_DIRECTORY: GqlOperation = GqlOperation {
       edges {
         node {
           id title viewersCount
-          game { id name slug }
+          game { id name slug boxArtURL }
           broadcaster { id login displayName }
           freeformTags { name }
         }
@@ -136,7 +136,7 @@ pub const STREAM_INFO: GqlOperation = GqlOperation {
   user(login: $channel) {
     id login displayName
     stream { id viewersCount }
-    broadcastSettings { title game { id name slug } }
+    broadcastSettings { title game { id name slug boxArtURL } }
   }
 }"#,
 };

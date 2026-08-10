@@ -1,14 +1,20 @@
 //! Shared state between the miners and the dashboard.
 //!
 //! Each account's task publishes a snapshot and broadcasts events; the web
-//! layer only ever reads. Accounts never see each other's state, which is what
-//! keeps them independent.
+//! layer reads those and sends commands back. Accounts never see each other's
+//! state, which is what keeps them independent.
+//!
+//! The command path is deliberately a bounded per-account channel rather than
+//! shared mutable state: a miner applies a command between ticks, at a point
+//! where it is safe to abandon the current channel, and nothing outside the
+//! engine can mutate it mid-selection.
 
+use btdm_core::control::Command;
 use btdm_core::event::MinerEvent;
 use btdm_core::snapshot::Snapshot;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// An event tagged with the account that produced it.
 #[derive(Debug, Clone)]
@@ -17,11 +23,27 @@ pub struct AccountEvent {
     pub event: MinerEvent,
 }
 
+/// What the dashboard streams: either a new snapshot or a log line.
+#[derive(Debug, Clone)]
+pub enum Update {
+    Snapshot(Box<Snapshot>),
+    Event(AccountEvent),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CommandError {
+    #[error("no account named '{0}' is running")]
+    UnknownAccount(String),
+    #[error("the miner for '{0}' is not accepting commands")]
+    NotAccepting(String),
+}
+
 #[derive(Clone)]
 pub struct Hub {
     /// Ordered so the dashboard lists accounts consistently between refreshes.
     snapshots: Arc<RwLock<BTreeMap<String, Snapshot>>>,
-    events: broadcast::Sender<AccountEvent>,
+    commands: Arc<RwLock<BTreeMap<String, mpsc::Sender<Command>>>>,
+    updates: broadcast::Sender<Update>,
 }
 
 impl Default for Hub {
@@ -32,32 +54,39 @@ impl Default for Hub {
 
 impl Hub {
     pub fn new() -> Self {
-        let (events, _) = broadcast::channel(256);
+        let (updates, _) = broadcast::channel(256);
         Self {
             snapshots: Arc::new(RwLock::new(BTreeMap::new())),
-            events,
+            commands: Arc::new(RwLock::new(BTreeMap::new())),
+            updates,
         }
     }
 
+    /// Publishes a snapshot *and* pushes it to every open dashboard.
+    ///
+    /// Pushing the whole snapshot is what makes the page feel live. It
+    /// previously received only an event name and had to re-fetch, so a change
+    /// took a round trip to show up — and any change that produced no event
+    /// (most of them) waited for the next 15-second poll.
     pub fn publish(&self, snapshot: Snapshot) {
-        let mut guard = self
-            .snapshots
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.insert(snapshot.account.clone(), snapshot);
+        {
+            let mut guard = self.snapshots.write().unwrap_or_else(|e| e.into_inner());
+            guard.insert(snapshot.account.clone(), snapshot.clone());
+        }
+        let _ = self.updates.send(Update::Snapshot(Box::new(snapshot)));
     }
 
     /// Broadcasting with no subscribers is not an error — nobody has the
     /// dashboard open.
     pub fn emit(&self, account: &str, event: MinerEvent) {
-        let _ = self.events.send(AccountEvent {
+        let _ = self.updates.send(Update::Event(AccountEvent {
             account: account.to_owned(),
             event,
-        });
+        }));
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<AccountEvent> {
-        self.events.subscribe()
+    pub fn subscribe(&self) -> broadcast::Receiver<Update> {
+        self.updates.subscribe()
     }
 
     pub fn snapshots(&self) -> Vec<Snapshot> {
@@ -76,6 +105,49 @@ impl Hub {
             .get(account)
             .cloned()
     }
+
+    /// Registers an account's command channel. Called by the supervisor as it
+    /// starts each miner.
+    pub fn register(&self, account: &str, tx: mpsc::Sender<Command>) {
+        self.commands
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account.to_owned(), tx);
+    }
+
+    pub fn unregister(&self, account: &str) {
+        self.commands
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account);
+    }
+
+    pub fn accounts(&self) -> Vec<String> {
+        self.commands
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Sends a command to one account's miner.
+    ///
+    /// `try_send` rather than `send`: an HTTP handler must not block on a
+    /// miner that is mid-request, and a full queue means the user is clicking
+    /// faster than the miner can act, which is worth reporting rather than
+    /// silently absorbing.
+    pub fn send_command(&self, account: &str, command: Command) -> Result<(), CommandError> {
+        let tx = {
+            let guard = self.commands.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(account)
+                .cloned()
+                .ok_or_else(|| CommandError::UnknownAccount(account.to_owned()))?
+        };
+        tx.try_send(command)
+            .map_err(|_| CommandError::NotAccepting(account.to_owned()))
+    }
 }
 
 #[cfg(test)]
@@ -83,7 +155,7 @@ mod tests {
     use super::*;
     use btdm_core::event::EventKind;
     use btdm_core::model::ChannelId;
-    use btdm_core::snapshot::Totals;
+    use btdm_core::snapshot::{HealthView, SettingsView, Totals};
 
     fn snapshot(account: &str) -> Snapshot {
         Snapshot {
@@ -91,10 +163,15 @@ mod tests {
             login: Some("someone".into()),
             strategy: "deadline".into(),
             state: "Mining".into(),
+            paused: false,
             generated_at: chrono::Utc::now(),
             watching: None,
             eligible: vec![],
             rejected: vec![],
+            live: vec![],
+            settings: SettingsView::default(),
+            strategies: vec![],
+            health: HealthView::default(),
             totals: Totals::default(),
         }
     }
@@ -143,8 +220,25 @@ mod tests {
             },
         );
 
-        let got = rx.recv().await.unwrap();
-        assert_eq!(got.account, "main");
+        match rx.recv().await.unwrap() {
+            Update::Event(e) => assert_eq!(e.account, "main"),
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+
+    /// The page renders from pushed snapshots, so publishing has to reach
+    /// subscribers rather than only updating the map.
+    #[tokio::test]
+    async fn publishing_pushes_the_snapshot_to_subscribers() {
+        let hub = Hub::new();
+        let mut rx = hub.subscribe();
+
+        hub.publish(snapshot("main"));
+
+        match rx.recv().await.unwrap() {
+            Update::Snapshot(s) => assert_eq!(s.account, "main"),
+            other => panic!("expected a snapshot, got {other:?}"),
+        }
     }
 
     /// Nobody having the dashboard open must not break the miner.
@@ -158,5 +252,50 @@ mod tests {
                 kind: EventKind::AuthExpired,
             },
         );
+        hub.publish(snapshot("main"));
+    }
+
+    #[tokio::test]
+    async fn a_registered_account_receives_its_commands() {
+        let hub = Hub::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        hub.register("main", tx);
+
+        hub.send_command("main", Command::Pause).unwrap();
+        assert_eq!(rx.recv().await.unwrap(), Command::Pause);
+    }
+
+    #[test]
+    fn commanding_an_unknown_account_says_so() {
+        let hub = Hub::new();
+        assert_eq!(
+            hub.send_command("nope", Command::Pause),
+            Err(CommandError::UnknownAccount("nope".into()))
+        );
+    }
+
+    /// A miner that has stopped must not leave the dashboard reporting success
+    /// for commands nobody will ever act on.
+    #[tokio::test]
+    async fn commanding_a_stopped_miner_fails_loudly() {
+        let hub = Hub::new();
+        let (tx, rx) = mpsc::channel(1);
+        hub.register("main", tx);
+        drop(rx);
+
+        assert_eq!(
+            hub.send_command("main", Command::Pause),
+            Err(CommandError::NotAccepting("main".into()))
+        );
+    }
+
+    #[test]
+    fn unregistering_removes_the_account() {
+        let hub = Hub::new();
+        let (tx, _rx) = mpsc::channel(1);
+        hub.register("main", tx);
+        assert_eq!(hub.accounts(), vec!["main".to_string()]);
+        hub.unregister("main");
+        assert!(hub.accounts().is_empty());
     }
 }

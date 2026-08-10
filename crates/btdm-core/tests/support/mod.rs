@@ -134,6 +134,7 @@ pub fn game() -> Game {
         id: GameId::from("g1"),
         name: "Deadlock".into(),
         slug: "deadlock".into(),
+        box_art_url: None,
     }
 }
 

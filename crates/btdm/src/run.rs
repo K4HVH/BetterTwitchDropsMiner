@@ -1,29 +1,33 @@
 //! Wires config, storage, auth, PubSub and the engine into a running miner.
 
-use crate::config::Config;
+use crate::config::{Config, ConfigStore};
 use crate::notify::Discord;
 use crate::storage::Storage;
 use btdm_core::api::TwitchApi;
+use btdm_core::control::Command;
 use btdm_core::engine::{Engine, EngineConfig, MiningState};
+use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::api_impl::TwitchClient;
 use btdm_twitch::auth::AuthClient;
 use btdm_twitch::client::build_http_client;
-use btdm_core::watchdog::{RecoveryStep, Verdict};
 use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
 use btdm_web::Hub;
 use chrono::{Duration, Utc};
 use std::time::Duration as StdDuration;
+use tokio::sync::mpsc;
 
-/// How often campaigns are re-synced from Twitch.
-const SYNC_INTERVAL: Duration = Duration::minutes(30);
 /// How often the access token is re-validated.
 const AUTH_CHECK_INTERVAL: Duration = Duration::minutes(60);
 /// Backoff ceiling for PubSub reconnection.
 const PUBSUB_MAX_BACKOFF: StdDuration = StdDuration::from_secs(180);
+/// How many queued commands before the dashboard is told to slow down.
+const COMMAND_QUEUE: usize = 32;
 
 pub struct RunOptions {
     /// Run a single diagnostic pass and exit, rather than mining forever.
     pub probe: bool,
+    /// Where to write settings changed from the dashboard.
+    pub config_store: Option<ConfigStore>,
 }
 
 pub async fn mine(
@@ -55,6 +59,9 @@ pub async fn mine(
         favourites: account_config.favourite_channels.clone(),
         priority_games: account_config.priority_games.clone(),
         pinned: account_config.pinned_channel.clone(),
+        excluded_campaigns: account_config.excluded_campaigns.clone(),
+        excluded_games: account_config.excluded_games.clone(),
+        paused: account_config.paused,
         ..EngineConfig::default()
     };
     let watch_interval = engine_config.watch_interval.to_std()?;
@@ -63,6 +70,7 @@ pub async fn mine(
         strategy = engine.strategy_name(),
         favourites = account_config.favourite_channels.len(),
         priority_games = account_config.priority_games.len(),
+        paused = engine.is_paused(),
         "engine configured"
     );
 
@@ -71,36 +79,45 @@ pub async fn mine(
     let mut pubsub_rx =
         spawn_pubsub_supervisor(tokens.access_token.clone(), validated.user_id.clone());
 
+    // Commands from the dashboard. Registered before the first tick so a
+    // control pressed during startup is queued rather than rejected.
+    let (command_tx, mut command_rx) = mpsc::channel::<Command>(COMMAND_QUEUE);
+    if let Some(hub) = &hub {
+        hub.register(account, command_tx);
+    }
+
     let notifier = config
         .discord_webhook
         .as_ref()
         .map(|w| Discord::new(build_http_client().unwrap_or_default(), w.clone()));
 
-    let mut last_sync = None;
     let mut last_auth_check = Utc::now();
-
-    loop {
+    let result = loop {
         let now = Utc::now();
 
         // --- campaign sync -------------------------------------------------
-        if last_sync.is_none_or(|t| now - t >= SYNC_INTERVAL) {
+        if engine.needs_sync(now) {
             match engine.sync(now).await {
-                Ok(()) => last_sync = Some(now),
+                Ok(()) => {}
                 Err(btdm_core::api::ApiError::Unauthorized) => {
-                    anyhow::bail!("the stored token was rejected. Run: btdm login --force");
+                    break Err(anyhow::anyhow!(
+                        "the stored token was rejected. Run: btdm login --force"
+                    ));
                 }
                 Err(e) => tracing::error!(error = %e, "campaign sync failed"),
             }
         }
 
         // --- channel selection ---------------------------------------------
-        if engine.current_channel().is_none()
+        if engine.needs_selection(now)
             && let Err(e) = engine.select_channel(now).await
         {
             // A revoked token cannot be recovered from by retrying; say so now
             // rather than churning uselessly until the next scheduled sync.
             if matches!(e, btdm_core::api::ApiError::Unauthorized) {
-                anyhow::bail!("the stored token was rejected. Run: btdm login --force");
+                break Err(anyhow::anyhow!(
+                    "the stored token was rejected. Run: btdm login --force"
+                ));
             }
             tracing::error!(error = %e, "channel selection failed");
         }
@@ -108,7 +125,9 @@ pub async fn mine(
         // --- one mining tick -------------------------------------------------
         if let Err(e) = engine.tick(now).await {
             if matches!(e, btdm_core::api::ApiError::Unauthorized) {
-                anyhow::bail!("the stored token was rejected. Run: btdm login --force");
+                break Err(anyhow::anyhow!(
+                    "the stored token was rejected. Run: btdm login --force"
+                ));
             }
             tracing::error!(error = %e, "mining tick failed; leaving this channel");
             engine.switch_away(now);
@@ -124,16 +143,13 @@ pub async fn mine(
                 );
             }
             Verdict::Escalate(step) => {
-                if work_recovery_rung(&mut engine, &auth, &tokens.access_token, step, now).await {
-                    last_sync = None;
-                }
+                work_recovery_rung(&mut engine, &auth, &tokens.access_token, step, now).await;
             }
             Verdict::Exhausted => {
                 tracing::error!(
                     "recovery exhausted; quarantining this campaign and looking elsewhere"
                 );
                 engine.quarantine_current_campaign(now);
-                last_sync = None;
             }
         }
 
@@ -148,17 +164,16 @@ pub async fn mine(
 
         drain_events(&mut engine, storage, account, hub.as_ref(), notifier.as_ref()).await?;
         report_status(&engine, now);
-        if let Some(hub) = &hub {
-            hub.publish(engine.snapshot(account, Some(&validated.login), now));
-        }
+        publish(&engine, account, &validated.login, hub.as_ref());
 
         if opts.probe {
             tracing::info!("probe mode: one pass complete");
-            return Ok(());
+            break Ok(());
         }
 
-        // --- wait, servicing pushed events while we do ------------------------
+        // --- wait, servicing pushed events and commands while we do -----------
         let deadline = tokio::time::Instant::now() + watch_interval;
+        let mut shutdown = false;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -171,7 +186,36 @@ pub async fn mine(
                 _ = tokio::time::sleep(remaining) => break,
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutting down");
-                    return Ok(());
+                    shutdown = true;
+                    break;
+                }
+                cmd = command_rx.recv() => {
+                    let Some(cmd) = cmd else {
+                        // Only happens if the hub dropped the sender.
+                        tracing::debug!("command channel closed");
+                        tokio::time::sleep(remaining).await;
+                        break;
+                    };
+                    let effect = engine.apply_command(cmd, Utc::now());
+                    tracing::info!(message = %effect.message, "command applied");
+
+                    if effect.persist && let Some(store) = &opts.config_store
+                        && let Err(e) = store.save_account(account, &engine.settings()).await {
+                        tracing::error!(error = %e, "could not save settings");
+                    }
+
+                    drain_events(
+                        &mut engine, storage, account, hub.as_ref(), notifier.as_ref(),
+                    ).await?;
+                    publish(&engine, account, &validated.login, hub.as_ref());
+
+                    // Re-run the main loop at once so the effect is visible
+                    // immediately rather than at the end of the heartbeat wait.
+                    // Breaking here is the whole point of the control plane:
+                    // otherwise a strategy change waits out the heartbeat.
+                    if effect.reselect || effect.resync {
+                        break;
+                    }
                 }
                 msg = pubsub_rx.recv() => {
                     match msg {
@@ -185,13 +229,7 @@ pub async fn mine(
                                 notifier.as_ref(),
                             )
                             .await?;
-                            if let Some(hub) = &hub {
-                                hub.publish(engine.snapshot(
-                                    account,
-                                    Some(&validated.login),
-                                    Utc::now(),
-                                ));
-                            }
+                            publish(&engine, account, &validated.login, hub.as_ref());
                         }
                         // The supervisor retries forever, so this only happens
                         // if it stopped entirely.
@@ -204,6 +242,23 @@ pub async fn mine(
                 }
             }
         }
+
+        if shutdown {
+            break Ok(());
+        }
+    };
+
+    if let Some(hub) = &hub {
+        hub.unregister(account);
+    }
+    result
+}
+
+/// Publishes a fresh snapshot. Called after anything that can change state, so
+/// the dashboard is never more than one action behind.
+fn publish<A: TwitchApi>(engine: &Engine<A>, account: &str, login: &str, hub: Option<&Hub>) {
+    if let Some(hub) = hub {
+        hub.publish(engine.snapshot(account, Some(login), Utc::now()));
     }
 }
 
@@ -217,12 +272,12 @@ async fn work_recovery_rung(
     token: &str,
     step: RecoveryStep,
     now: chrono::DateTime<Utc>,
-) -> bool {
+) {
     let outcome = match engine.apply_recovery(step, now).await {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(error = %e, ?step, "recovery rung failed");
-            return false;
+            return;
         }
     };
 
@@ -235,7 +290,6 @@ async fn work_recovery_rung(
             ),
         }
     }
-    outcome.resync
 }
 
 /// Owns the PubSub connection for the process lifetime, reconnecting forever
@@ -245,11 +299,8 @@ async fn work_recovery_rung(
 /// loop meant a slow connect blocked watch heartbeats and Ctrl-C, and a single
 /// failed attempt disabled push events permanently — the retry could only be
 /// triggered by a disconnect message that could no longer arrive.
-fn spawn_pubsub_supervisor(
-    token: String,
-    user_id: String,
-) -> tokio::sync::mpsc::Receiver<PubSubMessage> {
-    let (tx, rx) = tokio::sync::mpsc::channel(128);
+fn spawn_pubsub_supervisor(token: String, user_id: String) -> mpsc::Receiver<PubSubMessage> {
+    let (tx, rx) = mpsc::channel(128);
 
     tokio::spawn(async move {
         let topics = vec![
@@ -303,11 +354,17 @@ async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage)
         PubSubMessage::DropClaimable { drop_id, claim_id } => {
             tracing::info!(drop = %drop_id, "drop is claimable");
             engine.on_drop_claimable(&drop_id, &claim_id);
+            // Claim at once rather than waiting for the next tick: a claim is
+            // the one thing the user actually wants, and there is no reason to
+            // hold it for up to a minute.
+            if let Err(e) = engine.claim_ready(now).await {
+                tracing::warn!(error = %e, "claiming failed; will retry on the next tick");
+            }
         }
         PubSubMessage::StreamDown { channel_id } => {
             if engine.current_channel().is_some_and(|c| c.id == channel_id) {
                 tracing::info!(channel = %channel_id, "watched channel went offline");
-                engine.switch_away(now);
+                engine.stop_watching(now, btdm_core::event::StopReason::WentOffline);
             }
         }
         PubSubMessage::PointsClaimable {
@@ -332,7 +389,7 @@ async fn drain_events<A: TwitchApi>(
     notifier: Option<&Discord>,
 ) -> anyhow::Result<()> {
     for event in engine.drain_events() {
-        tracing::info!(kind = ?event.kind, "event");
+        tracing::info!(summary = %event.summary(), "event");
         storage.append_event(account, &event)?;
         if let Some(notifier) = notifier {
             notifier.notify(account, &event).await;
@@ -365,6 +422,7 @@ fn report_status<A: TwitchApi>(engine: &Engine<A>, now: chrono::DateTime<Utc>) {
         .unwrap_or_else(|| "no confirmed progress".into());
 
     match engine.state() {
+        MiningState::Paused => tracing::info!("paused"),
         MiningState::Idle => tracing::info!("idle — no eligible channel"),
         MiningState::Establishing => tracing::info!(
             channel,
@@ -372,7 +430,14 @@ fn report_status<A: TwitchApi>(engine: &Engine<A>, now: chrono::DateTime<Utc>) {
             "watching, awaiting first confirmation"
         ),
         MiningState::Mining => {
-            tracing::info!(channel, confirmed = progress, last_confirmed = since, "mining")
+            let campaigns = engine.current().map(|w| w.campaigns.len()).unwrap_or(0);
+            tracing::info!(
+                channel,
+                campaigns,
+                confirmed = progress,
+                last_confirmed = since,
+                "mining"
+            )
         }
     }
 }
