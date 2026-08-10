@@ -22,6 +22,12 @@ use crate::strategy::{self, Advance, Candidate, Decision, MiningStrategy, WorldV
 use crate::watchdog::{Quarantine, RecoveryStep, Verdict, Watchdog, WatchdogConfig};
 use futures_util::StreamExt;
 use chrono::{DateTime, Duration, Utc};
+
+/// Games whose campaigns are earned on *any* channel, not only ones streaming
+/// that game. Twitch uses these for event drops — a tournament broadcast is
+/// categorised as the event, not as the game the drops belong to, so matching
+/// on the campaign's own game finds nobody and the campaign looks dead.
+const ANY_CHANNEL_GAME_IDS: [&str; 2] = ["509663", "509672"];
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -1149,6 +1155,25 @@ impl<A: TwitchApi> Engine<A> {
                 eligible: eligible.len(),
             },
         );
+        // Campaign ids churn every relaunch, so an exclusion list keyed on
+        // them grows without bound and stops matching anything. Drop entries
+        // for campaigns Twitch no longer offers at all — the dashboard's
+        // per-row "hide" button makes accumulating dead ids the normal path.
+        if !self.excluded_campaigns.is_empty() {
+            let known: HashSet<&str> = eligible
+                .iter()
+                .chain(recently_ended.iter())
+                .map(|c| c.id.0.as_str())
+                .chain(self.rejected.iter().map(|r| r.id.as_str()))
+                .collect();
+            let before = self.excluded_campaigns.len();
+            self.excluded_campaigns.retain(|id| known.contains(id.as_str()));
+            let dropped = before - self.excluded_campaigns.len();
+            if dropped > 0 {
+                tracing::debug!(dropped, "forgot exclusions for campaigns Twitch no longer offers");
+            }
+        }
+
         self.recently_ended = recently_ended;
         self.campaigns = eligible;
         self.last_sync = Some(now);
@@ -1476,9 +1501,21 @@ impl<A: TwitchApi> Engine<A> {
         let mut by_channel: BTreeMap<ChannelId, ChannelWork> = BTreeMap::new();
         let mut campaigns_without_channels = Vec::new();
 
+        // Channels available to a campaign that is not tied to its own game.
+        let everyone: Vec<(Channel, Stream)> = channels_by_game
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
+
         for (i, want) in wants.iter().enumerate() {
-            let Some(channels) = channels_by_game.get(&want.game.id) else {
-                continue;
+            let any_channel = ANY_CHANNEL_GAME_IDS.contains(&want.game.id.0.as_str());
+            let channels = if any_channel {
+                &everyone
+            } else {
+                match channels_by_game.get(&want.game.id) {
+                    Some(c) => c,
+                    None => continue,
+                }
             };
             let mut any = false;
             let mut taken = 0usize;
@@ -1957,5 +1994,8 @@ fn rejected_view(campaign: &DropCampaign, reason: RejectReason) -> RejectedView 
             RejectReason::NotLinked => campaign.account_link_url.clone(),
             _ => None,
         },
+        starts_at: campaign.starts_at,
+        ends_at: campaign.ends_at,
+        box_art_url: campaign.game.box_art_url.clone(),
     }
 }

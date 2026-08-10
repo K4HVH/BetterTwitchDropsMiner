@@ -178,6 +178,11 @@ pub struct RejectedView {
     pub explanation: String,
     /// Where to go and fix it, when there is somewhere to go.
     pub action_url: Option<String>,
+    /// Dates, so "not started" can say *when* — the reason to care about an
+    /// upcoming campaign is knowing whether to be around for it.
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub box_art_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

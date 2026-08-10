@@ -2023,3 +2023,68 @@ async fn direct_lookup_respects_quarantine() {
 
     assert!(e.select_channel(now()).await.unwrap().is_none());
 }
+
+/// Campaign ids churn every relaunch, so an exclusion list keyed on them grows
+/// without bound and eventually matches nothing. The dashboard's per-row
+/// "hide" button makes accumulating dead ids the normal path.
+#[tokio::test]
+async fn exclusions_for_campaigns_that_no_longer_exist_are_forgotten() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c1"),
+            excluded: true,
+        },
+        now(),
+    );
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c-from-last-year"),
+            excluded: true,
+        },
+        now(),
+    );
+    assert_eq!(e.settings().excluded_campaigns.len(), 2);
+
+    e.sync(now()).await.unwrap();
+
+    assert_eq!(
+        e.settings().excluded_campaigns,
+        vec!["c1".to_string()],
+        "the still-offered exclusion stays; the dead one is forgotten"
+    );
+}
+
+/// Twitch categorises event broadcasts as the event, not as the game the drops
+/// belong to, so matching on the campaign's own game finds nobody and the
+/// campaign looks permanently dead.
+#[tokio::test]
+async fn an_event_campaign_can_be_mined_on_any_live_channel() {
+    let fake = FakeTwitch::default();
+    let mut event = campaign("c-event", true, vec![drop("d-event", 60, 0)]);
+    event.game = Game {
+        id: GameId::from("509663"),
+        name: "Special Events".into(),
+        slug: "special-events".into(),
+        box_art_url: None,
+    };
+    // A normal campaign too, so the directory has somebody in it.
+    *fake.inventory.lock().unwrap() = vec![event, campaign("c1", true, vec![drop("d1", 60, 0)])];
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+    // The channel progresses only the event drop.
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d-event")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap();
+
+    assert!(
+        watch.is_some_and(|w| w.campaigns.iter().any(|c| c.0 == "c-event")),
+        "an event campaign must be minable on a channel not streaming its game"
+    );
+}

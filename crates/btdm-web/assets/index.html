@@ -840,7 +840,21 @@
           .sort((a, b) => (a.game || "").localeCompare(b.game || ""))
           .forEach((r) => {
             const tr = el("tr");
-            tr.append(el("td", null, r.name || "(unnamed)"));
+
+            const nameCell = el("td");
+            nameCell.append(document.createTextNode(r.name || "(unnamed)"));
+            // "Not started" is only useful if it says when.
+            if (reason === "not started" && r.starts_at) {
+                const when = new Date(r.starts_at);
+                const days = Math.round((when - Date.now()) / 86400000);
+                const soon = el("span", "pill", days <= 0
+                    ? "starts today"
+                    : days === 1 ? "starts tomorrow" : `in ${days} days`);
+                soon.style.marginLeft = "7px";
+                soon.title = when.toLocaleString();
+                nameCell.append(soon);
+            }
+            tr.append(nameCell);
             tr.append(el("td", "sub", r.game));
 
             // "Your account is not linked" without saying where to link it is
