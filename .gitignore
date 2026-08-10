@@ -25,3 +25,10 @@ target
 
 /target
 Cargo.lock
+# Local miner state — contains live Twitch OAuth tokens. Never commit.
+devdata/
+data/
+*.db
+*.db-shm
+*.db-wal
+config.toml
