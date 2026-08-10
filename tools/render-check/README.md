@@ -21,7 +21,8 @@ the page.
 # with a miner running
 curl -s localhost:8080/api/snapshots > tools/render-check/snapshot.json
 cd tools/render-check && npm install jsdom     # once
-node check.js
+node check.js          # does it work on real data?
+node adversarial.js    # can it be broken?   (needs no snapshot)
 ```
 
 Exit status is 0 when every check passes, 1 on a failure, 2 when there is no
@@ -37,3 +38,27 @@ snapshot to render.
 - A pushed snapshot re-renders the page, and a pushed log line appears
 - Markup in a server-supplied string is displayed as text, never parsed as HTML
 - With no confirmation from Twitch, the page says so rather than showing a number
+
+## What `adversarial.js` asserts
+
+It treats the snapshot as untrusted, which it very nearly is — campaign names,
+drop names, stream titles and channel display names are all chosen by whoever
+made the channel or campaign.
+
+- Script injection in every string field: campaigns, drops, benefits, the
+  watched channel, stream titles, selection reasons, rejection reasons,
+  settings chips, and the activity log
+- `javascript:` URLs in link targets and image sources, which it found being
+  rendered into an anchor the user is actively encouraged to click
+- Null, missing and wrong-typed fields everywhere, including whole absent
+  sections — which it found leaving the page half-rendered with no tabs
+- Negative, zero, enormous, null and non-numeric minutes; dates in 1970 and
+  9999 and dates that are not dates
+- 1000 campaigns with 8000 drops, filtering over them, 5000-character names,
+  emoji and right-to-left text
+- Twenty clicks on one control, a command the server refuses, and the token
+  surviving into every request
+- URL metacharacters in campaign ids and account names
+- Twenty snapshots landing while the user is mid-word, with focus and caret
+- That nothing invented ever reaches the screen: no confirmation shows no
+  number, a stall is unmistakable, and a claimed drop has no progress bar
