@@ -23,6 +23,12 @@ const AUTH_CHECK_INTERVAL: Duration = Duration::minutes(60);
 const PUBSUB_MAX_BACKOFF: StdDuration = StdDuration::from_secs(180);
 /// How many queued commands before the dashboard is told to slow down.
 const COMMAND_QUEUE: usize = 32;
+/// How many channels to follow for stream state at once.
+///
+/// The point is to hear about a stream ending, or a better one starting,
+/// within seconds rather than at the next scheduled re-evaluation. Bounded by
+/// what one PubSub connection can carry; the supervisor clamps it again.
+const CHANNEL_POOL: usize = 45;
 
 pub struct RunOptions {
     /// Run a single diagnostic pass and exit, rather than mining forever.
@@ -87,9 +93,9 @@ pub async fn mine(
     // owns reconnection, so the main loop never blocks on it.
     let (mut pubsub_rx, pubsub_follow) =
         spawn_pubsub_supervisor(tokens.access_token.clone(), validated.user_id.clone());
-    // The channel currently subscribed for stream-state, so we only ask for a
+    // The pool currently subscribed for stream-state, so we only ask for a
     // change when there has actually been one.
-    let mut followed: Option<ChannelId> = None;
+    let mut followed: Vec<ChannelId> = Vec::new();
 
     // Commands from the dashboard. Registered before the first tick so a
     // control pressed during startup is queued rather than rejected.
@@ -180,10 +186,10 @@ pub async fn mine(
 
         // Never awaited: the supervisor stops polling this while it reconnects,
         // and blocking the main loop here would stall mining and Ctrl-C alike.
-        let watching = engine.current_channel().map(|c| c.id.clone());
-        if watching != followed {
-            let _ = pubsub_follow.send(watching.clone());
-            followed = watching;
+        let pool = engine.channels_worth_following(CHANNEL_POOL);
+        if pool != followed {
+            let _ = pubsub_follow.send(pool.clone());
+            followed = pool;
         }
 
         if opts.probe {
@@ -332,10 +338,7 @@ async fn work_recovery_rung(
 fn spawn_pubsub_supervisor(
     token: String,
     user_id: String,
-) -> (
-    mpsc::Receiver<PubSubMessage>,
-    watch::Sender<Option<ChannelId>>,
-) {
+) -> (mpsc::Receiver<PubSubMessage>, watch::Sender<Vec<ChannelId>>) {
     let (tx, rx) = mpsc::channel(128);
     // Which channel's stream state to follow, so we hear the moment a stream
     // ends rather than discovering it from the watchdog minutes later.
@@ -347,13 +350,17 @@ fn spawn_pubsub_supervisor(
     // `send().await` blocked forever, taking Ctrl-C down with it. That is the
     // exact failure this supervisor was extracted to prevent, reintroduced
     // through backpressure.
-    let (watch_tx, mut watch_rx) = watch::channel::<Option<ChannelId>>(None);
+    let (watch_tx, mut watch_rx) = watch::channel::<Vec<ChannelId>>(Vec::new());
 
     tokio::spawn(async move {
         let base = vec![
             Topic::UserDrops.as_str(&user_id),
             Topic::UserPoints.as_str(&user_id),
         ];
+        // Twitch drops silently past its per-connection topic limit, so the
+        // pool is bounded by what one socket can actually carry alongside the
+        // account-wide topics.
+        let pool_capacity = pubsub::MAX_TOPICS_PER_CONNECTION.saturating_sub(base.len());
         let mut backoff = StdDuration::from_secs(1);
 
         loop {
@@ -365,8 +372,9 @@ fn spawn_pubsub_supervisor(
                     // Whatever the miner wants followed *now*, which may have
                     // changed several times while we were disconnected.
                     let mut followed = watch_rx.borrow_and_update().clone();
-                    if let Some(id) = &followed {
-                        socket.listen(vec![Topic::StreamState.as_str(&id.0)]).await;
+                    followed.truncate(pool_capacity);
+                    if !followed.is_empty() {
+                        socket.listen(stream_topics(&followed)).await;
                     }
 
                     loop {
@@ -376,20 +384,38 @@ fn spawn_pubsub_supervisor(
                                 if changed.is_err() {
                                     return;
                                 }
-                                let next = watch_rx.borrow_and_update().clone();
+                                let mut next = watch_rx.borrow_and_update().clone();
+                                next.truncate(pool_capacity);
                                 if next == followed {
                                     continue;
                                 }
-                                if let Some(old) = &followed {
-                                    socket
-                                        .unlisten(vec![Topic::StreamState.as_str(&old.0)])
-                                        .await;
+
+                                // Only the difference goes on the wire.
+                                // Re-subscribing the whole pool on every change
+                                // would be dozens of frames a minute.
+                                let gone: Vec<ChannelId> = followed
+                                    .iter()
+                                    .filter(|id| !next.contains(id))
+                                    .cloned()
+                                    .collect();
+                                let added: Vec<ChannelId> = next
+                                    .iter()
+                                    .filter(|id| !followed.contains(id))
+                                    .cloned()
+                                    .collect();
+
+                                if !gone.is_empty() {
+                                    socket.unlisten(stream_topics(&gone)).await;
                                 }
-                                if let Some(new) = &next {
-                                    socket
-                                        .listen(vec![Topic::StreamState.as_str(&new.0)])
-                                        .await;
+                                if !added.is_empty() {
+                                    socket.listen(stream_topics(&added)).await;
                                 }
+                                tracing::debug!(
+                                    following = next.len(),
+                                    added = added.len(),
+                                    dropped = gone.len(),
+                                    "channel pool updated"
+                                );
                                 followed = next;
                             }
                             msg = socket.recv() => {
@@ -428,6 +454,14 @@ fn spawn_pubsub_supervisor(
     (rx, watch_tx)
 }
 
+/// The stream-state topics for a set of channels.
+fn stream_topics(channels: &[ChannelId]) -> Vec<String> {
+    channels
+        .iter()
+        .map(|id| Topic::StreamState.as_str(&id.0))
+        .collect()
+}
+
 async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {
     let now = Utc::now();
     match msg {
@@ -446,7 +480,19 @@ async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage)
             if engine.current_channel().is_some_and(|c| c.id == channel_id) {
                 tracing::info!(channel = %channel_id, "watched channel went offline");
                 engine.stop_watching(now, btdm_core::event::StopReason::WentOffline);
+            } else {
+                // A channel in the pool ended. Stop offering it, and reconsider
+                // — it may have been the fallback we were counting on.
+                engine.on_channel_offline(&channel_id);
             }
+        }
+        PubSubMessage::StreamUp { channel_id } => {
+            // Somebody we were watching for came online. They may be a better
+            // option than whatever is being mined, and the whole reason for
+            // following a pool is not waiting out the re-selection timer to
+            // find out.
+            tracing::debug!(channel = %channel_id, "a followed channel came online");
+            engine.request_reselect();
         }
         PubSubMessage::PointsClaimable {
             channel_id,
@@ -458,7 +504,7 @@ async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage)
                 tracing::debug!(error = %e, "channel points claim failed");
             }
         }
-        PubSubMessage::StreamUp { .. } | PubSubMessage::Disconnected => {}
+        PubSubMessage::Disconnected => {}
     }
 }
 

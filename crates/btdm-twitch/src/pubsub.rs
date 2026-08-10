@@ -20,6 +20,18 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(180);
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for Twitch to acknowledge a LISTEN.
 pub const LISTEN_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Twitch's per-connection topic limit. Exceeding it does not fail loudly —
+/// the excess subscriptions are simply never delivered, which would look
+/// exactly like channels that never go offline.
+pub const MAX_TOPICS_PER_CONNECTION: usize = 50;
+/// Topics per LISTEN or UNLISTEN frame.
+///
+/// Separate from the connection limit, and discovered the hard way: asking for
+/// 45 topics in one frame made Twitch close the socket with WebSocket code
+/// 1009 (message too big) roughly a second later, producing a reconnect loop
+/// that subscribed, died, and subscribed again every two seconds. The
+/// connection tolerates 50 topics; it just will not accept them all at once.
+pub const MAX_TOPICS_PER_FRAME: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topic {
@@ -126,11 +138,28 @@ impl Connection {
     /// had ended only from the watchdog minutes later — heartbeating a dead
     /// broadcast the whole time.
     pub async fn listen(&self, topics: Vec<String>) -> bool {
-        !topics.is_empty() && self.control.send(ControlFrame::Listen(topics)).await.is_ok()
+        self.send_chunked(topics, true).await
     }
 
     pub async fn unlisten(&self, topics: Vec<String>) -> bool {
-        !topics.is_empty() && self.control.send(ControlFrame::Unlisten(topics)).await.is_ok()
+        self.send_chunked(topics, false).await
+    }
+
+    async fn send_chunked(&self, topics: Vec<String>, listen: bool) -> bool {
+        if topics.is_empty() {
+            return false;
+        }
+        for chunk in topics.chunks(MAX_TOPICS_PER_FRAME) {
+            let frame = if listen {
+                ControlFrame::Listen(chunk.to_vec())
+            } else {
+                ControlFrame::Unlisten(chunk.to_vec())
+            };
+            if self.control.send(frame).await.is_err() {
+                return false;
+            }
+        }
+        true
     }
 
     pub async fn recv(&mut self) -> Option<PubSubMessage> {
@@ -253,6 +282,22 @@ pub async fn connect(
                                 pong_deadline = None;
                                 continue;
                             }
+                            // A rejected subscription is reported once and then
+                            // never mentioned again, so without this a topic
+                            // silently delivers nothing for the life of the
+                            // connection — indistinguishable from a channel
+                            // that simply never changes state.
+                            if let Ok(v) = serde_json::from_str::<Value>(&text)
+                                && v.get("type").and_then(Value::as_str) == Some("RESPONSE")
+                                && let Some(err) = v.get("error").and_then(Value::as_str)
+                                && !err.is_empty()
+                            {
+                                tracing::warn!(
+                                    error = err,
+                                    "pubsub rejected a subscription change"
+                                );
+                                continue;
+                            }
                             if let Some(msg) = parse_pubsub_frame(&text)
                                 && tx.send(msg).await.is_err()
                             {
@@ -261,6 +306,13 @@ pub async fn connect(
                         }
                         Some(Ok(Message::Ping(payload))) => {
                             let _ = write.send(Message::Pong(payload)).await;
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            tracing::info!(
+                                reason = ?frame,
+                                "pubsub closed the connection"
+                            );
+                            break;
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {
@@ -408,6 +460,35 @@ mod subscription_tests {
     fn the_stream_state_topic_is_addressable_per_channel() {
         let topic = Topic::StreamState.as_str("12345");
         assert_eq!(topic, "video-playback-by-id.12345");
+    }
+
+    /// Asking for every topic in one frame made Twitch close the socket with
+    /// "message too big", which looked like a mysterious reconnect loop.
+    #[tokio::test]
+    async fn a_large_subscription_is_split_across_frames() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_msg_tx, msg_rx) = mpsc::channel(1);
+        let conn = Connection {
+            messages: msg_rx,
+            control: tx,
+        };
+
+        let topics: Vec<String> = (0..45).map(|i| format!("video-playback-by-id.{i}")).collect();
+        assert!(conn.listen(topics).await);
+
+        let mut frames = 0;
+        let mut total = 0;
+        while let Ok(ControlFrame::Listen(t)) = rx.try_recv() {
+            assert!(
+                t.len() <= MAX_TOPICS_PER_FRAME,
+                "a frame carried {} topics",
+                t.len()
+            );
+            frames += 1;
+            total += t.len();
+        }
+        assert_eq!(frames, 3, "45 topics at 20 per frame");
+        assert_eq!(total, 45, "and none were dropped");
     }
 
     #[tokio::test]
