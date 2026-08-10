@@ -63,6 +63,8 @@ pub async fn serve_announcing(
         .route("/api/health", get(health))
         .route("/api/history", get(history))
         .route("/api/rewards", get(rewards))
+        .route("/api/logins", get(logins))
+        .route("/api/accounts/{account}/login", post(begin_login))
         .route("/api/accounts/{account}/command", post(command))
         .with_state(state);
 
@@ -276,6 +278,46 @@ async fn rewards(
     }
     let (account, limit) = account_and_limit(&uri, 500);
     Json(state.hub.rewards(&account, limit)).into_response()
+}
+
+/// Current state of every login, in progress or finished.
+async fn logins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !authorised(&state, &headers, uri.query()) {
+        return unauthorised();
+    }
+    Json(serde_json::json!({
+        "logins": state.hub.login_states(),
+        "errors": state.hub.account_errors(),
+    }))
+    .into_response()
+}
+
+/// Starts a device-code login for an account.
+///
+/// Returns immediately; the code to enter appears on `/api/logins` a moment
+/// later, because obtaining it is itself a network round trip and an HTTP
+/// handler must not sit on one.
+async fn begin_login(
+    State(state): State<AppState>,
+    Path(account): Path<String>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !authorised(&state, &headers, uri.query()) {
+        return unauthorised();
+    }
+    match state.hub.begin_login(&account) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 async fn events(

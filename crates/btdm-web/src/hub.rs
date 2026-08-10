@@ -49,6 +49,25 @@ pub trait History: Send + Sync {
     fn rewards(&self, account: &str, limit: u32) -> Vec<RewardRow>;
 }
 
+/// A device-code login in progress, or its outcome.
+///
+/// A dead token used to need shell access to fix, which is a poor answer on
+/// the headless box this project targets.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginState {
+    pub account: String,
+    /// One of: pending, granted, failed.
+    pub status: String,
+    pub user_code: Option<String>,
+    pub verification_uri: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Starts a login. Completion is reported through [`Hub::set_login_state`].
+pub trait Enrolment: Send + Sync {
+    fn begin(&self, account: &str) -> Result<(), String>;
+}
+
 /// What the dashboard streams: either a new snapshot or a log line.
 #[derive(Debug, Clone)]
 pub enum Update {
@@ -71,6 +90,11 @@ pub struct Hub {
     commands: Arc<RwLock<BTreeMap<String, mpsc::Sender<Command>>>>,
     updates: broadcast::Sender<Update>,
     history: Arc<RwLock<Option<Arc<dyn History>>>>,
+    enrolment: Arc<RwLock<Option<Arc<dyn Enrolment>>>>,
+    logins: Arc<RwLock<BTreeMap<String, LoginState>>>,
+    /// Why an account's miner stopped, so the dashboard can offer a fix rather
+    /// than simply showing nothing.
+    errors: Arc<RwLock<BTreeMap<String, String>>>,
 }
 
 impl Default for Hub {
@@ -87,6 +111,9 @@ impl Hub {
             commands: Arc::new(RwLock::new(BTreeMap::new())),
             updates,
             history: Arc::new(RwLock::new(None)),
+            enrolment: Arc::new(RwLock::new(None)),
+            logins: Arc::new(RwLock::new(BTreeMap::new())),
+            errors: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -153,6 +180,60 @@ impl Hub {
             .as_ref()
             .map(|h| h.rewards(account, limit))
             .unwrap_or_default()
+    }
+
+    pub fn set_enrolment(&self, enrolment: Arc<dyn Enrolment>) {
+        *self.enrolment.write().unwrap_or_else(|e| e.into_inner()) = Some(enrolment);
+    }
+
+    /// Starts a device-code login for an account.
+    pub fn begin_login(&self, account: &str) -> Result<(), String> {
+        let enrolment = {
+            let guard = self.enrolment.read().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        match enrolment {
+            Some(e) => e.begin(account),
+            None => Err("this miner cannot log in from the dashboard".into()),
+        }
+    }
+
+    pub fn set_login_state(&self, state: LoginState) {
+        self.logins
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(state.account.clone(), state);
+    }
+
+    pub fn login_states(&self) -> Vec<LoginState> {
+        self.logins
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Records why an account's miner stopped.
+    pub fn set_account_error(&self, account: &str, detail: &str) {
+        self.errors
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(account.to_owned(), detail.to_owned());
+    }
+
+    pub fn clear_account_error(&self, account: &str) {
+        self.errors
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(account);
+    }
+
+    pub fn account_errors(&self) -> BTreeMap<String, String> {
+        self.errors
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Registers an account's command channel. Called by the supervisor as it

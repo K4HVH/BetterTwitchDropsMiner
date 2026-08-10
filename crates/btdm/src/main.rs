@@ -1,6 +1,7 @@
 mod auth_flow;
 mod config;
 mod control_cli;
+mod enrol;
 mod notify;
 mod run;
 mod storage;

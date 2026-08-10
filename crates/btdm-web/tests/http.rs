@@ -467,3 +467,129 @@ async fn history_requires_the_token() {
         .unwrap();
     assert_eq!(ok.status(), 200);
 }
+
+// ---------------------------------------------------------------------------
+// Logging in from the dashboard
+//
+// A dead token used to need shell access, which is no answer on the headless
+// box this targets — and by then the miner had already exited, so there was
+// nothing left to ask.
+// ---------------------------------------------------------------------------
+
+struct FakeEnrolment {
+    started: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    refuse: bool,
+}
+
+impl btdm_web::Enrolment for FakeEnrolment {
+    fn begin(&self, account: &str) -> Result<(), String> {
+        if self.refuse {
+            return Err("already in progress".into());
+        }
+        self.started.lock().unwrap().push(account.to_owned());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_login_can_be_started_from_the_dashboard() {
+    let hub = Hub::new();
+    let started = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    hub.set_enrolment(std::sync::Arc::new(FakeEnrolment {
+        started: started.clone(),
+        refuse: false,
+    }));
+    let base = start(hub, None).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{base}/api/accounts/main/login"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), 200);
+    assert_eq!(*started.lock().unwrap(), vec!["main".to_string()]);
+}
+
+#[tokio::test]
+async fn a_refused_login_says_why() {
+    let hub = Hub::new();
+    hub.set_enrolment(std::sync::Arc::new(FakeEnrolment {
+        started: Default::default(),
+        refuse: true,
+    }));
+    let base = start(hub, None).await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{base}/api/accounts/main/login"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"], "already in progress");
+}
+
+/// The code has to reach the page, or the flow is unusable.
+#[tokio::test]
+async fn a_pending_code_is_visible_to_the_page() {
+    let hub = Hub::new();
+    hub.set_login_state(btdm_web::LoginState {
+        account: "main".into(),
+        status: "pending".into(),
+        user_code: Some("ABCD1234".into()),
+        verification_uri: Some("https://www.twitch.tv/activate".into()),
+        detail: None,
+    });
+    hub.set_account_error("other", "the stored token was rejected");
+    let base = start(hub, None).await;
+
+    let body: serde_json::Value = reqwest::get(format!("{base}/api/logins"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["logins"][0]["user_code"], "ABCD1234");
+    assert_eq!(body["errors"]["other"], "the stored token was rejected");
+}
+
+/// Starting a login changes what the miner does with a Twitch session, so it
+/// is guarded like every other mutating route.
+#[tokio::test]
+async fn login_routes_require_the_token() {
+    let hub = Hub::new();
+    hub.set_enrolment(std::sync::Arc::new(FakeEnrolment {
+        started: Default::default(),
+        refuse: false,
+    }));
+    let base = start(hub, Some("secret")).await;
+    let http = reqwest::Client::new();
+
+    assert_eq!(
+        http.post(format!("{base}/api/accounts/main/login"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        reqwest::get(format!("{base}/api/logins")).await.unwrap().status(),
+        401
+    );
+}
+
+/// With no enrolment attached the route must refuse clearly rather than 404 or
+/// pretend to have worked.
+#[tokio::test]
+async fn a_miner_that_cannot_enrol_says_so() {
+    let base = start(Hub::new(), None).await;
+    let res = reqwest::Client::new()
+        .post(format!("{base}/api/accounts/main/login"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+}

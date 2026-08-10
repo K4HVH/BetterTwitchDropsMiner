@@ -55,6 +55,14 @@ Rust debug string that nothing could read back. The release workflow uploading
 90-day CI artifacts and never publishing a release, so `btdm update` could
 never find anything — a headline feature that had never once worked.
 
+**From running it.** Subscribing to 45 stream-state topics in one LISTEN frame
+made Twitch close the socket with WebSocket code 1009, "message too big",
+about a second later — a reconnect loop that subscribed, died and subscribed
+again every two seconds while the poll backstop quietly carried mining. No
+test would have caught it; the connection tolerates 50 topics, it just will
+not accept them at once. Frames are chunked at 20 now, and a rejected
+subscription is logged rather than silently delivering nothing.
+
 **Security.** An OAuth token committed to local git history (never pushed;
 history rewritten, verified absent from every object). The dashboard bearer
 token generated from `RandomState::hash_one`, which is seeded for hash-flooding
@@ -64,15 +72,10 @@ resistance rather than secrecy.
 
 Honest list of what a serious miner could do that this does not.
 
-- **A live channel pool.** The reference implementation tracks up to 199
-  channels and switches within seconds of one going offline. This follows only
-  the channel it is watching, so it learns about *that* one immediately but
-  still discovers a better channel appearing only on its own timer.
-- **Request batching and a rate limiter.** Twitch's GraphQL endpoint accepts an
-  array of operations; the reference implementation sends 20 at a time under a
-  hard 5/sec cap. Every call here is its own request, bounded only by
-  concurrency limits.
-- **Logging in from the dashboard.** A dead token still needs shell access.
+- **A channel pool larger than one connection.** 45 channels are followed for
+  stream state, which is what a single PubSub socket carries. The reference
+  implementation shards across 8 sockets to reach 199. Sharding is the
+  increment; nothing else needs to change.
 - **Per-campaign priority and per-drop targeting.** Priority and exclusion are
   keyed on games and whole campaigns; two campaigns for the same game cannot be
   ranked against each other, and "get me tier 1 and stop" cannot be expressed.
@@ -90,7 +93,7 @@ Honest list of what a serious miner could do that this does not.
 
 ## Test coverage, and where it is thin
 
-354 tests, no clippy warnings.
+377 tests, no clippy warnings.
 
 Well covered: the engine against a scripted Twitch (93 scenarios), strategies,
 eligibility and feasibility maths, the watchdog ladder, parsing, the control

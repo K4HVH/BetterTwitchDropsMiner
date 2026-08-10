@@ -280,6 +280,8 @@
     // everything that happened before it was opened.
     history: [],
     historyFor: null,
+    logins: [],
+    accountErrors: {},
     rewards: [],
     rewardsFor: null,
   };
@@ -329,6 +331,32 @@
       state.history = await res.json();
       if (state.tab === "log") render();
     } catch (e) { /* the live stream still works without it */ }
+  }
+
+  /// A dead token used to need shell access to fix, which is no answer at all
+  /// on the headless box this targets.
+  async function loadLogins() {
+    try {
+      const res = await fetch(api("/api/logins"));
+      if (!res.ok) return;
+      const body = await res.json();
+      const before = JSON.stringify([state.logins, state.accountErrors]);
+      state.logins = body.logins || [];
+      state.accountErrors = body.errors || {};
+      if (JSON.stringify([state.logins, state.accountErrors]) !== before) render();
+    } catch (e) { /* the rest of the page still works */ }
+  }
+
+  async function beginLogin(account) {
+    try {
+      const res = await fetch(api(`/api/accounts/${encodeURIComponent(account)}/login`), {
+        method: "POST",
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(body.error || "Could not start the login", true); return; }
+      toast("Starting login…");
+      loadLogins();
+    } catch (e) { toast("The miner is unreachable", true); }
   }
 
   async function loadRewards(account) {
@@ -1113,6 +1141,64 @@
     return panel;
   }
 
+  /// Anything the user has to act on, above everything else.
+  function attentionPanel() {
+    const box = el("div");
+
+    Object.entries(state.accountErrors).forEach(([account, detail]) => {
+      const pending = state.logins.find((l) => l.account === account);
+      if (pending && pending.status === "pending") return;
+
+      const p = el("div", "banner bad");
+      p.style.display = "flex";
+      p.style.alignItems = "center";
+      p.style.gap = "12px";
+      p.style.flexWrap = "wrap";
+      const text = el("div");
+      text.append(el("div", null, `Account "${account}" has stopped: ${detail}`));
+      text.append(el("div", "sub", "Other accounts are still mining."));
+      p.append(text);
+
+      const fix = el("button", "primary", "Sign in again");
+      fix.onclick = () => beginLogin(account);
+      p.append(fix);
+      box.append(p);
+    });
+
+    state.logins.forEach((l) => {
+      if (l.status === "pending" && l.user_code) {
+        const p = el("div", "banner warn");
+        p.append(el("div", null, `Sign in to "${l.account}"`));
+        const row = el("div", "row");
+        row.style.marginTop = "8px";
+        const code = el("span", "headline", l.user_code);
+        code.style.fontFamily = "ui-monospace, monospace";
+        code.style.letterSpacing = "0.12em";
+        row.append(code);
+        const link = el("a", null, "Open twitch.tv/activate →");
+        link.href = l.verification_uri;
+        link.target = "_blank";
+        link.rel = "noreferrer noopener";
+        link.style.color = "inherit";
+        row.append(link);
+        p.append(row);
+        p.append(el("div", "sub", "Enter that code on any device. Mining starts by itself."));
+        box.append(p);
+      } else if (l.status === "failed") {
+        const p = el("div", "banner bad");
+        p.append(el("div", null, `Signing in to "${l.account}" failed: ${l.detail || ""}`));
+        const again = el("button", null, "Try again");
+        again.style.marginTop = "8px";
+        again.onclick = () => beginLogin(l.account);
+        p.append(again);
+        box.append(p);
+      } else if (l.status === "starting") {
+        box.append(el("div", "banner warn", `Asking Twitch for a code for "${l.account}"…`));
+      }
+    });
+    return box;
+  }
+
   function banners(s) {
     const box = el("div");
     if (s.watching && s.watching.stalled) {
@@ -1136,9 +1222,14 @@
     const app = $("#app");
     if (!s) {
       app.textContent = "";
+      app.append(attentionPanel());
       const p = el("div", "panel pad");
       p.style.marginTop = "20px";
-      p.append(el("div", "empty", "No account has reported yet."));
+      p.append(el("div", "empty", "No account is mining yet."));
+      const add = el("button", "primary", "Link a Twitch account");
+      add.style.marginTop = "10px";
+      add.onclick = () => beginLogin("default");
+      p.append(add);
       app.append(p);
       return;
     }
@@ -1155,6 +1246,7 @@
     if (oldLog) state.logScroll = oldLog.scrollTop;
 
     app.textContent = "";
+    app.append(attentionPanel());
     app.append(banners(s));
 
     const hero = el("div", "hero");
@@ -1283,8 +1375,12 @@
   };
 
   poll();
+  loadLogins();
   connect();
   setInterval(poll, 60000);
+  // A device code is only valid for minutes, and its state changes without
+  // producing a snapshot, so this is polled rather than pushed.
+  setInterval(loadLogins, 5000);
   // Deadline countdowns are wall-clock, so refresh them even when nothing
   // changes. This never touches a progress figure.
   setInterval(() => { if (state.tab === "campaigns") render(); }, 30000);
