@@ -55,6 +55,9 @@ pub async fn run(
     tracing::info!(accounts = ?accounts, "starting miners");
 
     let hub = Hub::new();
+    // The dashboard reads the stored log through this, so a page opened after
+    // a restart shows what happened while nobody was looking.
+    hub.set_history(Arc::new(StoredHistory(Arc::clone(&storage))));
     let mut tasks = tokio::task::JoinSet::new();
 
     for account in accounts {
@@ -139,6 +142,44 @@ pub async fn run(
     }
     tasks.shutdown().await;
     Ok(())
+}
+
+/// Adapts the miner's SQLite log to what the dashboard reads.
+struct StoredHistory(Arc<Storage>);
+
+impl btdm_web::History for StoredHistory {
+    fn recent(&self, account: &str, limit: u32) -> Vec<btdm_web::HistoryRow> {
+        match self.0.recent_events(account, limit) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| btdm_web::HistoryRow {
+                    at: r.at,
+                    summary: r.summary,
+                    severity: r.severity,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the stored event log");
+                Vec::new()
+            }
+        }
+    }
+
+    fn rewards(&self, account: &str, limit: u32) -> Vec<btdm_web::RewardRow> {
+        match self.0.claimed_drops(account, limit) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| btdm_web::RewardRow {
+                    at: r.at,
+                    name: r.name,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read claimed drops");
+                Vec::new()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

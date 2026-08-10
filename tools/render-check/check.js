@@ -110,7 +110,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
 
   // Every tab must render without throwing.
-  for (const label of ["Live now", "Unavailable", "Settings", "Activity", "Campaigns"]) {
+  for (const label of ["Live now", "Unavailable", "Rewards", "Settings", "Activity", "Campaigns"]) {
     check(`tab: ${label}`, () => {
       const btn = [...doc.querySelectorAll(".tabs button")].find((b) =>
         b.textContent.startsWith(label));

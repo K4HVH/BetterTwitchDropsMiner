@@ -61,6 +61,8 @@ pub async fn serve_announcing(
         .route("/api/snapshots", get(snapshots))
         .route("/api/events", get(events))
         .route("/api/health", get(health))
+        .route("/api/history", get(history))
+        .route("/api/rewards", get(rewards))
         .route("/api/accounts/{account}/command", post(command))
         .with_state(state);
 
@@ -175,6 +177,47 @@ async fn command(
         )
             .into_response(),
     }
+}
+
+/// Query parameters shared by the two history routes.
+fn query_param(uri: &axum::http::Uri, key: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.replace("%20", " ").replace('+', " "))
+    })
+}
+
+fn account_and_limit(uri: &axum::http::Uri, default_limit: u32) -> (String, u32) {
+    let account = query_param(uri, "account").unwrap_or_else(|| "default".into());
+    let limit = query_param(uri, "limit")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(default_limit)
+        .min(1000);
+    (account, limit)
+}
+
+async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !authorised(&state, &headers, uri.query()) {
+        return unauthorised();
+    }
+    let (account, limit) = account_and_limit(&uri, 200);
+    Json(state.hub.history(&account, limit)).into_response()
+}
+
+async fn rewards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !authorised(&state, &headers, uri.query()) {
+        return unauthorised();
+    }
+    let (account, limit) = account_and_limit(&uri, 500);
+    Json(state.hub.rewards(&account, limit)).into_response()
 }
 
 async fn events(

@@ -1,11 +1,9 @@
 //! Runtime state. SQLite rather than JSON because a half-written JSON file is
 //! a corrupted config, whereas a half-written transaction is simply rolled back.
 
-// `recent_events`, `event_count` and `open_in_memory` are the stored-history
-// API and the test seam. They are exercised by tests rather than by the binary.
+// `event_count` and `open_in_memory` are the test seam.
 #![allow(dead_code)]
 
-use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -20,6 +18,23 @@ pub enum StorageError {
     Db(#[from] rusqlite::Error),
     #[error("filesystem: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// One row of the stored event log, ready to hand to the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoredEvent {
+    pub at: String,
+    pub summary: String,
+    pub severity: String,
+    /// The original event, as JSON.
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ClaimedDrop {
+    pub at: String,
+    pub name: String,
+    pub drop_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,10 +61,12 @@ CREATE TABLE IF NOT EXISTS tokens (
     device_id     TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    account TEXT NOT NULL,
-    at      TEXT NOT NULL,
-    kind    TEXT NOT NULL
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    account  TEXT NOT NULL,
+    at       TEXT NOT NULL,
+    kind     TEXT NOT NULL,
+    summary  TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT 'info'
 );
 CREATE INDEX IF NOT EXISTS events_by_account ON events(account, id DESC);
 ";
@@ -79,6 +96,16 @@ impl Storage {
     fn init(conn: Connection) -> Result<Self, StorageError> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Databases written before the log became readable have neither
+        // column. `ALTER TABLE ... ADD COLUMN` errors if it already exists, so
+        // the failure is expected and ignored rather than fatal — an old
+        // database must not stop the miner starting.
+        for column in [
+            "ALTER TABLE events ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE events ADD COLUMN severity TEXT NOT NULL DEFAULT 'info'",
+        ] {
+            let _ = conn.execute(column, []);
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -156,9 +183,21 @@ impl Storage {
         event: &btdm_core::event::MinerEvent,
     ) -> Result<(), StorageError> {
         let conn = self.lock();
+        // Stored as JSON, not as a Rust debug string. The log used to be
+        // written in a form nothing could read back, so a dashboard opened
+        // after a restart said "nothing has happened yet" with months of
+        // history sitting on disk.
+        let kind = serde_json::to_string(&event.kind).unwrap_or_else(|_| "{}".into());
         conn.execute(
-            "INSERT INTO events (account, at, kind) VALUES (?1, ?2, ?3)",
-            params![account, event.at.to_rfc3339(), format!("{:?}", event.kind)],
+            "INSERT INTO events (account, at, kind, summary, severity)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                account,
+                event.at.to_rfc3339(),
+                kind,
+                event.summary(),
+                format!("{:?}", event.severity()).to_lowercase(),
+            ],
         )?;
         // Keep the log bounded; an unattended miner runs for months.
         conn.execute(
@@ -170,27 +209,65 @@ impl Storage {
         Ok(())
     }
 
+    /// The most recent events for an account, newest first.
     pub fn recent_events(
         &self,
         account: &str,
         limit: u32,
-    ) -> Result<Vec<(DateTime<Utc>, String)>, StorageError> {
+    ) -> Result<Vec<StoredEvent>, StorageError> {
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT at, kind FROM events WHERE account = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let mut stmt = conn.prepare(
+            "SELECT at, summary, severity, kind FROM events
+             WHERE account = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
         let rows = stmt
             .query_map(params![account, limit], |r| {
-                let at: String = r.get(0)?;
-                let kind: String = r.get(1)?;
-                Ok((at, kind))
+                Ok(StoredEvent {
+                    at: r.get::<_, String>(0)?,
+                    summary: r.get(1)?,
+                    severity: r.get(2)?,
+                    kind: r.get(3)?,
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every drop this account has claimed, newest first.
+    ///
+    /// Twitch's inventory only reports campaigns still running, so it is the
+    /// one place that cannot answer "what have I actually earned?". The event
+    /// log can, and it is already being written.
+    pub fn claimed_drops(
+        &self,
+        account: &str,
+        limit: u32,
+    ) -> Result<Vec<ClaimedDrop>, StorageError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT at, kind FROM events
+             WHERE account = ?1 AND kind LIKE '%\"drop_claimed\"%'
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![account, limit], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(rows
             .into_iter()
             .filter_map(|(at, kind)| {
-                DateTime::parse_from_rfc3339(&at)
-                    .ok()
-                    .map(|t| (t.with_timezone(&Utc), kind))
+                let v: serde_json::Value = serde_json::from_str(&kind).ok()?;
+                Some(ClaimedDrop {
+                    at,
+                    name: v.get("name")?.as_str()?.to_owned(),
+                    drop_id: v
+                        .get("drop")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
             })
             .collect())
     }
@@ -209,6 +286,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use btdm_core::event::{EventKind, MinerEvent};
     use btdm_core::model::ChannelId;
 
@@ -315,7 +393,7 @@ mod tests {
         }
         let got = s.recent_events("main", 3).unwrap();
         assert_eq!(got.len(), 3);
-        assert!(got[0].0 >= got[1].0, "expected newest first");
+        assert!(got[0].at >= got[1].at, "expected newest first");
     }
 
     #[test]
@@ -340,5 +418,104 @@ mod tests {
         let _s = Storage::open(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the DB holds live OAuth tokens");
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use chrono::Utc;
+    use btdm_core::event::{EventKind, MinerEvent};
+    use btdm_core::model::{ChannelId, DropId};
+
+    fn event(kind: EventKind) -> MinerEvent {
+        MinerEvent {
+            at: Utc::now(),
+            kind,
+        }
+    }
+
+    /// The log used to be written as a Rust debug string, so nothing could
+    /// read it back and the dashboard reported "nothing has happened yet"
+    /// with months of history on disk.
+    #[test]
+    fn stored_events_come_back_readable() {
+        let s = Storage::open_in_memory().unwrap();
+        s.append_event(
+            "main",
+            &event(EventKind::CampaignsSynced {
+                total: 86,
+                eligible: 16,
+            }),
+        )
+        .unwrap();
+
+        let got = s.recent_events("main", 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].summary, "Synced 86 campaigns, 16 mineable");
+        assert_eq!(got[0].severity, "info");
+        // And the structured form survives too.
+        let parsed: serde_json::Value = serde_json::from_str(&got[0].kind).unwrap();
+        assert_eq!(parsed["type"], "campaigns_synced");
+        assert_eq!(parsed["total"], 86);
+    }
+
+    #[test]
+    fn severity_is_recorded_so_the_log_can_be_coloured_after_a_restart() {
+        let s = Storage::open_in_memory().unwrap();
+        s.append_event(
+            "main",
+            &event(EventKind::DropClaimed {
+                drop: DropId::from("d1"),
+                name: "Weapon Charm".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.recent_events("main", 1).unwrap()[0].severity, "good");
+    }
+
+    /// "What have I actually earned?" is the question Twitch's own inventory
+    /// cannot answer, because it only reports campaigns still running.
+    #[test]
+    fn claimed_drops_are_recoverable_from_the_log() {
+        let s = Storage::open_in_memory().unwrap();
+        for name in ["Weapon Charm", "Golden Skin"] {
+            s.append_event(
+                "main",
+                &event(EventKind::DropClaimed {
+                    drop: DropId::from("d"),
+                    name: name.into(),
+                }),
+            )
+            .unwrap();
+        }
+        // Noise that must not appear in the reward list.
+        s.append_event(
+            "main",
+            &event(EventKind::WatchSent {
+                channel: ChannelId::from("c1"),
+            }),
+        )
+        .unwrap();
+
+        let claimed = s.claimed_drops("main", 50).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].name, "Golden Skin", "newest first");
+        assert_eq!(claimed[1].name, "Weapon Charm");
+    }
+
+    #[test]
+    fn one_accounts_history_is_not_visible_to_another() {
+        let s = Storage::open_in_memory().unwrap();
+        s.append_event(
+            "main",
+            &event(EventKind::DropClaimed {
+                drop: DropId::from("d"),
+                name: "Mine".into(),
+            }),
+        )
+        .unwrap();
+        assert!(s.claimed_drops("other", 10).unwrap().is_empty());
+        assert!(s.recent_events("other", 10).unwrap().is_empty());
     }
 }
