@@ -6,6 +6,7 @@ pub mod client;
 pub mod gql;
 pub mod operations;
 pub mod parse;
+pub mod pubsub;
 pub mod watch;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +19,12 @@ pub enum TwitchError {
     RateLimited,
     #[error("unexpected response shape: {0}")]
     Malformed(String),
+    #[error(
+        "cannot reach the watch endpoint {url} — drops CANNOT progress while this is \
+         blocked. It is an analytics domain, so an ad-blocker, Pi-hole, VPN filter or \
+         DNS blocklist is the usual cause: allow-list `spade.twitch.tv`. ({detail})"
+    )]
+    SpadeUnreachable { url: String, detail: String },
     #[error("persisted query hash is stale")]
     StaleQueryHash,
     #[error("graphql errors: {0:?}")]

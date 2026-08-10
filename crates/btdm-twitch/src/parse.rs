@@ -43,12 +43,21 @@ fn slugify(name: &str) -> String {
         .to_owned()
 }
 
+/// Twitch is inconsistent about how it names a game across queries: the
+/// inventory returns `name` and `slug`, while the campaign dashboard returns
+/// `displayName` and no slug at all. Requiring `name` silently discarded 129
+/// of 130 campaigns against a real account, so both spellings are accepted and
+/// the slug is derived when absent.
 fn parse_game(v: &Value) -> Result<Game, TwitchError> {
-    let name = str_at(v, "name")?.to_owned();
+    let name = v
+        .get("name")
+        .or_else(|| v.get("displayName"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("game has neither `name` nor `displayName`"))?
+        .to_owned();
+
     Ok(Game {
         id: GameId(str_at(v, "id")?.to_owned()),
-        // Twitch omits `slug` in some shapes; derive it rather than failing,
-        // since the slug is only needed for directory lookups.
         slug: v
             .get("slug")
             .and_then(Value::as_str)

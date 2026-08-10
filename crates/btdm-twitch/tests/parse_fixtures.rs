@@ -222,3 +222,66 @@ fn campaign_details_unwraps_the_nested_shape() {
             .is_none()
     );
 }
+
+/// The campaign dashboard names games with `displayName` and omits `slug`,
+/// while the inventory uses `name` and `slug`. Requiring `name` silently
+/// discarded 129 of 130 campaigns against a real account.
+#[test]
+fn a_game_named_with_display_name_still_parses() {
+    let v = serde_json::json!({
+        "id": "c1", "name": "Official 13",
+        "startAt": "2026-08-03T13:00:00Z", "endAt": "2026-08-10T12:59:59.999Z",
+        "game": { "id": "2099590881", "displayName": "Out of the Park Baseball 27" },
+        "self": { "isAccountConnected": true },
+        "timeBasedDrops": []
+    });
+    let c = parse_campaign(&v).unwrap();
+    assert_eq!(c.game.name, "Out of the Park Baseball 27");
+    assert_eq!(
+        c.game.slug, "out-of-the-park-baseball-27",
+        "the directory lookup needs a slug even when Twitch omits one"
+    );
+}
+
+#[test]
+fn a_game_with_neither_name_nor_display_name_is_rejected() {
+    let v = serde_json::json!({
+        "id": "c1", "name": "X",
+        "startAt": "2026-08-03T13:00:00Z", "endAt": "2026-08-10T12:59:59.999Z",
+        "game": { "id": "g1" },
+        "self": { "isAccountConnected": true },
+        "timeBasedDrops": []
+    });
+    assert!(parse_campaign(&v).is_err());
+}
+
+/// A null `allow.channels` means "any channel", not "no channels".
+#[test]
+fn a_null_channel_allow_list_means_any_channel() {
+    let v = serde_json::json!({
+        "id": "c1", "name": "X",
+        "startAt": "2026-08-03T13:00:00Z", "endAt": "2026-08-10T12:59:59.999Z",
+        "game": { "id": "g1", "name": "G", "slug": "g" },
+        "self": { "isAccountConnected": true },
+        "allow": { "channels": null },
+        "timeBasedDrops": []
+    });
+    assert!(parse_campaign(&v).unwrap().allowed_channels.is_empty());
+}
+
+/// Real inventory data returns `preconditionDrops: null` rather than omitting it.
+#[test]
+fn null_precondition_drops_parse_as_no_preconditions() {
+    let v = serde_json::json!({
+        "id": "c1", "name": "X",
+        "startAt": "2026-08-03T13:00:00Z", "endAt": "2026-08-10T12:59:59.999Z",
+        "game": { "id": "g1", "name": "G", "slug": "g" },
+        "self": { "isAccountConnected": true },
+        "timeBasedDrops": [{
+            "id": "d1", "name": "Drop 4", "requiredMinutesWatched": 240,
+            "preconditionDrops": null, "benefitEdges": [],
+            "self": { "currentMinutesWatched": 0, "isClaimed": false, "dropInstanceID": null }
+        }]
+    });
+    assert!(parse_campaign(&v).unwrap().drops[0].precondition_ids.is_empty());
+}
