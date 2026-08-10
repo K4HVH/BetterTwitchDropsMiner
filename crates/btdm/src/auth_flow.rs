@@ -94,10 +94,11 @@ pub async fn status(storage: &Storage, account: &str) -> anyhow::Result<()> {
 
     match auth.validate(&tokens.access_token).await {
         Ok(v) => {
-            let days = v.expires_in_secs / 86_400;
             println!(
-                "Account '{account}': linked to '{}' (user {}), token valid for ~{days} days.",
-                v.login, v.user_id
+                "Account '{account}': linked to '{}' (user {}), {}.",
+                v.login,
+                v.user_id,
+                describe_expiry(v.expires_in_secs)
             );
         }
         Err(e) => {
@@ -105,4 +106,45 @@ pub async fn status(storage: &Storage, account: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Describes token lifetime in words.
+///
+/// Twitch reports `expires_in: 0` for tokens that never expire. Dividing that
+/// by a day and printing "~0 days" reads as *about to expire* — the opposite
+/// of the truth, and exactly the kind of confidently-wrong display this
+/// project exists to avoid.
+fn describe_expiry(expires_in_secs: u64) -> String {
+    match expires_in_secs {
+        0 => "token does not expire".to_string(),
+        s if s < 3_600 => format!("token expires in ~{} minutes", s / 60),
+        s if s < 86_400 => format!("token expires in ~{} hours", s / 3_600),
+        s => format!("token expires in ~{} days", s / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this replaced: `0 / 86400` printed "~0 days", which reads as
+    /// "about to expire" when Twitch means "never expires".
+    #[test]
+    fn zero_means_never_expires_not_expiring_now() {
+        let text = describe_expiry(0);
+        assert!(text.contains("does not expire"), "got: {text}");
+        assert!(!text.contains("0 days"), "must not read as imminent expiry");
+    }
+
+    #[test]
+    fn short_lifetimes_are_reported_in_useful_units() {
+        assert!(describe_expiry(600).contains("minutes"));
+        assert!(describe_expiry(7_200).contains("hours"));
+        assert!(describe_expiry(5_000_000).contains("days"));
+    }
+
+    #[test]
+    fn a_long_lifetime_reports_a_plausible_day_count() {
+        assert_eq!(describe_expiry(5_184_000), "token expires in ~60 days");
+    }
 }

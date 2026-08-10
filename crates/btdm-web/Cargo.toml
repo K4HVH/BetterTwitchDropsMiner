@@ -14,3 +14,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset", "http2"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

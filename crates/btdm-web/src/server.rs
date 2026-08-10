@@ -69,11 +69,14 @@ pub async fn serve_announcing(
             source,
         })?;
 
+    // Report the address actually bound, not the one requested: port 0 means
+    // "any free port", so echoing the request would announce a dead URL.
+    let bound = listener.local_addr().unwrap_or(addr);
     let url = match &app_token {
-        Some(t) => format!("http://{addr}/?token={t}"),
-        None => format!("http://{addr}/"),
+        Some(t) => format!("http://{bound}/?token={t}"),
+        None => format!("http://{bound}/"),
     };
-    tracing::info!(%addr, "dashboard listening");
+    tracing::info!(%bound, "dashboard listening");
     announce(url);
 
     axum::serve(listener, app).await?;

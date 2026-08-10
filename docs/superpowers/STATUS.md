@@ -72,6 +72,15 @@ Found by adversarial review:
 10. **PubSub `LISTEN` was never acknowledged**, so a rejected subscription
     looked identical to a healthy socket.
 
+## Late fixes
+
+- **`btdm status` reported "token valid for ~0 days"** for a token that never
+  expires — Twitch signals non-expiry as `expires_in: 0`, and dividing by a day
+  turned that into a message reading as imminent expiry.
+- **The dashboard announced the requested address, not the bound one**, so
+  binding to port 0 printed a dead URL. Found immediately by the first
+  HTTP-level test written for the web crate.
+
 ## Incident during the build
 
 `devdata/state.db`, containing a live OAuth token, was committed by a broad
@@ -82,11 +91,10 @@ remaining object. `devdata/`, `*.db` and `config.toml` are now in `.gitignore`.
 
 ## Known gaps
 
-- `btdm-web` has no HTTP-level integration tests; its handlers are covered only
-  by unit tests of the authorisation logic.
 - `run.rs` remains the least-tested file. Its recovery ladder is exercised
   through `btdm-core` tests, but the loop itself is verified by running it.
 - Fixture JSON is hand-built from observed shapes. Captured real responses would
   be stronger.
-- Token refresh is validated hourly but never actually refreshed; expiry
-  requires `btdm login --force`.
+- Token refresh is not implemented. This turned out not to matter: Twitch
+  reports `expires_in: 0` for these device-flow tokens, meaning they do not
+  expire. A refresh token is stored should that ever change.
