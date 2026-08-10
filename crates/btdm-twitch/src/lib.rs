@@ -1,9 +1,12 @@
 //! Twitch API client: auth, GQL, spade heartbeat, PubSub.
 
+pub mod api_impl;
 pub mod auth;
 pub mod client;
 pub mod gql;
 pub mod operations;
+pub mod parse;
+pub mod watch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TwitchError {

@@ -1,0 +1,49 @@
+{
+  "game": {
+    "id": "g-1",
+    "name": "Deadlock",
+    "slug": "deadlock",
+    "streams": {
+      "edges": [
+        {
+          "node": {
+            "id": "bc-1",
+            "title": "Grinding drops",
+            "viewersCount": 1234,
+            "game": { "id": "g-1", "name": "Deadlock", "slug": "deadlock" },
+            "broadcaster": {
+              "id": "ch-1",
+              "login": "streamer1",
+              "displayName": "Streamer1"
+            },
+            "freeformTags": [{ "name": "English" }, { "name": "DropsEnabled" }]
+          }
+        },
+        {
+          "node": {
+            "id": "bc-2",
+            "title": "No drops here",
+            "viewersCount": 10,
+            "game": { "id": "g-1", "name": "Deadlock", "slug": "deadlock" },
+            "broadcaster": {
+              "id": "ch-2",
+              "login": "streamer2",
+              "displayName": "Streamer2"
+            },
+            "freeformTags": [{ "name": "English" }]
+          }
+        },
+        {
+          "node": {
+            "id": "bc-3",
+            "title": "Broken node with no broadcaster",
+            "viewersCount": 5,
+            "game": { "id": "g-1", "name": "Deadlock", "slug": "deadlock" },
+            "broadcaster": null,
+            "freeformTags": []
+          }
+        }
+      ]
+    }
+  }
+}

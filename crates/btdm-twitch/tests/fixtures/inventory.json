@@ -1,0 +1,106 @@
+{
+  "currentUser": {
+    "inventory": {
+      "dropCampaignsInProgress": [
+        {
+          "id": "camp-1",
+          "name": "Deadlock Launch Drops",
+          "status": "ACTIVE",
+          "startAt": "2026-08-01T00:00:00Z",
+          "endAt": "2026-09-01T00:00:00Z",
+          "game": { "id": "g-1", "name": "Deadlock", "slug": "deadlock" },
+          "self": { "isAccountConnected": true },
+          "allow": {
+            "channels": [
+              { "id": "ch-1", "name": "streamer1", "displayName": "Streamer1" }
+            ]
+          },
+          "timeBasedDrops": [
+            {
+              "id": "drop-1",
+              "name": "One Hour Reward",
+              "requiredMinutesWatched": 60,
+              "benefitEdges": [
+                {
+                  "benefit": {
+                    "id": "b-1",
+                    "name": "Skin",
+                    "distributionType": "DIRECT_ENTITLEMENT"
+                  }
+                }
+              ],
+              "self": {
+                "currentMinutesWatched": 23,
+                "isClaimed": false,
+                "dropInstanceID": null
+              }
+            },
+            {
+              "id": "drop-2",
+              "name": "Three Hour Reward",
+              "requiredMinutesWatched": 180,
+              "benefitEdges": [
+                {
+                  "benefit": {
+                    "id": "b-2",
+                    "name": "Emote",
+                    "distributionType": "EMOTE"
+                  }
+                }
+              ],
+              "self": {
+                "currentMinutesWatched": 180,
+                "isClaimed": false,
+                "dropInstanceID": "inst-2"
+              },
+              "preconditionDrops": [{ "id": "drop-1" }]
+            }
+          ]
+        },
+        {
+          "id": "camp-2",
+          "name": "Unlinked Badge Campaign",
+          "status": "ACTIVE",
+          "startAt": "2026-08-01T00:00:00Z",
+          "endAt": "2026-09-01T00:00:00Z",
+          "game": { "id": "g-2", "name": "Other Game", "slug": "other-game" },
+          "self": { "isAccountConnected": false },
+          "allow": { "channels": [] },
+          "timeBasedDrops": [
+            {
+              "id": "drop-3",
+              "name": "Badge",
+              "requiredMinutesWatched": 120,
+              "benefitEdges": [
+                {
+                  "benefit": {
+                    "id": "b-3",
+                    "name": "Shiny Badge",
+                    "distributionType": "BADGE"
+                  }
+                }
+              ],
+              "self": {
+                "currentMinutesWatched": 0,
+                "isClaimed": false,
+                "dropInstanceID": null
+              }
+            }
+          ]
+        },
+        {
+          "id": "camp-3",
+          "name": "Campaign With No Game",
+          "status": "ACTIVE",
+          "startAt": "2026-08-01T00:00:00Z",
+          "endAt": "2026-09-01T00:00:00Z",
+          "game": null,
+          "self": { "isAccountConnected": true },
+          "allow": null,
+          "timeBasedDrops": []
+        }
+      ],
+      "gameEventDrops": [{ "id": "b-9", "lastAwardedAt": "2026-08-05T10:00:00Z" }]
+    }
+  }
+}
