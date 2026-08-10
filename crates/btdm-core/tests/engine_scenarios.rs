@@ -702,3 +702,25 @@ async fn unlinked_campaigns_cost_no_detail_requests() {
     );
     assert_eq!(e.campaigns().len(), 1);
 }
+
+/// Skipping the detail fetch for unlinked campaigns must not make them vanish
+/// from the totals. "You could mine these if you linked those accounts" is
+/// exactly what the dashboard should say.
+#[tokio::test]
+async fn unlinked_campaigns_are_still_reported_as_rejected() {
+    let fake = FakeTwitch::default();
+    *fake.offered.lock().unwrap() = vec![
+        campaign("c-unlinked-a", false, vec![]),
+        campaign("c-unlinked-b", false, vec![]),
+    ];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let snap = e.snapshot("main", Some("someone"), now());
+    assert_eq!(snap.totals.campaigns_known, 2, "the campaigns still exist");
+    assert_eq!(snap.totals.campaigns_eligible, 0);
+    assert_eq!(snap.rejected.len(), 2);
+    assert!(snap.rejected.iter().all(|r| r.reason == "NotLinked"));
+    assert_eq!(*e.api().detail_fetches.lock().unwrap(), 0, "still no requests spent");
+}

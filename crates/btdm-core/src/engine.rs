@@ -387,6 +387,7 @@ impl<A: TwitchApi> Engine<A> {
 
         let mut fetched = 0usize;
         let mut skipped_unlinked = 0usize;
+        let mut unlinked: Vec<RejectedView> = Vec::new();
         for campaign in offered {
             if merged.contains_key(&campaign.id) {
                 continue;
@@ -399,8 +400,19 @@ impl<A: TwitchApi> Engine<A> {
             // campaign can never be mined. Filtering here turned 130 detail
             // requests into a handful against a real account, which is what
             // made the fetch cap stop truncating the campaign list.
+            //
+            // It is still recorded as rejected: "113 campaigns you could mine
+            // if you linked those accounts" is exactly what the dashboard
+            // should be telling you, and dropping them silently would make the
+            // totals claim the campaigns never existed.
             if !campaign.is_account_linked {
                 skipped_unlinked += 1;
+                unlinked.push(RejectedView {
+                    id: campaign.id.0.clone(),
+                    name: campaign.name.clone(),
+                    game: campaign.game.name.clone(),
+                    reason: format!("{:?}", RejectReason::NotLinked),
+                });
                 continue;
             }
             if fetched >= self.config.max_detail_fetches {
@@ -454,6 +466,9 @@ impl<A: TwitchApi> Engine<A> {
                 }
             }
         }
+        rejected.extend(unlinked);
+        // Deterministic order so the dashboard does not reshuffle on refresh.
+        rejected.sort_by(|a, b| a.reason.cmp(&b.reason).then(a.name.cmp(&b.name)));
         self.rejected = rejected;
 
         // Deterministic order: soonest deadline first, so behaviour is
