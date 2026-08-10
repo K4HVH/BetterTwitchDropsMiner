@@ -102,6 +102,12 @@ impl<A: TwitchApi> Engine<A> {
         self.progress.confirmed(drop)
     }
 
+    /// The drop currently advancing, with its server-confirmed figures.
+    /// This is the only drop whose numbers may be displayed as "current".
+    pub fn active_drop(&self) -> Option<(&DropId, &crate::progress::ConfirmedProgress)> {
+        self.progress.active()
+    }
+
     /// Leaves the current channel. Progress there tells us nothing about the next.
     pub fn switch_away(&mut self, now: DateTime<Utc>) {
         if let Some((channel, _, _)) = &self.current {

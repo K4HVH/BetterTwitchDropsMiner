@@ -230,12 +230,12 @@ fn report_status<A: TwitchApi>(engine: &Engine<A>, now: chrono::DateTime<Utc>) {
         .map(|d| format!("{}s ago", d.num_seconds()))
         .unwrap_or_else(|| "never".into());
 
+    // Only the drop that actually advanced may be shown. Picking any other
+    // drop with non-zero minutes reports numbers that belong to something the
+    // miner is not currently earning.
     let progress = engine
-        .campaigns()
-        .iter()
-        .flat_map(|c| &c.drops)
-        .find(|d| !d.is_claimed && d.current_minutes > 0)
-        .map(|d| format!("{}/{} min", d.current_minutes, d.required_minutes))
+        .active_drop()
+        .map(|(_, p)| format!("{}/{} min", p.current_minutes, p.required_minutes))
         .unwrap_or_else(|| "no confirmed progress".into());
 
     match engine.state() {
