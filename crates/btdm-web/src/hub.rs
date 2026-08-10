@@ -10,6 +10,7 @@
 //! engine can mutate it mid-selection.
 
 use btdm_core::control::Command;
+use serde::Serialize;
 use btdm_core::event::MinerEvent;
 use btdm_core::snapshot::Snapshot;
 use std::collections::BTreeMap;
@@ -21,6 +22,31 @@ use tokio::sync::{broadcast, mpsc};
 pub struct AccountEvent {
     pub account: String,
     pub event: MinerEvent,
+}
+
+/// One line of stored history.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryRow {
+    pub at: String,
+    pub summary: String,
+    pub severity: String,
+}
+
+/// One reward this account has actually earned.
+#[derive(Debug, Clone, Serialize)]
+pub struct RewardRow {
+    pub at: String,
+    pub name: String,
+}
+
+/// Where the dashboard reads history from.
+///
+/// The miner already writes every event to SQLite; without this the page had
+/// no way to read any of it back, so opening the dashboard after a restart
+/// showed an empty log and no record of anything ever claimed.
+pub trait History: Send + Sync {
+    fn recent(&self, account: &str, limit: u32) -> Vec<HistoryRow>;
+    fn rewards(&self, account: &str, limit: u32) -> Vec<RewardRow>;
 }
 
 /// What the dashboard streams: either a new snapshot or a log line.
@@ -44,6 +70,7 @@ pub struct Hub {
     snapshots: Arc<RwLock<BTreeMap<String, Snapshot>>>,
     commands: Arc<RwLock<BTreeMap<String, mpsc::Sender<Command>>>>,
     updates: broadcast::Sender<Update>,
+    history: Arc<RwLock<Option<Arc<dyn History>>>>,
 }
 
 impl Default for Hub {
@@ -59,6 +86,7 @@ impl Hub {
             snapshots: Arc::new(RwLock::new(BTreeMap::new())),
             commands: Arc::new(RwLock::new(BTreeMap::new())),
             updates,
+            history: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -104,6 +132,27 @@ impl Hub {
             .unwrap_or_else(|e| e.into_inner())
             .get(account)
             .cloned()
+    }
+
+    /// Attaches the stored history the dashboard reads from.
+    pub fn set_history(&self, history: Arc<dyn History>) {
+        *self.history.write().unwrap_or_else(|e| e.into_inner()) = Some(history);
+    }
+
+    pub fn history(&self, account: &str, limit: u32) -> Vec<HistoryRow> {
+        let guard = self.history.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .map(|h| h.recent(account, limit))
+            .unwrap_or_default()
+    }
+
+    pub fn rewards(&self, account: &str, limit: u32) -> Vec<RewardRow> {
+        let guard = self.history.read().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .map(|h| h.rewards(account, limit))
+            .unwrap_or_default()
     }
 
     /// Registers an account's command channel. Called by the supervisor as it

@@ -7,5 +7,5 @@
 mod hub;
 mod server;
 
-pub use hub::{AccountEvent, CommandError, Hub, Update};
+pub use hub::{AccountEvent, CommandError, History, HistoryRow, Hub, RewardRow, Update};
 pub use server::{ServeError, serve, serve_announcing};

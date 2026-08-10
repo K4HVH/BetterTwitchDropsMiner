@@ -283,3 +283,109 @@ async fn a_published_snapshot_is_pushed_to_an_open_stream() {
     assert!(text.contains("event: snapshot"), "got: {text}");
     assert!(text.contains("\"state\":\"Idle\""), "got: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// Stored history
+//
+// The miner writes every event to SQLite. Until these routes existed the page
+// could not read any of it, so opening the dashboard after a restart showed an
+// empty log and no record of anything ever claimed.
+// ---------------------------------------------------------------------------
+
+struct FakeHistory;
+
+impl btdm_web::History for FakeHistory {
+    fn recent(&self, account: &str, limit: u32) -> Vec<btdm_web::HistoryRow> {
+        if account != "main" {
+            return vec![];
+        }
+        (0..limit.min(3))
+            .map(|i| btdm_web::HistoryRow {
+                at: "2026-08-10T12:00:00Z".into(),
+                summary: format!("line {i}"),
+                severity: "info".into(),
+            })
+            .collect()
+    }
+
+    fn rewards(&self, account: &str, _limit: u32) -> Vec<btdm_web::RewardRow> {
+        if account != "main" {
+            return vec![];
+        }
+        vec![btdm_web::RewardRow {
+            at: "2026-08-10T12:00:00Z".into(),
+            name: "Weapon Charm".into(),
+        }]
+    }
+}
+
+#[tokio::test]
+async fn history_is_served_per_account() {
+    let hub = Hub::new();
+    hub.set_history(std::sync::Arc::new(FakeHistory));
+    let base = start(hub, None).await;
+
+    let rows: Vec<serde_json::Value> =
+        reqwest::get(format!("{base}/api/history?account=main&limit=2"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2, "the limit must be honoured");
+    assert_eq!(rows[0]["summary"], "line 0");
+
+    let other: Vec<serde_json::Value> =
+        reqwest::get(format!("{base}/api/history?account=someone-else"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(other.is_empty(), "accounts must not see each other's log");
+}
+
+#[tokio::test]
+async fn rewards_are_served() {
+    let hub = Hub::new();
+    hub.set_history(std::sync::Arc::new(FakeHistory));
+    let base = start(hub, None).await;
+
+    let rows: Vec<serde_json::Value> = reqwest::get(format!("{base}/api/rewards?account=main"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "Weapon Charm");
+}
+
+/// With no history attached the routes must return an empty list rather than
+/// erroring — `btdm mine` can run without a database behind the dashboard.
+#[tokio::test]
+async fn history_without_a_store_is_empty_not_broken() {
+    let base = start(Hub::new(), None).await;
+    let res = reqwest::get(format!("{base}/api/history?account=main")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Vec<serde_json::Value> = res.json().await.unwrap();
+    assert!(rows.is_empty());
+}
+
+/// History is derived from a live Twitch session and must be guarded like
+/// everything else.
+#[tokio::test]
+async fn history_requires_the_token() {
+    let hub = Hub::new();
+    hub.set_history(std::sync::Arc::new(FakeHistory));
+    let base = start(hub, Some("secret")).await;
+
+    for path in ["/api/history?account=main", "/api/rewards?account=main"] {
+        let res = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(res.status(), 401, "{path} must be guarded");
+    }
+    let ok = reqwest::get(format!("{base}/api/history?account=main&token=secret"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+}

@@ -276,6 +276,12 @@
     // wiped mid-sentence.
     drafts: {},
     logScroll: 0,
+    // Loaded from the miner's own stored log, so the page is not blank about
+    // everything that happened before it was opened.
+    history: [],
+    historyFor: null,
+    rewards: [],
+    rewardsFor: null,
   };
 
   const el = (tag, cls, text) => {
@@ -312,6 +318,28 @@
       toast("The miner is unreachable", true);
       return false;
     }
+  }
+
+  async function loadHistory(account) {
+    if (state.historyFor === account) return;
+    state.historyFor = account;
+    try {
+      const res = await fetch(api(`/api/history?account=${encodeURIComponent(account)}&limit=300`));
+      if (!res.ok) return;
+      state.history = await res.json();
+      if (state.tab === "log") render();
+    } catch (e) { /* the live stream still works without it */ }
+  }
+
+  async function loadRewards(account) {
+    if (state.rewardsFor === account) return;
+    state.rewardsFor = account;
+    try {
+      const res = await fetch(api(`/api/rewards?account=${encodeURIComponent(account)}&limit=500`));
+      if (!res.ok) return;
+      state.rewards = await res.json();
+      if (state.tab === "rewards") render();
+    } catch (e) { /* nothing to show is better than a broken page */ }
   }
 
   // ---------------------------------------------------------------------
@@ -980,18 +1008,81 @@
     return box;
   }
 
-  function logTab() {
+  function rewardsTab(s) {
+    loadRewards(s.account);
+    const box = el("div");
+
+    const list = state.rewards.filter((r) => matches(r.name));
+    if (!list.length) {
+      const p = el("div", "panel pad");
+      p.style.marginTop = "16px";
+      p.append(el("div", "empty", state.rewards.length
+        ? "Nothing matches that search."
+        : "Nothing claimed yet. Rewards appear here as they are earned."));
+      box.append(p);
+      return box;
+    }
+
+    // Grouped by day, because "what did I get overnight" is the question.
+    const byDay = new Map();
+    list.forEach((r) => {
+      const day = new Date(r.at).toDateString();
+      if (!byDay.has(day)) byDay.set(day, []);
+      byDay.get(day).push(r);
+    });
+
+    const total = el("div", "sub");
+    total.style.marginTop = "16px";
+    total.textContent = `${plural(state.rewards.length, "reward")} claimed by this miner.`;
+    box.append(total);
+
+    byDay.forEach((items, day) => {
+      const h = el("h2");
+      h.append(document.createTextNode(day));
+      h.append(el("span", "count", String(items.length)));
+      box.append(h);
+
+      const panel = el("div", "panel scroll");
+      const table = el("table"), tbody = el("tbody");
+      items.forEach((r) => {
+        const tr = el("tr");
+        const name = el("td");
+        name.append(el("span", "pill ok", "claimed"));
+        name.append(document.createTextNode(" " + r.name));
+        tr.append(name);
+        tr.append(el("td", "sub num", new Date(r.at).toLocaleTimeString()));
+        tbody.append(tr);
+      });
+      table.append(tbody);
+      panel.append(table);
+      box.append(panel);
+    });
+    return box;
+  }
+
+  function logTab(s) {
+    loadHistory(s.account);
     const panel = el("div", "panel");
     panel.style.marginTop = "16px";
     panel.id = "log";
-    if (!state.log.length) {
+    // Live lines first, then whatever the miner recorded before this page was
+    // opened. Without the stored half, a restart looked like amnesia.
+    const seen = new Set(state.log.map((l) => l.at + l.summary));
+    const merged = state.log.concat(
+      state.history
+        .filter((h) => !seen.has(h.at + h.summary))
+        .filter((h) => h.severity !== "debug")
+        .map((h) => ({ at: h.at, account: s.account, summary: h.summary, severity: h.severity })),
+    );
+
+    if (!merged.length) {
       const e = el("div", "empty");
       e.style.padding = "14px";
       e.textContent = "Nothing has happened yet.";
       panel.append(e);
       return panel;
     }
-    state.log.forEach((item) => {
+    merged.forEach((item) => {
       const line = el("div", "line");
       line.append(el("time", null, new Date(item.at).toLocaleTimeString()));
       if (state.snapshots.size > 1) line.append(el("span", "who", item.account));
@@ -1060,6 +1151,7 @@
       ["campaigns", "Campaigns", s.eligible.length],
       ["live", "Live now", s.live.length],
       ["unavailable", "Unavailable", s.rejected.length],
+      ["rewards", "Rewards", null],
       ["settings", "Settings", null],
       ["log", "Activity", null],
     ];
@@ -1074,7 +1166,7 @@
     });
     app.append(tabs);
 
-    if (state.tab === "campaigns" || state.tab === "live" || state.tab === "unavailable") {
+    if (["campaigns", "live", "unavailable", "rewards"].includes(state.tab)) {
       const searchRow = el("div", "row");
       searchRow.style.marginTop = "14px";
       const search = el("input");
@@ -1091,8 +1183,9 @@
     if (state.tab === "campaigns") app.append(campaignsTab(s));
     else if (state.tab === "live") app.append(liveTab(s));
     else if (state.tab === "unavailable") app.append(unavailableTab(s));
+    else if (state.tab === "rewards") app.append(rewardsTab(s));
     else if (state.tab === "settings") app.append(settingsTab(s));
-    else app.append(logTab());
+    else app.append(logTab(s));
 
     if (focusedId) {
       const restored = document.getElementById(focusedId);
