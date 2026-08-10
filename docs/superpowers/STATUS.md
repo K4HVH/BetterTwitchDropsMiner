@@ -34,12 +34,13 @@ Built in one session, verified against a real Twitch account (`k4hvh`).
 | Web dashboard, embedded, token-guarded | Done |
 | Discord alerting | Done |
 | Docker, systemd, static release workflow | Done |
-| **Self-update** | **Not built** |
+| Self-update | Done (explicit, checksum-verified, never automatic) |
 
-Self-update is the one selected v1 item not delivered. It is the feature most
-able to break an unattended machine, and it was scheduled last deliberately.
-The release workflow already publishes checksummed static binaries, so adding
-it later is self-contained.
+Self-update installs only when asked (`btdm update --apply`), verifies the
+published SHA-256 before replacing anything, refuses a release with no
+checksum, and swaps by rename. Nothing updates itself behind your back, because
+an unattended miner that replaces its own binary mid-run is the easiest way to
+turn a working box into a broken one.
 
 ## Defects found and fixed during the build
 
