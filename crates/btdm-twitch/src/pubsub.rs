@@ -18,6 +18,8 @@ pub const PUBSUB_URL: &str = "wss://pubsub-edge.twitch.tv/v1";
 pub const PING_INTERVAL: Duration = Duration::from_secs(180);
 /// A PONG must arrive within this window or the socket is considered dead.
 pub const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for Twitch to acknowledge a LISTEN.
+pub const LISTEN_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Topic {
@@ -128,6 +130,42 @@ pub async fn connect(
         .send(Message::Text(listen.to_string().into()))
         .await
         .map_err(|e| TwitchError::Network(e.to_string()))?;
+
+    // Wait for the subscription to be acknowledged. Without this a rejected
+    // LISTEN (bad auth, bad topic) leaves a socket that answers PING forever
+    // and delivers nothing — indistinguishable from a healthy one.
+    let ack = tokio::time::timeout(LISTEN_ACK_TIMEOUT, async {
+        while let Some(frame) = read.next().await {
+            let Ok(Message::Text(text)) = frame else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if v.get("type").and_then(Value::as_str) == Some("RESPONSE") {
+                return match v.get("error").and_then(Value::as_str) {
+                    None | Some("") => Ok(()),
+                    Some(e) => Err(TwitchError::Malformed(format!(
+                        "pubsub rejected the subscription: {e}"
+                    ))),
+                };
+            }
+        }
+        Err(TwitchError::Network(
+            "pubsub closed before acknowledging the subscription".into(),
+        ))
+    })
+    .await;
+
+    match ack {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(TwitchError::Network(
+                "pubsub did not acknowledge the subscription in time".into(),
+            ));
+        }
+    }
 
     let (tx, rx) = mpsc::channel(64);
 

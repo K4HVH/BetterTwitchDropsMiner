@@ -63,12 +63,13 @@ pub async fn mine(
         "engine configured"
     );
 
-    // Push channel for drop progress and claim notifications.
-    let mut pubsub_rx = connect_pubsub(&tokens.access_token, &validated.user_id).await;
+    // Push channel for drop progress and claim notifications. The supervisor
+    // owns reconnection, so the main loop never blocks on it.
+    let mut pubsub_rx =
+        spawn_pubsub_supervisor(tokens.access_token.clone(), validated.user_id.clone());
 
     let mut last_sync = None;
     let mut last_auth_check = Utc::now();
-    let mut pubsub_backoff = StdDuration::from_secs(1);
 
     loop {
         let now = Utc::now();
@@ -88,11 +89,19 @@ pub async fn mine(
         if engine.current_channel().is_none()
             && let Err(e) = engine.select_channel(now).await
         {
+            // A revoked token cannot be recovered from by retrying; say so now
+            // rather than churning uselessly until the next scheduled sync.
+            if matches!(e, btdm_core::api::ApiError::Unauthorized) {
+                anyhow::bail!("the stored token was rejected. Run: btdm login --force");
+            }
             tracing::error!(error = %e, "channel selection failed");
         }
 
         // --- one mining tick -------------------------------------------------
         if let Err(e) = engine.tick(now).await {
+            if matches!(e, btdm_core::api::ApiError::Unauthorized) {
+                anyhow::bail!("the stored token was rejected. Run: btdm login --force");
+            }
             tracing::error!(error = %e, "mining tick failed; leaving this channel");
             engine.switch_away(now);
         }
@@ -145,39 +154,26 @@ pub async fn mine(
                 break;
             }
 
-            let recv = async {
-                match pubsub_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            };
-
             tokio::select! {
+                // Every branch here is cheap, so the heartbeat deadline and
+                // Ctrl-C are always reachable.
                 _ = tokio::time::sleep(remaining) => break,
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("shutting down");
                     return Ok(());
                 }
-                msg = recv => {
+                msg = pubsub_rx.recv() => {
                     match msg {
-                        Some(PubSubMessage::Disconnected) | None => {
-                            pubsub_rx = None;
-                            tracing::warn!(
-                                backoff_secs = pubsub_backoff.as_secs(),
-                                "pubsub disconnected; the poll backstop is now the only \
-                                 progress source"
-                            );
-                            tokio::time::sleep(pubsub_backoff).await;
-                            pubsub_backoff = (pubsub_backoff * 2).min(PUBSUB_MAX_BACKOFF);
-                            pubsub_rx =
-                                connect_pubsub(&tokens.access_token, &validated.user_id).await;
-                            if pubsub_rx.is_some() {
-                                pubsub_backoff = StdDuration::from_secs(1);
-                            }
-                        }
-                        Some(other) => {
-                            handle_pubsub(&mut engine, other);
+                        Some(event) => {
+                            handle_pubsub(&mut engine, event);
                             drain_events(&mut engine, storage, account)?;
+                        }
+                        // The supervisor retries forever, so this only happens
+                        // if it stopped entirely.
+                        None => {
+                            tracing::error!("pubsub supervisor stopped; polling only");
+                            tokio::time::sleep(remaining).await;
+                            break;
                         }
                     }
                 }
@@ -251,24 +247,62 @@ async fn work_recovery_rung(
     }
 }
 
-async fn connect_pubsub(
-    token: &str,
-    user_id: &str,
-) -> Option<tokio::sync::mpsc::Receiver<PubSubMessage>> {
-    let topics = vec![
-        Topic::UserDrops.as_str(user_id),
-        Topic::UserPoints.as_str(user_id),
-    ];
-    match pubsub::connect(pubsub::PUBSUB_URL, token, topics).await {
-        Ok(rx) => {
-            tracing::info!("pubsub connected");
-            Some(rx)
+/// Owns the PubSub connection for the process lifetime, reconnecting forever
+/// with capped backoff.
+///
+/// This is a separate task on purpose. Doing reconnection inline in the main
+/// loop meant a slow connect blocked watch heartbeats and Ctrl-C, and a single
+/// failed attempt disabled push events permanently — the retry could only be
+/// triggered by a disconnect message that could no longer arrive.
+fn spawn_pubsub_supervisor(
+    token: String,
+    user_id: String,
+) -> tokio::sync::mpsc::Receiver<PubSubMessage> {
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+
+    tokio::spawn(async move {
+        let topics = vec![
+            Topic::UserDrops.as_str(&user_id),
+            Topic::UserPoints.as_str(&user_id),
+        ];
+        let mut backoff = StdDuration::from_secs(1);
+
+        loop {
+            match pubsub::connect(pubsub::PUBSUB_URL, &token, topics.clone()).await {
+                Ok(mut socket) => {
+                    tracing::info!("pubsub connected");
+                    backoff = StdDuration::from_secs(1);
+
+                    while let Some(msg) = socket.recv().await {
+                        if matches!(msg, PubSubMessage::Disconnected) {
+                            break;
+                        }
+                        // The consumer going away means the miner is shutting
+                        // down; stop rather than reconnecting into the void.
+                        if tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    tracing::warn!(
+                        "pubsub disconnected; the poll backstop is the only progress \
+                         source until it is back"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        retry_in_secs = backoff.as_secs(),
+                        "pubsub connect failed; will retry"
+                    );
+                }
+            }
+
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(PUBSUB_MAX_BACKOFF);
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "pubsub connect failed; relying on the poll backstop");
-            None
-        }
-    }
+    });
+
+    rx
 }
 
 fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {
