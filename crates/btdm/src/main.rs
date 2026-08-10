@@ -4,6 +4,7 @@ mod notify;
 mod run;
 mod storage;
 mod supervisor;
+mod update;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -49,6 +50,12 @@ enum Command {
     },
     /// Run a single pass and report what the miner sees, then exit.
     Probe,
+    /// Check for a newer release. Installs nothing unless --apply is given.
+    Update {
+        /// Download and install the update, replacing this binary.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn default_data_dir() -> PathBuf {
@@ -107,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Update { apply } => update::run(apply).await,
         Command::Probe => {
             run::mine(
                 &storage,

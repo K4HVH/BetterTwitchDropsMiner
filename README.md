@@ -54,9 +54,14 @@ finished binary, dashboard included.
 | `btdm logout` | Remove a stored token |
 | `btdm mine [--headless]` | Mine every linked account |
 | `btdm probe` | One diagnostic pass, then exit |
+| `btdm update [--apply]` | Check for a newer release; install only with `--apply` |
 
 Add `--account <name>` to any command to manage a second account, and
 `--only-this-account` to `mine` to run just that one.
+
+Updates are never automatic. `btdm update` only reports what is available;
+`--apply` downloads it, verifies the published SHA-256 before touching anything,
+and swaps the binary by rename. A release without a checksum is refused.
 
 ## Configuration
 
