@@ -1571,3 +1571,369 @@ async fn a_paused_miner_never_asks_to_select() {
     e.apply_command(Command::Pause, now());
     assert!(!e.needs_selection(now() + chrono::Duration::hours(2)));
 }
+
+/// Pausing means "stop watching", not "abandon what I have already earned".
+#[tokio::test]
+async fn a_paused_miner_still_claims_drops_it_already_earned() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.apply_command(Command::Pause, now());
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(
+        *e.api().claims.lock().unwrap(),
+        vec!["claim-1".to_string()],
+        "an earned drop must still be claimed while paused"
+    );
+    assert!(
+        e.api().watches_sent.lock().unwrap().is_empty(),
+        "but nothing new may be mined"
+    );
+}
+
+/// The websocket is not the only way a claimable drop is discovered: a missed
+/// push must be picked up by the next inventory sync, or the drop is lost.
+#[tokio::test]
+async fn a_claimable_drop_found_by_sync_is_claimed_without_any_websocket_event() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-from-inventory".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(
+        *e.api().claims.lock().unwrap(),
+        vec!["claim-from-inventory".to_string()]
+    );
+    let claimed: Vec<String> = e
+        .drain_events()
+        .into_iter()
+        .filter_map(|ev| match ev.kind {
+            EventKind::DropClaimed { name, .. } => Some(name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(claimed.len(), 1, "and the claim must be reported");
+}
+
+// ---------------------------------------------------------------------------
+// Claiming
+//
+// Every one of these is a way a drop that was earned could be lost.
+// ---------------------------------------------------------------------------
+
+/// The worst bug the reviewer found: a refused claim was reported as a success
+/// and marked claimed locally, so it was never retried.
+#[tokio::test]
+async fn a_refused_claim_is_not_reported_as_a_success() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+    *fake.fail_claims.lock().unwrap() = true;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.drain_events();
+    e.tick(now()).await.unwrap();
+
+    let events = e.drain_events();
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev.kind, EventKind::DropClaimed { .. })),
+        "a claim that failed must never be announced as a claim"
+    );
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev.kind,
+            EventKind::Notice { severity: btdm_core::event::Severity::Warn, .. }
+        )),
+        "and the user must be told it failed"
+    );
+    assert!(
+        e.campaigns()[0].drops[0].is_claimable(),
+        "it must stay claimable so the next tick retries it"
+    );
+}
+
+/// A failed claim must not take the heartbeat down with it.
+#[tokio::test]
+async fn a_failed_claim_does_not_abort_the_tick() {
+    let fake = happy_path();
+    let mut earned = drop("d1", 60, 60);
+    earned.claim_id = Some("claim-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![earned])];
+    *fake.fail_claims.lock().unwrap() = true;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(
+        e.api().watches_sent.lock().unwrap().len(),
+        1,
+        "mining must continue even when a claim is refused"
+    );
+}
+
+/// Twitch does not always supply a dropInstanceID. Requiring one meant an
+/// earned drop was silently never claimed.
+#[tokio::test]
+async fn an_earned_drop_with_no_instance_id_is_still_claimed() {
+    let fake = happy_path();
+    // Fully watched, but Twitch sent no claim id.
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 60)])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    let claims = e.api().claims.lock().unwrap().clone();
+    assert_eq!(claims.len(), 1, "the claim must still be attempted");
+    assert!(
+        claims[0].contains("c1") && claims[0].contains("d1"),
+        "the id is reconstructed from the campaign and drop: {claims:?}"
+    );
+}
+
+/// Twitch allows claiming for 24 hours after a campaign ends. Dropping the
+/// campaign the instant it expired threw away rewards already worked for.
+#[tokio::test]
+async fn a_drop_earned_in_a_just_ended_campaign_is_still_claimed() {
+    let fake = FakeTwitch::default();
+    let mut ended = campaign("c-ended", true, vec![drop("d1", 60, 60)]);
+    ended.starts_at = now() - chrono::Duration::days(10);
+    ended.ends_at = now() - chrono::Duration::hours(1);
+    ended.drops[0].claim_id = Some("claim-late".into());
+    *fake.inventory.lock().unwrap() = vec![ended];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.campaigns().is_empty(), "it is not mineable any more");
+
+    e.tick(now()).await.unwrap();
+    assert_eq!(
+        *e.api().claims.lock().unwrap(),
+        vec!["claim-late".to_string()],
+        "but the reward is still ours for another 23 hours"
+    );
+}
+
+/// Past the grace period there is nothing to be done, and we must not keep
+/// hammering Twitch about it.
+#[tokio::test]
+async fn a_long_expired_campaign_is_not_retried_forever() {
+    let fake = FakeTwitch::default();
+    let mut ended = campaign("c-old", true, vec![drop("d1", 60, 60)]);
+    ended.starts_at = now() - chrono::Duration::days(30);
+    ended.ends_at = now() - chrono::Duration::days(3);
+    ended.drops[0].claim_id = Some("claim-ancient".into());
+    *fake.inventory.lock().unwrap() = vec![ended];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert!(
+        e.api().claims.lock().unwrap().is_empty(),
+        "the 24-hour window closed long ago"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regressions found by adversarial review
+// ---------------------------------------------------------------------------
+
+/// A flaky directory request used to swallow the user's command entirely: the
+/// "already reselected" flag was cleared before the fallible call, so the
+/// dashboard reported success and nothing happened for ten minutes.
+#[tokio::test]
+async fn a_failed_selection_leaves_the_request_pending() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    e.apply_command(
+        Command::SetStrategy {
+            name: "coverage".into(),
+        },
+        now(),
+    );
+    assert!(e.needs_selection(now()));
+
+    // Twitch falls over on the very next request.
+    *e.api().fail_with.lock().unwrap() = Some(ApiError::Network("boom".into()));
+    assert!(e.select_channel(now()).await.is_err());
+
+    assert!(
+        e.needs_selection(now()),
+        "the command must still be pending, not silently dropped"
+    );
+
+    *e.api().fail_with.lock().unwrap() = None;
+    e.select_channel(now()).await.unwrap();
+    assert!(!e.needs_selection(now()), "and satisfied once it succeeds");
+}
+
+/// Excluding one campaign of several must trim the session, not end it —
+/// ending it resets the progress tracker and the stall clock for campaigns the
+/// user never touched.
+#[tokio::test]
+async fn excluding_one_of_several_campaigns_keeps_the_session() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(watch.campaigns.len(), 2);
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d1"),
+            current_minutes: 30,
+            required_minutes: 60,
+        },
+        now(),
+    );
+    assert_eq!(e.state(), MiningState::Mining);
+
+    // Exclude the *other* campaign.
+    let secondary = watch.campaigns[1].clone();
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: secondary.clone(),
+            excluded: true,
+        },
+        now(),
+    );
+
+    let still = e.current().expect("the session must survive");
+    assert_eq!(still.campaigns.len(), 1);
+    assert!(!still.campaigns.contains(&secondary));
+    assert_eq!(
+        e.state(),
+        MiningState::Mining,
+        "progress on the campaign the user kept must not be discarded"
+    );
+}
+
+#[tokio::test]
+async fn excluding_every_campaign_in_the_session_does_end_it() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    for campaign in watch.campaigns.clone() {
+        e.apply_command(
+            Command::SetCampaignExcluded {
+                campaign,
+                excluded: true,
+            },
+            now(),
+        );
+    }
+    assert!(e.current().is_none());
+}
+
+/// The masked-stall case. A channel is chosen for campaign P and also advances
+/// Q. Twitch reports drops per *account*, so a browser watching some other
+/// stream can keep Q ticking. Accepting that as proof of health would hide P
+/// earning nothing here.
+#[tokio::test]
+async fn a_secondary_campaign_advancing_does_not_mask_a_stalled_primary() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    let secondary = watch.campaigns[1].clone();
+    let secondary_drop = e
+        .campaigns()
+        .iter()
+        .find(|c| c.id == secondary)
+        .unwrap()
+        .drops[0]
+        .id
+        .clone();
+
+    // Six minutes later, only the secondary campaign has moved.
+    let later = now() + chrono::Duration::minutes(6);
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: secondary_drop,
+            current_minutes: 5,
+            required_minutes: 120,
+        },
+        later,
+    );
+
+    let quiet = e.since_last_confirmation(later).unwrap();
+    assert!(
+        quiet >= chrono::Duration::minutes(6),
+        "the stall clock must still be running for the campaign we came for, \
+         got {quiet:?}"
+    );
+}
+
+/// ...but progress on the campaign that drove the choice does clear it.
+#[tokio::test]
+async fn progress_on_the_primary_campaign_clears_the_stall_clock() {
+    let mut e = engine(two_campaigns_one_channel());
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    let primary = watch.primary_campaign().unwrap().clone();
+    let primary_drop = e
+        .campaigns()
+        .iter()
+        .find(|c| c.id == primary)
+        .unwrap()
+        .drops[0]
+        .id
+        .clone();
+
+    let later = now() + chrono::Duration::minutes(6);
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: primary_drop,
+            current_minutes: 5,
+            required_minutes: 60,
+        },
+        later,
+    );
+
+    assert_eq!(e.since_last_confirmation(later).unwrap().num_seconds(), 0);
+}
+
+/// Once the primary campaign has nothing left to earn, any of the session's
+/// campaigns counts — otherwise finishing it would read as a stall.
+#[tokio::test]
+async fn a_finished_primary_campaign_does_not_make_the_session_look_stalled() {
+    let fake = two_campaigns_one_channel();
+    // The first campaign is already fully claimed.
+    let mut done = campaign("c1", true, vec![drop("d1", 60, 60)]);
+    done.drops[0].is_claimed = true;
+    *fake.inventory.lock().unwrap() = vec![done, campaign("c2", true, vec![drop("d2", 120, 0)])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap().unwrap();
+
+    let later = now() + chrono::Duration::minutes(6);
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d2"),
+            current_minutes: 5,
+            required_minutes: 120,
+        },
+        later,
+    );
+    assert_eq!(e.since_last_confirmation(later).unwrap().num_seconds(), 0);
+}

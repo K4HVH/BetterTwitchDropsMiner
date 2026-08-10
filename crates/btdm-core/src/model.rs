@@ -92,8 +92,16 @@ impl TimedDrop {
         self.required_minutes.saturating_sub(self.current_minutes)
     }
 
+    /// Whether this drop is waiting to be claimed.
+    ///
+    /// Twitch does not always populate `dropInstanceID`, and requiring it meant
+    /// a drop that had plainly been earned was never claimed at all. Having
+    /// watched the required minutes is enough — the claim id can be
+    /// reconstructed.
     pub fn is_claimable(&self) -> bool {
-        !self.is_claimed && self.claim_id.is_some()
+        !self.is_claimed
+            && (self.claim_id.is_some()
+                || (self.required_minutes > 0 && self.current_minutes >= self.required_minutes))
     }
 }
 
@@ -177,15 +185,29 @@ mod tests {
     }
 
     #[test]
-    fn drop_is_claimable_only_with_a_claim_id_and_not_already_claimed() {
-        let mut d = drop_with(60, 60);
-        assert!(!d.is_claimable(), "no claim id yet");
-
+    fn a_drop_with_a_claim_id_is_claimable_until_it_is_claimed() {
+        let mut d = drop_with(60, 0);
         d.claim_id = Some("claim-1".into());
         assert!(d.is_claimable());
 
         d.is_claimed = true;
         assert!(!d.is_claimable(), "already claimed");
+    }
+
+    /// Twitch does not always send `dropInstanceID`. Requiring it meant a drop
+    /// that had plainly been earned was never claimed at all.
+    #[test]
+    fn a_fully_watched_drop_is_claimable_without_an_instance_id() {
+        assert!(drop_with(60, 60).is_claimable());
+        assert!(drop_with(60, 75).is_claimable(), "overshoot still counts");
+        assert!(!drop_with(60, 59).is_claimable(), "not earned yet");
+    }
+
+    /// A campaign with no time requirement must not look permanently
+    /// claimable, or the miner would retry it forever.
+    #[test]
+    fn a_zero_requirement_drop_is_not_claimable_on_its_own() {
+        assert!(!drop_with(0, 0).is_claimable());
     }
 
     #[test]

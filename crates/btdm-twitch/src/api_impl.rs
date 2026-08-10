@@ -187,14 +187,32 @@ impl TwitchApi for TwitchClient {
         Ok(Some(progress))
     }
 
-    async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError> {
-        self.gql
-            .run(
-                &ops::CLAIM_DROP,
-                json!({ "input": { "dropInstanceID": claim_id } }),
-            )
+    /// Claims a drop, and checks that Twitch agreed.
+    ///
+    /// The mutation's `status` used to be discarded, so a refused claim was
+    /// reported to the user as a success and the drop was marked claimed
+    /// locally — never to be retried. For a miner whose entire premise is not
+    /// telling you things that are not true, announcing a claim that did not
+    /// happen is the worst possible bug.
+    async fn claim_drop(
+        &self,
+        drop: &DropId,
+        campaign: &CampaignId,
+        claim_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        // Twitch's own client reconstructs the instance id from ids it already
+        // holds when the field is missing, and the format is stable.
+        let id = match claim_id {
+            Some(id) => id.to_owned(),
+            None => format!("{}#{}#{}", self.user_id.0, campaign.0, drop.0),
+        };
+
+        let response = self
+            .gql
+            .run(&ops::CLAIM_DROP, json!({ "input": { "dropInstanceID": id } }))
             .await?;
-        Ok(())
+
+        parse::claim_granted(&response).map_err(ApiError::Malformed)
     }
 
     async fn claim_points(&self, channel: &ChannelId, claim_id: &str) -> Result<(), ApiError> {

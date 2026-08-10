@@ -144,6 +144,10 @@ pub struct Engine<A: TwitchApi> {
     /// A channel the user asked to watch next, honoured once.
     forced_channel: Option<String>,
     campaigns: Vec<DropCampaign>,
+    /// Campaigns that have ended but whose earned drops can still be claimed.
+    /// Twitch allows claiming for 24 hours after a campaign closes; dropping
+    /// them at the moment they expired threw away rewards already worked for.
+    recently_ended: Vec<DropCampaign>,
     /// Why each unavailable campaign was rejected, for the dashboard.
     rejected: Vec<RejectedView>,
     current: Option<CurrentWatch>,
@@ -157,6 +161,10 @@ pub struct Engine<A: TwitchApi> {
     last_watch: Option<DateTime<Utc>>,
     last_poll: Option<DateTime<Utc>>,
     last_sync: Option<DateTime<Utc>>,
+    /// When this channel last proved it is earning the campaign it was chosen
+    /// for. Separate from the display clock on purpose — see
+    /// [`Engine::counts_towards_health`].
+    last_health_advance: Option<DateTime<Utc>>,
     /// Set by the user's "sync now", cleared by the next sync.
     sync_forced: bool,
     last_selection: Option<DateTime<Utc>>,
@@ -204,6 +212,7 @@ impl<A: TwitchApi> Engine<A> {
             forced_channel: None,
             config,
             campaigns: Vec::new(),
+            recently_ended: Vec::new(),
             rejected: Vec::new(),
             current: None,
             live: Vec::new(),
@@ -212,6 +221,7 @@ impl<A: TwitchApi> Engine<A> {
             last_watch: None,
             last_poll: None,
             last_sync: None,
+            last_health_advance: None,
             sync_forced: false,
             last_selection: None,
             reselect_forced: false,
@@ -332,13 +342,17 @@ impl<A: TwitchApi> Engine<A> {
                     .unwrap_or_else(|| campaign.0.clone());
                 if excluded {
                     self.excluded_campaigns.insert(campaign.0.clone());
-                    // Stop immediately if we are mining the thing being excluded.
-                    if self
-                        .current
-                        .as_ref()
-                        .is_some_and(|w| w.campaigns.contains(&campaign))
-                    {
-                        self.stop_watching(now, StopReason::UserRequest);
+                    // Trim it out of the session rather than ending the whole
+                    // thing. One channel commonly advances several campaigns,
+                    // and excluding one of them is no reason to throw away the
+                    // confirmed progress on the others — which is what
+                    // stopping would do, since it resets the progress tracker
+                    // and the stall clock.
+                    if let Some(w) = &mut self.current {
+                        w.campaigns.retain(|id| id != &campaign);
+                        if w.campaigns.is_empty() {
+                            self.stop_watching(now, StopReason::UserRequest);
+                        }
                     }
                 } else {
                     self.excluded_campaigns.remove(&campaign.0);
@@ -657,10 +671,7 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Ask the watchdog whether the current session is healthy.
     pub fn assess_health(&mut self, now: DateTime<Utc>) -> Verdict {
-        let since = self
-            .current
-            .as_ref()
-            .and(self.progress.since_last_confirmation(now));
+        let since = self.current.as_ref().and(self.since_last_confirmation(now));
         let verdict = self.watchdog.assess(since, now);
         self.recovery_step = match &verdict {
             Verdict::Escalate(step) => Some(*step),
@@ -715,6 +726,7 @@ impl<A: TwitchApi> Engine<A> {
                         "the stream restarted; heartbeats were carrying a stale broadcast id"
                     );
                     self.progress.begin(now);
+                    self.last_health_advance = Some(now);
                 }
                 if let Some(w) = &mut self.current {
                     w.stream = fresh;
@@ -882,8 +894,43 @@ impl<A: TwitchApi> Engine<A> {
         std::mem::take(&mut self.events)
     }
 
+    /// How long since this channel last proved it is earning what it was
+    /// chosen for.
+    ///
+    /// This is the health clock, not the display clock. See
+    /// [`Engine::counts_towards_health`] for why they differ.
     pub fn since_last_confirmation(&self, now: DateTime<Utc>) -> Option<Duration> {
-        self.progress.since_last_confirmation(now)
+        self.last_health_advance
+            .map(|t| now - t)
+            .or_else(|| self.progress.since_last_confirmation(now))
+    }
+
+    /// Whether a confirmation proves the *current channel* is doing its job.
+    ///
+    /// A channel chosen for campaign P often also advances Q. Twitch reports
+    /// drop progress per account, not per session, so if the user is watching
+    /// a different stream in a browser and that advances Q, accepting it here
+    /// would reset the stall clock while P silently earned nothing on this
+    /// channel — a narrower recurrence of the account-wide progress bug this
+    /// project exists to prevent.
+    ///
+    /// Health is therefore judged on the campaign that drove the choice.
+    /// Once that campaign has nothing left to earn, any of the session's
+    /// campaigns will do, so finishing the primary does not read as a stall.
+    fn counts_towards_health(&self, drop: &DropId) -> bool {
+        let Some(watch) = &self.current else {
+            return false;
+        };
+        let Some(primary) = watch.primary_campaign() else {
+            return true;
+        };
+        let Some(campaign) = self.campaigns.iter().find(|c| &c.id == primary) else {
+            return true;
+        };
+        if eligibility::mineable_drops(campaign).is_empty() {
+            return true;
+        }
+        campaign.drops.iter().any(|d| &d.id == drop)
     }
 
     pub fn state(&self) -> MiningState {
@@ -919,6 +966,7 @@ impl<A: TwitchApi> Engine<A> {
         self.progress.reset();
         self.watchdog.reset();
         self.recovery_step = None;
+        self.last_health_advance = None;
         self.last_watch = None;
         self.last_poll = None;
     }
@@ -1048,10 +1096,19 @@ impl<A: TwitchApi> Engine<A> {
 
         let mut eligible = Vec::new();
         let mut rejected = Vec::new();
+        let mut recently_ended = Vec::new();
         for campaign in merged.into_values() {
             match eligibility::assess(&campaign, now) {
                 Ok(()) => eligible.push(campaign),
                 Err(reason) => {
+                    // A campaign that ended in the last day may still hold
+                    // drops we earned and never claimed.
+                    if reason == RejectReason::Expired
+                        && now < campaign.ends_at + CLAIM_GRACE
+                        && campaign.drops.iter().any(|d| d.is_claimable())
+                    {
+                        recently_ended.push(campaign.clone());
+                    }
                     rejected.push(rejected_view(&campaign, reason));
                     self.emit(
                         now,
@@ -1081,6 +1138,7 @@ impl<A: TwitchApi> Engine<A> {
                 eligible: eligible.len(),
             },
         );
+        self.recently_ended = recently_ended;
         self.campaigns = eligible;
         self.last_sync = Some(now);
         self.sync_forced = false;
@@ -1123,10 +1181,15 @@ impl<A: TwitchApi> Engine<A> {
         if self.paused {
             return Ok(None);
         }
+        self.quarantine.prune(now);
+        // Mark the pass handled only once it has actually happened. Clearing
+        // the flag first meant one flaky directory request threw away the
+        // user's command: `select_channel` returned Err, the caller logged it,
+        // and `needs_selection` then reported nothing was due for another ten
+        // minutes — with the dashboard already told the command succeeded.
+        let (candidates, fallbacks) = self.gather_candidates(now).await?;
         self.last_selection = Some(now);
         self.reselect_forced = false;
-        self.quarantine.prune(now);
-        let (candidates, fallbacks) = self.gather_candidates(now).await?;
         // Kept for the dashboard, so the user sees the choice we faced.
         self.live = candidates.clone();
 
@@ -1520,6 +1583,7 @@ impl<A: TwitchApi> Engine<A> {
         self.progress.begin(now);
         self.watchdog.reset();
         self.recovery_step = None;
+        self.last_health_advance = Some(now);
         self.last_watch = None;
         self.last_poll = None;
 
@@ -1554,10 +1618,13 @@ impl<A: TwitchApi> Engine<A> {
     /// One iteration: claim anything claimable, send a heartbeat if due, then
     /// poll progress as a backstop to the websocket.
     pub async fn tick(&mut self, now: DateTime<Utc>) -> Result<(), ApiError> {
+        // Claiming happens even while paused. A drop that has already been
+        // earned is ours; "pause" means stop watching, not abandon what the
+        // account already has waiting for it.
+        self.claim_ready(now).await?;
         if self.paused {
             return Ok(());
         }
-        self.claim_ready(now).await?;
 
         let Some(watch) = self.current.clone() else {
             return Ok(());
@@ -1643,9 +1710,12 @@ impl<A: TwitchApi> Engine<A> {
         if !self.progress.record(p.clone(), now) {
             return;
         }
-        // Real progress ends any stall episode in flight.
-        self.watchdog.on_progress();
-        self.recovery_step = None;
+        // Real progress on what we came for ends any stall episode in flight.
+        if self.counts_towards_health(&p.drop_id) {
+            self.last_health_advance = Some(now);
+            self.watchdog.on_progress();
+            self.recovery_step = None;
+        }
         // Keep the campaign view in step so claim detection and remaining-time
         // figures reflect what the server actually reported.
         for campaign in &mut self.campaigns {
@@ -1697,21 +1767,48 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Claims everything ready, whether or not it belongs to the current
     /// session. A drop earned an hour ago on a channel we have since left is
-    /// still ours.
+    /// still ours — and so is one from a campaign that ended twenty minutes
+    /// ago, which Twitch allows for a further twenty-four hours.
     pub async fn claim_ready(&mut self, now: DateTime<Utc>) -> Result<(), ApiError> {
-        let ready: Vec<(String, DropId, String)> = self
-            .all_drops()
-            .filter(|d| d.is_claimable())
-            .filter_map(|d| {
-                d.claim_id
-                    .clone()
-                    .map(|cid| (cid, d.id.clone(), d.name.clone()))
-            })
+        let ready: Vec<(CampaignId, DropId, Option<String>, String)> = self
+            .campaigns
+            .iter()
+            .chain(self.recently_ended.iter())
+            .flat_map(|c| c.drops.iter().map(move |d| (c, d)))
+            .filter(|(_, d)| d.is_claimable())
+            .map(|(c, d)| (c.id.clone(), d.id.clone(), d.claim_id.clone(), d.name.clone()))
             .collect();
 
-        for (claim_id, drop_id, name) in ready {
-            self.api.claim_drop(&claim_id).await?;
-            for campaign in &mut self.campaigns {
+        for (campaign_id, drop_id, claim_id, name) in ready {
+            // A claim failing must not abort the tick: the other drops are
+            // still worth claiming, and the heartbeat still has to be sent.
+            if let Err(e) = self
+                .api
+                .claim_drop(&drop_id, &campaign_id, claim_id.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    drop = %drop_id,
+                    error = %e,
+                    "claim refused; leaving it unclaimed so it is retried"
+                );
+                self.emit(
+                    now,
+                    EventKind::Notice {
+                        message: format!("Could not claim {name}: {e}. It will be retried."),
+                        severity: Severity::Warn,
+                    },
+                );
+                continue;
+            }
+
+            // Only now is it claimed. Marking it before the server agreed is
+            // how a refused claim became permanent.
+            for campaign in self
+                .campaigns
+                .iter_mut()
+                .chain(self.recently_ended.iter_mut())
+            {
                 if let Some(d) = campaign.drops.iter_mut().find(|d| d.id == drop_id) {
                     d.is_claimed = true;
                     d.claim_id = None;
@@ -1722,6 +1819,10 @@ impl<A: TwitchApi> Engine<A> {
         Ok(())
     }
 }
+
+/// How long after a campaign ends its earned drops can still be claimed.
+/// Twitch's own documented grace period.
+const CLAIM_GRACE: Duration = Duration::hours(24);
 
 /// A campaign's requirements, resolved once per selection pass.
 struct Want {

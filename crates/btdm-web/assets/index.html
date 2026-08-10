@@ -270,6 +270,12 @@
     filter: "",
     log: [],
     connected: false,
+    // What the user has typed but not yet submitted. Held here rather than in
+    // the DOM because a snapshot arrives every heartbeat and the page rebuilds
+    // itself from scratch — anything living only in an input element would be
+    // wiped mid-sentence.
+    drafts: {},
+    logScroll: 0,
   };
 
   const el = (tag, cls, text) => {
@@ -316,6 +322,22 @@
   // locally is time until a deadline, which is a clock, not progress.
   // ---------------------------------------------------------------------
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+  /// A text box whose contents survive the page rebuilding underneath it.
+  function draftInput(id, placeholder, fallback, onEnter) {
+    const input = el("input");
+    input.type = "text";
+    input.id = id;
+    input.placeholder = placeholder;
+    input.value = state.drafts[id] !== undefined ? state.drafts[id] : (fallback || "");
+    input.oninput = () => { state.drafts[id] = input.value; };
+    if (onEnter) {
+      input.onkeydown = (e) => { if (e.key === "Enter") onEnter(input.value.trim()); };
+    }
+    return input;
+  }
+
+  const clearDraft = (id) => { delete state.drafts[id]; };
 
   function ago(seconds) {
     if (seconds === null || seconds === undefined) return "never";
@@ -526,13 +548,14 @@
     f2.style.marginBottom = "0";
     f2.append(el("label", null, "Pinned channel"));
     const pinRow = el("div", "row");
-    const pin = el("input");
-    pin.type = "text";
-    pin.placeholder = "channel login";
-    pin.value = s.settings.pinned || "";
+    const submitPin = (value) => {
+      clearDraft("pin-input");
+      send(acct, { command: "pin", channel: value || null });
+    };
+    const pin = draftInput("pin-input", "channel login", s.settings.pinned, submitPin);
     pin.style.flex = "1 1 140px";
     const savePin = el("button", null, "Pin");
-    savePin.onclick = () => send(acct, { command: "pin", channel: pin.value.trim() || null });
+    savePin.onclick = () => submitPin(pin.value.trim());
     pinRow.append(pin, savePin);
     if (s.settings.pinned) {
       const clear = el("button", "tiny", "Clear");
@@ -845,19 +868,16 @@
     p1.append(chips);
 
     const addRow = el("div", "row");
-    const gameInput = el("input");
-    gameInput.type = "text";
-    gameInput.placeholder = "Game name, exactly as Twitch spells it";
+    const doAdd = (v) => {
+      if (!v) return;
+      clearDraft("priority-input");
+      send(acct, { command: "set_priority_games", games: [...s.settings.priority_games, v] });
+    };
+    const gameInput = draftInput(
+      "priority-input", "Game name, exactly as Twitch spells it", "", doAdd);
     gameInput.style.flex = "1 1 220px";
     const addBtn = el("button", null, "Add");
-    const doAdd = () => {
-      const v = gameInput.value.trim();
-      if (!v) return;
-      send(acct, { command: "set_priority_games", games: [...s.settings.priority_games, v] });
-      gameInput.value = "";
-    };
-    addBtn.onclick = doAdd;
-    gameInput.onkeydown = (e) => { if (e.key === "Enter") doAdd(); };
+    addBtn.onclick = () => doAdd(gameInput.value.trim());
     addRow.append(gameInput, addBtn);
     p1.append(addRow);
     box.append(p1);
@@ -901,19 +921,15 @@
     p3.append(exChips);
 
     const exRow = el("div", "row");
-    const exInput = el("input");
-    exInput.type = "text";
-    exInput.placeholder = "Game name";
+    const doExclude = (v) => {
+      if (!v) return;
+      clearDraft("exclude-input");
+      send(acct, { command: "set_game_excluded", game: v, excluded: true });
+    };
+    const exInput = draftInput("exclude-input", "Game name", "", doExclude);
     exInput.style.flex = "1 1 220px";
     const exBtn = el("button", null, "Exclude");
-    const doExclude = () => {
-      const v = exInput.value.trim();
-      if (!v) return;
-      send(acct, { command: "set_game_excluded", game: v, excluded: true });
-      exInput.value = "";
-    };
-    exBtn.onclick = doExclude;
-    exInput.onkeydown = (e) => { if (e.key === "Enter") doExclude(); };
+    exBtn.onclick = () => doExclude(exInput.value.trim());
     exRow.append(exInput, exBtn);
     p3.append(exRow);
     box.append(p3);
@@ -1001,12 +1017,15 @@
     }
     state.current = s.account;
 
-    // Preserve the search box's focus and caret across re-renders, or typing
-    // while the miner publishes a snapshot would lose a character.
-    const oldSearch = $("#search");
-    const hadFocus = oldSearch && document.activeElement === oldSearch;
-    const caret = oldSearch ? oldSearch.selectionStart : null;
+    // Preserve focus and caret across the rebuild for whichever box the user
+    // is in — not just the search field. Their *contents* are already safe in
+    // `state.drafts`; this is so the cursor does not jump out mid-word.
+    const active = document.activeElement;
+    const focusedId = active && active.id && active.tagName === "INPUT" ? active.id : null;
+    const caret = focusedId ? active.selectionStart : null;
     const scrolled = window.scrollY;
+    const oldLog = $("#log");
+    if (oldLog) state.logScroll = oldLog.scrollTop;
 
     app.textContent = "";
     app.append(banners(s));
@@ -1060,11 +1079,17 @@
     else if (state.tab === "settings") app.append(settingsTab(s));
     else app.append(logTab());
 
-    const newSearch = $("#search");
-    if (hadFocus && newSearch) {
-      newSearch.focus();
-      if (caret !== null) newSearch.setSelectionRange(caret, caret);
+    if (focusedId) {
+      const restored = document.getElementById(focusedId);
+      if (restored) {
+        restored.focus();
+        if (caret !== null && restored.setSelectionRange) {
+          try { restored.setSelectionRange(caret, caret); } catch (e) { /* not a text box */ }
+        }
+      }
     }
+    const newLog = $("#log");
+    if (newLog) newLog.scrollTop = state.logScroll;
     window.scrollTo(0, scrolled);
   }
 
@@ -1079,9 +1104,15 @@
     source.addEventListener("snapshot", (msg) => {
       try {
         const s = JSON.parse(msg.data);
+        const isNewAccount = !state.snapshots.has(s.account);
         state.snapshots.set(s.account, s);
         state.connected = true;
-        render();
+        // Rebuilding the page for an account that is not on screen would
+        // interrupt the user for no visible benefit. With several accounts
+        // mining, that is a rebuild every few seconds.
+        if (isNewAccount || !state.current || s.account === state.current) {
+          render();
+        }
       } catch (e) { /* a malformed frame must not kill the page */ }
     });
 

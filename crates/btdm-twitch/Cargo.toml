@@ -8,6 +8,7 @@ license.workspace = true
 base64 = "0.23.1"
 btdm-core = { path = "../btdm-core" }
 chrono.workspace = true
+getrandom.workspace = true
 futures-util = "0.3.33"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "gzip", "rustls", "form", "charset", "http2"] }

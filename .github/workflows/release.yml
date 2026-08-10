@@ -5,6 +5,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -16,26 +19,85 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
+          # musl gives a genuinely static binary; rustls means no OpenSSL to
+          # link, and rusqlite is bundled, so these cross-compile cleanly.
           - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
           - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          # A Raspberry Pi 2/3 running a 32-bit OS is a stated target.
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            suffix: .exe
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # musl gives a genuinely static binary; rustls means no OpenSSL to link.
-      - run: cargo install cross --locked
-      - run: cross build --release --locked --target ${{ matrix.target }} -p btdm
-      - run: |
-          mv target/${{ matrix.target }}/release/btdm btdm-${{ matrix.target }}
-          sha256sum btdm-${{ matrix.target }} > btdm-${{ matrix.target }}.sha256
+
+      - if: matrix.cross
+        run: cargo install cross --locked
+      - if: matrix.cross
+        run: cross build --release --locked --target ${{ matrix.target }} -p btdm
+      - if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p btdm
+
+      # The self-updater verifies a SHA-256 before replacing the binary, so the
+      # checksum is part of the release rather than a nicety.
+      - name: Package
+        shell: bash
+        run: |
+          name="btdm-${{ matrix.target }}${{ matrix.suffix }}"
+          mv "target/${{ matrix.target }}/release/btdm${{ matrix.suffix }}" "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name" > "$name.sha256"
+          else
+            shasum -a 256 "$name" > "$name.sha256"
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: btdm-${{ matrix.target }}
           path: |
-            btdm-${{ matrix.target }}
-            btdm-${{ matrix.target }}.sha256
+            btdm-${{ matrix.target }}${{ matrix.suffix }}
+            btdm-${{ matrix.target }}${{ matrix.suffix }}.sha256
+
+  publish:
+    # Without this the workflow built binaries and threw them away as
+    # 90-day artifacts. `btdm update` queries /releases/latest, so it could
+    # never find anything at all — a headline feature that had never once
+    # worked.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec mv {} release/ \;
+          ls -la release
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

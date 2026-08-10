@@ -23,6 +23,12 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
     /// Optional Discord webhook for drop claims and anything needing attention.
     pub discord_webhook: Option<String>,
+    /// Bearer token for a dashboard bound off loopback.
+    ///
+    /// Generated on first use and kept, rather than regenerated each start: a
+    /// token that changed every restart invalidated the URL the user had just
+    /// bookmarked, and left `btdm control` with no way to authenticate.
+    pub dashboard_token: Option<String>,
     pub accounts: Vec<AccountConfig>,
 }
 
@@ -32,6 +38,7 @@ impl Default for Config {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            dashboard_token: None,
             accounts: vec![AccountConfig::default()],
         }
     }
@@ -184,6 +191,15 @@ impl ConfigStore {
         }
         cfg.save_atomic(&self.path)
     }
+
+    /// Stores the dashboard token so it survives a restart and `btdm control`
+    /// can find it.
+    pub async fn save_dashboard_token(&self, token: &str) -> Result<(), ConfigError> {
+        let _guard = self.lock.lock().await;
+        let mut cfg = Config::load(&self.path)?;
+        cfg.dashboard_token = Some(token.to_owned());
+        cfg.save_atomic(&self.path)
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +221,7 @@ mod tests {
             bind: "0.0.0.0:9000".into(),
             data_dir: None,
             discord_webhook: None,
+            dashboard_token: None,
             accounts: vec![AccountConfig {
                 name: "main".into(),
                 strategy: "coverage".into(),
@@ -253,6 +270,7 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            dashboard_token: None,
             accounts: vec![],
         };
         let a = cfg.account("whoever");
@@ -267,6 +285,7 @@ mod account_tests {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
             discord_webhook: None,
+            dashboard_token: None,
             accounts: vec![
                 AccountConfig {
                     name: "alt".into(),
@@ -384,6 +403,7 @@ mod store_tests {
             bind: "0.0.0.0:9999".into(),
             data_dir: None,
             discord_webhook: Some("https://example.invalid/hook".into()),
+            dashboard_token: None,
             accounts: vec![AccountConfig::default()],
         }
         .save_atomic(&path)

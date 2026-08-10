@@ -29,6 +29,8 @@ pub struct FakeTwitch {
     pub fail_with: Mutex<Option<ApiError>>,
     /// When set, only `available_drops` fails.
     pub fail_available_drops: Mutex<bool>,
+    /// When set, Twitch refuses every claim.
+    pub fail_claims: Mutex<bool>,
     pub detail_fetches: Mutex<usize>,
 }
 
@@ -116,9 +118,23 @@ impl TwitchApi for FakeTwitch {
         Ok(self.progress.lock().unwrap().clone())
     }
 
-    async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError> {
+    async fn claim_drop(
+        &self,
+        drop: &DropId,
+        campaign: &CampaignId,
+        claim_id: Option<&str>,
+    ) -> Result<(), ApiError> {
         self.guard()?;
-        self.claims.lock().unwrap().push(claim_id.to_owned());
+        if *self.fail_claims.lock().unwrap() {
+            return Err(ApiError::Malformed("Twitch refused the claim".into()));
+        }
+        // Records what the transport would have sent, so a synthesised id is
+        // visible to tests.
+        self.claims.lock().unwrap().push(
+            claim_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("synth#{}#{}", campaign.0, drop.0)),
+        );
         Ok(())
     }
 

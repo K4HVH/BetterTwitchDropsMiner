@@ -47,13 +47,56 @@ pub fn mineable_drops(campaign: &DropCampaign) -> Vec<&TimedDrop> {
         .collect()
 }
 
-/// Minutes of watching still needed to finish every reachable drop in the
-/// campaign. Tiers are cumulative, so this is the largest remaining figure
-/// rather than their sum.
+/// Minutes of watching still needed to finish a single drop, including every
+/// tier it is gated behind.
+///
+/// Twitch expresses tiers two different ways. Most campaigns give each drop a
+/// *cumulative* requirement (60, 120, 180 minutes of the same watching) and no
+/// preconditions. Others gate a drop behind earlier ones, and then the
+/// requirements are that drop's own — you must finish the predecessor first
+/// and then watch again. Adding the worst predecessor chain handles both:
+/// with no preconditions the chain contributes nothing and the cumulative
+/// figures stand on their own.
+fn total_remaining_minutes(campaign: &DropCampaign, drop: &TimedDrop) -> u32 {
+    fn walk(
+        campaign: &DropCampaign,
+        drop: &TimedDrop,
+        // Guards against a precondition cycle. Twitch should never send one,
+        // but a miner that hangs on malformed data is worse than one that
+        // slightly misjudges a deadline.
+        seen: &mut std::collections::HashSet<DropId>,
+    ) -> u32 {
+        if !seen.insert(drop.id.clone()) {
+            return 0;
+        }
+        let worst_chain = drop
+            .precondition_ids
+            .iter()
+            .filter_map(|id| campaign.drops.iter().find(|d| &d.id == id))
+            // A precondition already claimed is behind us and costs nothing.
+            .filter(|d| !d.is_claimed)
+            .map(|d| walk(campaign, d, seen))
+            .max()
+            .unwrap_or(0);
+        drop.remaining_minutes().saturating_add(worst_chain)
+    }
+
+    walk(campaign, drop, &mut std::collections::HashSet::new())
+}
+
+/// Minutes of watching still needed to finish everything left in the campaign.
+///
+/// Computed over every *unclaimed* drop, not only the ones minable right now.
+/// Counting only the unlocked tiers made a 1h-then-5h campaign report that it
+/// needed one hour, so a campaign that could not possibly be finished looked
+/// comfortable — and this figure feeds the feasibility filter, the "at risk"
+/// flag and the completionist strategy alike.
 pub fn remaining_minutes(campaign: &DropCampaign) -> u32 {
-    mineable_drops(campaign)
+    campaign
+        .drops
         .iter()
-        .map(|d| d.remaining_minutes())
+        .filter(|d| !d.is_claimed)
+        .map(|d| total_remaining_minutes(campaign, d))
         .max()
         .unwrap_or(0)
 }
@@ -195,5 +238,131 @@ mod tests {
             precondition_ids: vec![],
         });
         assert_eq!(remaining_minutes(&c), 160);
+    }
+}
+
+#[cfg(test)]
+mod remaining_minutes_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 10, h, 0, 0).unwrap()
+    }
+
+    fn tier(id: &str, required: u32, current: u32, after: &[&str]) -> TimedDrop {
+        TimedDrop {
+            id: DropId::from(id),
+            name: id.into(),
+            benefits: vec![],
+            required_minutes: required,
+            current_minutes: current,
+            claim_id: None,
+            is_claimed: false,
+            precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
+        }
+    }
+
+    fn with(drops: Vec<TimedDrop>) -> DropCampaign {
+        DropCampaign {
+            id: CampaignId::from("c1"),
+            name: "Camp".into(),
+            game: Game {
+                id: GameId::from("g1"),
+                name: "Game".into(),
+                slug: "game".into(),
+                box_art_url: None,
+            },
+            starts_at: at(10),
+            ends_at: at(20),
+            is_account_linked: true,
+            allowed_channels: vec![],
+            drops,
+        }
+    }
+
+    /// The common shape: no preconditions, cumulative requirements. The last
+    /// tier is the whole job.
+    #[test]
+    fn cumulative_tiers_report_the_largest_requirement() {
+        let c = with(vec![
+            tier("d1", 60, 30, &[]),
+            tier("d2", 120, 30, &[]),
+            tier("d3", 180, 30, &[]),
+        ]);
+        assert_eq!(remaining_minutes(&c), 150);
+    }
+
+    /// The bug this replaced. A tier locked behind an unclaimed one was
+    /// excluded entirely, so a 1h-then-5h campaign claimed it needed one hour
+    /// — and a campaign that could never be finished looked comfortable.
+    #[test]
+    fn a_locked_tier_still_counts_towards_the_work_remaining() {
+        let c = with(vec![
+            tier("d1", 60, 0, &[]),
+            tier("d2", 300, 0, &["d1"]),
+        ]);
+        assert_eq!(
+            remaining_minutes(&c),
+            360,
+            "an hour, then five more — not an hour"
+        );
+    }
+
+    #[test]
+    fn a_claimed_precondition_no_longer_costs_anything() {
+        let mut c = with(vec![
+            tier("d1", 60, 60, &[]),
+            tier("d2", 300, 0, &["d1"]),
+        ]);
+        c.drops[0].is_claimed = true;
+        assert_eq!(remaining_minutes(&c), 300);
+    }
+
+    #[test]
+    fn a_chain_of_preconditions_adds_up() {
+        let c = with(vec![
+            tier("d1", 10, 0, &[]),
+            tier("d2", 20, 0, &["d1"]),
+            tier("d3", 30, 0, &["d2"]),
+        ]);
+        assert_eq!(remaining_minutes(&c), 60);
+    }
+
+    /// Where a drop is gated behind two, the longer branch decides.
+    #[test]
+    fn branching_preconditions_take_the_worst_branch() {
+        let c = with(vec![
+            tier("short", 10, 0, &[]),
+            tier("long", 100, 0, &[]),
+            tier("final", 5, 0, &["short", "long"]),
+        ]);
+        assert_eq!(remaining_minutes(&c), 105);
+    }
+
+    #[test]
+    fn everything_claimed_needs_no_more_watching() {
+        let mut c = with(vec![tier("d1", 60, 60, &[])]);
+        c.drops[0].is_claimed = true;
+        assert_eq!(remaining_minutes(&c), 0);
+    }
+
+    /// Malformed data must not hang the miner.
+    #[test]
+    fn a_precondition_cycle_terminates() {
+        let c = with(vec![
+            tier("a", 10, 0, &["b"]),
+            tier("b", 10, 0, &["a"]),
+        ]);
+        let _ = remaining_minutes(&c);
+    }
+
+    #[test]
+    fn progress_already_made_is_deducted_along_the_chain() {
+        let c = with(vec![
+            tier("d1", 60, 45, &[]),
+            tier("d2", 300, 0, &["d1"]),
+        ]);
+        assert_eq!(remaining_minutes(&c), 315, "15 left on tier 1, then 300");
     }
 }
