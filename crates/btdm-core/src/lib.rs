@@ -7,6 +7,7 @@
 //! observe in production.
 
 pub mod api;
+pub mod control;
 pub mod eligibility;
 pub mod engine;
 pub mod event;

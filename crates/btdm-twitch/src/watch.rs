@@ -225,6 +225,7 @@ mod tests {
             id: GameId::from("g1"),
             name: "Deadlock".into(),
             slug: "deadlock".into(),
+        box_art_url: None,
         };
 
         let parsed = decode(&build_watch_payload(

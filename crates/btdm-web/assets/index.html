@@ -6,137 +6,441 @@
 <title>Twitch Drops Miner</title>
 <style>
   :root {
-    --bg: #f6f7f9; --panel: #ffffff; --ink: #14161a; --muted: #5c6472;
-    --line: #e3e6eb; --accent: #7d5bed; --ok: #1f9254; --warn: #b8860b;
-    --bad: #c0392b; --radius: 10px;
+    --bg: #f4f5f7; --panel: #ffffff; --panel-2: #fafbfc;
+    --ink: #14161a; --muted: #626b7a; --faint: #8a92a1;
+    --line: #e1e5ea; --line-strong: #cfd5dd;
+    --accent: #7d5bed; --accent-ink: #ffffff;
+    --ok: #14804a; --ok-bg: #e6f4ec;
+    --warn: #9a6700; --warn-bg: #fff5e0;
+    --bad: #b42318; --bad-bg: #fdecea;
+    --radius: 12px; --radius-sm: 7px;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.10);
   }
-  :root:not([data-theme="light"]) { }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #14161a; --panel: #1c1f26; --ink: #e8eaee; --muted: #98a0ae;
-      --line: #2a2f39; --accent: #a08bf5; --ok: #45c07d; --warn: #e0b64a;
-      --bad: #ef6b5b;
+      --bg: #0e1013; --panel: #171a1f; --panel-2: #1d2127;
+      --ink: #e8eaee; --muted: #98a0ae; --faint: #6d7684;
+      --line: #262b33; --line-strong: #333944;
+      --accent: #a08bf5; --accent-ink: #12121a;
+      --ok: #52c98a; --ok-bg: #12241a;
+      --warn: #e0b64a; --warn-bg: #241f10;
+      --bad: #f0776a; --bad-bg: #2a1512;
+      --shadow: 0 1px 2px rgba(0,0,0,.4);
     }
   }
   :root[data-theme="dark"] {
-    --bg: #14161a; --panel: #1c1f26; --ink: #e8eaee; --muted: #98a0ae;
-    --line: #2a2f39; --accent: #a08bf5; --ok: #45c07d; --warn: #e0b64a;
-    --bad: #ef6b5b;
+    --bg: #0e1013; --panel: #171a1f; --panel-2: #1d2127;
+    --ink: #e8eaee; --muted: #98a0ae; --faint: #6d7684;
+    --line: #262b33; --line-strong: #333944;
+    --accent: #a08bf5; --accent-ink: #12121a;
+    --ok: #52c98a; --ok-bg: #12241a;
+    --warn: #e0b64a; --warn-bg: #241f10;
+    --bad: #f0776a; --bad-bg: #2a1512;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
   }
 
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    padding: 20px; max-width: 1100px; margin-inline: auto;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
-  h1 { font-size: 1.35rem; margin: 0; letter-spacing: -0.01em; }
-  h2 { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.07em;
-       color: var(--muted); margin: 26px 0 10px; font-weight: 600; }
-  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-           margin-bottom: 4px; }
-  .sub { color: var(--muted); font-size: 0.88rem; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 18px 60px; }
+
+  /* ---- top bar ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar .wrap {
+    padding-block: 12px; display: flex; align-items: center;
+    gap: 14px; flex-wrap: wrap;
+  }
+  .brand { font-weight: 680; letter-spacing: -.02em; font-size: 1.05rem;
+           display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint);
+         flex: none; }
+  .dot.live { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+  .dot.down { background: var(--bad); }
+  .spacer { flex: 1 1 auto; }
+
+  /* ---- generic bits ---- */
   .panel { background: var(--panel); border: 1px solid var(--line);
-           border-radius: var(--radius); padding: 16px; }
-  .grid { display: grid; gap: 12px; }
-  @media (min-width: 720px) { .grid.two { grid-template-columns: 1fr 1fr; } }
+           border-radius: var(--radius); box-shadow: var(--shadow); }
+  .pad { padding: 16px; }
+  h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 28px 0 12px; font-weight: 650; }
+  h2 .count { color: var(--faint); font-weight: 500; text-transform: none;
+              letter-spacing: 0; margin-left: 6px; }
+  .sub { color: var(--muted); font-size: .875rem; }
+  .faint { color: var(--faint); }
+  .num { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--faint); font-style: italic; padding: 14px 0; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
-  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px;
-          font-size: 0.75rem; font-weight: 600; border: 1px solid var(--line); }
-  .pill.ok { color: var(--ok); border-color: var(--ok); }
-  .pill.warn { color: var(--warn); border-color: var(--warn); }
-  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  button, select, input {
+    font: inherit; color: inherit; border-radius: var(--radius-sm);
+    border: 1px solid var(--line-strong); background: var(--panel);
+    padding: 6px 11px;
+  }
+  button { cursor: pointer; transition: background .12s, border-color .12s; }
+  button:hover:not(:disabled) { background: var(--panel-2); border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: var(--accent-ink);
+                   border-color: transparent; font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.07); background: var(--accent); }
+  button.tiny { padding: 3px 8px; font-size: .78rem; }
+  button.icon { padding: 3px 7px; line-height: 1; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  input[type=search], input[type=text] { min-width: 0; }
+  select { padding-right: 8px; }
 
-  .headline { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; }
-  .confirm { font-variant-numeric: tabular-nums; }
-  .stale { color: var(--bad); font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 5px;
+          padding: 2px 9px; border-radius: 999px; font-size: .74rem;
+          font-weight: 600; border: 1px solid var(--line-strong);
+          white-space: nowrap; }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+  .pill.warn { color: var(--warn); background: var(--warn-bg); border-color: transparent; }
+  .pill.bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+  .pill.accent { color: var(--accent); border-color: var(--accent); }
 
-  .bar { height: 7px; background: var(--line); border-radius: 999px;
-         overflow: hidden; margin-top: 10px; }
-  .bar > i { display: block; height: 100%; background: var(--accent); }
+  /* ---- hero ---- */
+  .hero { display: grid; gap: 16px; margin-top: 18px; }
+  @media (min-width: 900px) { .hero { grid-template-columns: 1.35fr 1fr; } }
+  .hero .now { display: flex; gap: 14px; align-items: flex-start; }
+  .hero .headline { font-size: 1.5rem; font-weight: 680; letter-spacing: -.02em;
+                    line-height: 1.2; }
+  .hero a.headline { color: inherit; text-decoration: none; }
+  .hero a.headline:hover { text-decoration: underline; }
+  .reason { font-size: .85rem; color: var(--muted); margin-top: 8px;
+            border-left: 2px solid var(--line-strong); padding-left: 10px; }
+  .confirm { font-variant-numeric: tabular-nums; margin-top: 12px; font-size: 1.05rem; }
+  .stale { color: var(--bad); font-weight: 650; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  .bar { height: 8px; background: var(--line); border-radius: 999px;
+         overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; background: var(--accent);
+             border-radius: 999px; transition: width .4s ease; }
+  .bar.done > i { background: var(--ok); }
+
+  /* ---- stats ---- */
+  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px;
+           background: var(--line); border-radius: var(--radius);
+           overflow: hidden; border: 1px solid var(--line); }
+  @media (min-width: 560px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+  .stat { background: var(--panel); padding: 12px 14px; }
+  .stat b { display: block; font-size: 1.35rem; font-weight: 680;
+            letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .stat span { font-size: .76rem; color: var(--muted); text-transform: uppercase;
+               letter-spacing: .05em; }
+
+  /* ---- tabs ---- */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line);
+          margin: 26px 0 0; overflow-x: auto; }
+  .tabs button { border: 0; background: none; border-radius: 0;
+                 border-bottom: 2px solid transparent; padding: 9px 12px;
+                 color: var(--muted); font-weight: 560; white-space: nowrap; }
+  .tabs button:hover { background: none; color: var(--ink); }
+  .tabs button[aria-selected="true"] { color: var(--ink);
+                                       border-bottom-color: var(--accent); }
+  .tabs .badge { display: inline-block; margin-left: 6px; font-size: .72rem;
+                 background: var(--line); color: var(--muted);
+                 border-radius: 999px; padding: 1px 7px; font-weight: 600; }
+
+  /* ---- campaign cards ---- */
+  .cards { display: grid; gap: 14px; margin-top: 16px; }
+  @media (min-width: 720px) { .cards { grid-template-columns: 1fr 1fr; } }
+  .camp { overflow: hidden; display: flex; flex-direction: column; }
+  .camp.current { border-color: var(--accent);
+                  box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+  .camp.excluded { opacity: .55; }
+  .camp header { display: flex; gap: 12px; padding: 14px; align-items: flex-start; }
+  .art { width: 54px; height: 72px; border-radius: 6px; object-fit: cover;
+         background: var(--line); flex: none; }
+  .art.none { display: grid; place-items: center; color: var(--faint);
+              font-size: .65rem; text-align: center; }
+  .camp h3 { margin: 0; font-size: 1rem; font-weight: 650; letter-spacing: -.01em; }
+  .camp .meta { font-size: .8rem; color: var(--muted); margin-top: 3px; }
+  .camp .acts { margin-left: auto; display: flex; gap: 4px; flex: none; }
+
+  .drops { border-top: 1px solid var(--line); }
+  .drop { display: flex; gap: 11px; padding: 10px 14px; align-items: center;
+          border-bottom: 1px solid var(--line); }
+  .drop:last-child { border-bottom: 0; }
+  .drop.claimed { opacity: .6; }
+  .drop.locked { opacity: .65; }
+  .drop img, .drop .noimg { width: 34px; height: 34px; border-radius: 6px;
+                            object-fit: cover; background: var(--line); flex: none; }
+  .drop .body { flex: 1 1 auto; min-width: 0; }
+  .drop .name { font-size: .88rem; font-weight: 560; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+  .drop .mins { font-size: .76rem; color: var(--muted); font-variant-numeric: tabular-nums;
+                flex: none; }
+  .drop .bar { margin-top: 5px; height: 5px; }
+  .benefits { font-size: .74rem; color: var(--faint); margin-top: 2px;
+              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- lists ---- */
+  table { width: 100%; border-collapse: collapse; font-size: .885rem; }
   th { text-align: left; font-weight: 600; color: var(--muted);
-       font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;
-       padding: 6px 10px; border-bottom: 1px solid var(--line); }
-  td { padding: 8px 10px; border-bottom: 1px solid var(--line);
-       vertical-align: top; }
+       font-size: .72rem; text-transform: uppercase; letter-spacing: .05em;
+       padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   tr:last-child td { border-bottom: 0; }
   .scroll { overflow-x: auto; }
-  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 
-  #log { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
-         max-height: 300px; overflow-y: auto; }
-  #log div { padding: 1px 0; border-bottom: 1px solid var(--line); }
-  #log time { color: var(--muted); margin-right: 8px; }
-  .empty { color: var(--muted); font-style: italic; }
-  details summary { cursor: pointer; color: var(--muted); font-size: 0.88rem; }
-  footer { margin-top: 30px; color: var(--muted); font-size: 0.8rem; }
+  /* ---- log ---- */
+  #log { max-height: 420px; overflow-y: auto; font-size: .82rem; }
+  #log .line { display: flex; gap: 10px; padding: 5px 14px;
+               border-bottom: 1px solid var(--line); align-items: baseline; }
+  #log .line:last-child { border-bottom: 0; }
+  #log time { color: var(--faint); font-variant-numeric: tabular-nums; flex: none;
+              font-size: .78rem; }
+  #log .who { color: var(--muted); flex: none; font-size: .78rem; }
+  #log .sev-good { color: var(--ok); }
+  #log .sev-warn { color: var(--warn); }
+  #log .sev-bad { color: var(--bad); font-weight: 600; }
+  #log .sev-debug { color: var(--faint); }
+
+  .toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+           background: var(--ink); color: var(--bg); padding: 9px 16px;
+           border-radius: 999px; font-size: .86rem; font-weight: 560;
+           box-shadow: 0 6px 24px rgba(0,0,0,.28); z-index: 50;
+           opacity: 0; pointer-events: none; transition: opacity .18s; }
+  .toast.show { opacity: 1; }
+  .toast.err { background: var(--bad); color: #fff; }
+
+  .banner { border-radius: var(--radius); padding: 12px 14px; margin-top: 16px;
+            font-size: .9rem; border: 1px solid transparent; }
+  .banner.warn { background: var(--warn-bg); color: var(--warn); }
+  .banner.bad { background: var(--bad-bg); color: var(--bad); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: .8rem;
+          background: var(--panel-2); border: 1px solid var(--line);
+          border-radius: 999px; padding: 3px 6px 3px 11px; }
+  .chip button { border: 0; background: none; padding: 0 4px; color: var(--faint);
+                 font-size: 1rem; line-height: 1; }
+  .chip button:hover { color: var(--bad); background: none; }
+
+  .field { display: grid; gap: 5px; margin-bottom: 16px; }
+  .field label { font-size: .8rem; font-weight: 600; color: var(--muted); }
+  .field .hint { font-size: .78rem; color: var(--faint); }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
-<header>
-  <h1>Twitch Drops Miner</h1>
-  <span class="sub" id="conn">connecting…</span>
-</header>
-<p class="sub">Every figure below is confirmed by Twitch. Nothing here is a local timer.</p>
 
-<div id="accounts"></div>
+<div class="topbar">
+  <div class="wrap">
+    <div class="brand"><span class="dot" id="conn-dot"></span> Twitch Drops Miner</div>
+    <span class="sub" id="conn-text">connecting…</span>
+    <span class="spacer"></span>
+    <span id="account-picker" class="row"></span>
+    <button id="theme" class="icon" title="Toggle theme" aria-label="Toggle theme">◐</button>
+  </div>
+</div>
 
-<h2>Activity</h2>
-<div class="panel" id="log"><div class="empty">Waiting for events…</div></div>
+<div class="wrap">
+  <div id="app">
+    <div class="panel pad" style="margin-top:20px">
+      <div class="empty">Waiting for the miner to report…</div>
+    </div>
+  </div>
+</div>
 
-<footer>Updates stream live. If “last confirmed” keeps climbing, mining has stalled — the miner is already working its recovery ladder.</footer>
+<div class="toast" id="toast"></div>
 
 <script>
 (() => {
   "use strict";
-  const $ = (sel) => document.querySelector(sel);
+
+  // ---------------------------------------------------------------------
+  // Plumbing
+  // ---------------------------------------------------------------------
   const token = new URLSearchParams(location.search).get("token");
-  const api = (path) => path + (token ? "?token=" + encodeURIComponent(token) : "");
+  const api = (path) => path + (token ? (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(token) : "");
+
+  const state = {
+    snapshots: new Map(),   // account -> snapshot
+    current: null,          // selected account
+    tab: "campaigns",
+    filter: "",
+    log: [],
+    connected: false,
+  };
 
   const el = (tag, cls, text) => {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
-    if (text !== undefined) n.textContent = text;
+    if (text !== undefined && text !== null) n.textContent = String(text);
     return n;
   };
+  const $ = (sel) => document.querySelector(sel);
 
+  let toastTimer = null;
+  function toast(message, isError) {
+    const t = $("#toast");
+    t.textContent = message;
+    t.className = "toast show" + (isError ? " err" : "");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.className = "toast"; }, 3200);
+  }
+
+  async function send(account, command) {
+    try {
+      const res = await fetch(api(`/api/accounts/${encodeURIComponent(account)}/command`), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(command),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(body.error || `Failed (HTTP ${res.status})`, true);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      toast("The miner is unreachable", true);
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Formatting
+  //
+  // Nothing here invents a number. Minutes always come from the snapshot,
+  // which only ever carries figures Twitch confirmed. The only thing counted
+  // locally is time until a deadline, which is a clock, not progress.
+  // ---------------------------------------------------------------------
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
-  function relative(seconds) {
+  function ago(seconds) {
     if (seconds === null || seconds === undefined) return "never";
     if (seconds < 60) return `${seconds}s ago`;
     const m = Math.floor(seconds / 60);
     if (m < 60) return `${m}m ago`;
-    return `${Math.floor(m / 60)}h ${m % 60}m ago`;
+    const h = Math.floor(m / 60);
+    return h < 48 ? `${h}h ${m % 60}m ago` : `${Math.floor(h / 24)}d ago`;
   }
 
-  function untilText(iso) {
+  function until(iso) {
     const ms = new Date(iso).getTime() - Date.now();
-    if (ms <= 0) return "expired";
+    if (ms <= 0) return "ended";
     const mins = Math.floor(ms / 60000);
     if (mins < 60) return `${mins}m left`;
     const hrs = Math.floor(mins / 60);
-    if (hrs < 48) return `${hrs}h left`;
+    if (hrs < 48) return `${hrs}h ${mins % 60}m left`;
     return `${Math.floor(hrs / 24)}d left`;
   }
 
-  function watchingPanel(w) {
-    const panel = el("div", "panel");
+  function hours(mins) {
+    if (mins === null || mins === undefined) return "—";
+    const neg = mins < 0;
+    const m = Math.abs(mins);
+    const text = m < 60 ? `${m}m` : m < 1440 ? `${Math.floor(m / 60)}h ${m % 60}m`
+                                             : `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`;
+    return neg ? `−${text}` : text;
+  }
+
+  function bar(percent, done) {
+    const b = el("div", "bar" + (done ? " done" : ""));
+    const fill = el("i");
+    fill.style.width = Math.max(0, Math.min(100, percent || 0)) + "%";
+    b.append(fill);
+    return b;
+  }
+
+  function image(url, cls, alt) {
+    if (!url) {
+      const ph = el("div", cls + " noimg");
+      return ph;
+    }
+    const img = el("img", cls);
+    img.src = url;
+    img.alt = alt || "";
+    img.loading = "lazy";
+    // A missing picture must never look like a broken page.
+    img.onerror = () => { img.replaceWith(el("div", cls + " noimg")); };
+    return img;
+  }
+
+  const twitchUrl = (login) => "https://twitch.tv/" + encodeURIComponent(login);
+
+  // ---------------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------------
+  function snap() {
+    if (state.current && state.snapshots.has(state.current)) {
+      return state.snapshots.get(state.current);
+    }
+    return state.snapshots.values().next().value || null;
+  }
+
+  function renderAccountPicker() {
+    const host = $("#account-picker");
+    host.textContent = "";
+    const names = [...state.snapshots.keys()];
+    if (names.length <= 1) return;
+
+    const sel = el("select");
+    names.forEach((n) => {
+      const o = el("option", null, n);
+      o.value = n;
+      if (n === (state.current || names[0])) o.selected = true;
+      sel.append(o);
+    });
+    sel.onchange = () => { state.current = sel.value; render(); };
+    host.append(sel);
+  }
+
+  function connection() {
+    $("#conn-dot").className = "dot " + (state.connected ? "live" : "down");
+    $("#conn-text").textContent = state.connected ? "live" : "reconnecting…";
+  }
+
+  function heroPanel(s) {
+    const panel = el("div", "panel pad");
+    const w = s.watching;
+
+    if (s.paused) {
+      panel.append(el("div", "headline", "Paused"));
+      panel.append(el("div", "sub", "Mining is stopped. Campaigns are still tracked so nothing expires unnoticed."));
+      return panel;
+    }
     if (!w) {
       panel.append(el("div", "headline", "Idle"));
-      panel.append(el("div", "sub", "No channel is currently being watched."));
+      const why = s.eligible.length
+        ? "No live channel can progress any of your campaigns right now."
+        : "No campaign is currently mineable.";
+      panel.append(el("div", "sub", why));
+      if (s.health.recovery_step) {
+        panel.append(el("div", "reason", "Recovering: " + s.health.recovery_step));
+      }
       return panel;
     }
 
-    const head = el("div");
-    head.append(el("span", "headline", w.channel_display_name || w.channel_login));
-    head.append(document.createTextNode(" "));
-    head.append(el("span", "pill " + (w.stalled ? "bad" : "ok"),
-                   w.stalled ? "STALLED" : "mining"));
+    const head = el("div", "row");
+    const link = el("a", "headline", w.channel_display_name || w.channel_login);
+    link.href = twitchUrl(w.channel_login);
+    link.target = "_blank";
+    link.rel = "noreferrer noopener";
+    head.append(link);
+    head.append(el("span", "pill " + (w.stalled ? "bad" : "ok"), w.stalled ? "STALLED" : "mining"));
+    if (w.campaigns.length > 1) {
+      head.append(el("span", "pill accent", `${w.campaigns.length} campaigns at once`));
+    }
     panel.append(head);
-    panel.append(el("div", "sub", w.campaign));
+
+    if (w.stream_title) {
+      const t = el("div", "sub");
+      t.textContent = w.stream_title;
+      t.style.marginTop = "2px";
+      panel.append(t);
+    }
+    panel.append(el("div", "sub", w.campaigns.join(" · ")));
 
     const line = el("div", "confirm");
     if (w.current_minutes === null || w.current_minutes === undefined) {
@@ -147,147 +451,683 @@
     }
     panel.append(line);
 
+    if (w.required_minutes) {
+      panel.append(bar((w.current_minutes / w.required_minutes) * 100,
+                       w.current_minutes >= w.required_minutes));
+    }
+
     const since = el("div", "sub");
-    const stamp = el("span", w.stalled ? "stale" : "", relative(w.seconds_since_confirmation));
+    since.style.marginTop = "8px";
     since.append(document.createTextNode("Last confirmed by Twitch: "));
-    since.append(stamp);
+    since.append(el("span", w.stalled ? "stale" : "", ago(w.seconds_since_confirmation)));
     panel.append(since);
 
-    if (w.required_minutes) {
-      const bar = el("div", "bar");
-      const fill = el("i");
-      fill.style.width = Math.min(100, (w.current_minutes / w.required_minutes) * 100) + "%";
-      bar.append(fill);
-      panel.append(bar);
+    if (w.reason) panel.append(el("div", "reason", w.reason));
+    if (s.health.recovery_step) {
+      panel.append(el("div", "banner warn", "Recovering: " + s.health.recovery_step));
     }
     return panel;
   }
 
-  function campaignTable(list) {
-    const wrap = el("div", "panel scroll");
-    if (!list.length) {
-      wrap.append(el("div", "empty", "No mineable campaigns."));
-      return wrap;
-    }
-    const table = el("table");
-    const thead = el("thead");
-    const hr = el("tr");
-    ["Campaign", "Game", "Remaining", "Slack", "Ends"].forEach((h) => {
-      hr.append(el("th", null, h));
+  function controlsPanel(s) {
+    const panel = el("div", "panel pad");
+    const acct = s.account;
+
+    // Strategy
+    const f1 = el("div", "field");
+    f1.append(el("label", null, "Strategy"));
+    const sel = el("select");
+    s.strategies.forEach((st) => {
+      const o = el("option", null, st.name);
+      o.value = st.name;
+      if (st.selected) o.selected = true;
+      sel.append(o);
     });
+    sel.onchange = async () => {
+      if (await send(acct, { command: "set_strategy", name: sel.value })) {
+        toast("Strategy set to " + sel.value);
+      }
+    };
+    f1.append(sel);
+    const chosen = s.strategies.find((x) => x.selected);
+    f1.append(el("div", "hint", chosen ? chosen.description : ""));
+    panel.append(f1);
+
+    // Buttons
+    const acts = el("div", "row");
+    const pause = el("button", s.paused ? "primary" : "", s.paused ? "Resume mining" : "Pause mining");
+    pause.onclick = async () => {
+      await send(acct, { command: s.paused ? "resume" : "pause" });
+    };
+    acts.append(pause);
+
+    const sw = el("button", null, "Switch channel");
+    sw.disabled = !s.watching;
+    sw.onclick = () => send(acct, { command: "switch_channel" });
+    acts.append(sw);
+
+    const sync = el("button", null, "Refresh campaigns");
+    sync.onclick = async () => {
+      if (await send(acct, { command: "sync_now" })) toast("Refreshing campaigns…");
+    };
+    acts.append(sync);
+
+    const penalties = s.health.quarantined_channels.length + s.health.quarantined_campaigns.length;
+    if (penalties) {
+      const clear = el("button", null, `Clear ${plural(penalties, "penalty")}`.replace("penaltys", "penalties"));
+      clear.onclick = () => send(acct, { command: "clear_quarantine" });
+      acts.append(clear);
+    }
+    panel.append(acts);
+
+    // Pin
+    const f2 = el("div", "field");
+    f2.style.marginTop = "16px";
+    f2.style.marginBottom = "0";
+    f2.append(el("label", null, "Pinned channel"));
+    const pinRow = el("div", "row");
+    const pin = el("input");
+    pin.type = "text";
+    pin.placeholder = "channel login";
+    pin.value = s.settings.pinned || "";
+    pin.style.flex = "1 1 140px";
+    const savePin = el("button", null, "Pin");
+    savePin.onclick = () => send(acct, { command: "pin", channel: pin.value.trim() || null });
+    pinRow.append(pin, savePin);
+    if (s.settings.pinned) {
+      const clear = el("button", "tiny", "Clear");
+      clear.onclick = () => send(acct, { command: "pin", channel: null });
+      pinRow.append(clear);
+    }
+    f2.append(pinRow);
+    f2.append(el("div", "hint", "Used by the manual strategy; ignored by the others."));
+    panel.append(f2);
+
+    return panel;
+  }
+
+  function statsStrip(s) {
+    const t = s.totals;
+    const box = el("div", "stats");
+    const add = (value, label) => {
+      const d = el("div", "stat");
+      d.append(el("b", null, value));
+      d.append(el("span", null, label));
+      box.append(d);
+    };
+    add(`${t.campaigns_eligible}/${t.campaigns_known}`, "campaigns mineable");
+    add(t.drops_claimed, "drops claimed");
+    add(t.drops_remaining, "drops remaining");
+    add(hours(t.minutes_remaining), "watching left");
+    add(t.campaigns_at_risk, "at risk");
+    add(s.live.length, "channels live now");
+    return box;
+  }
+
+  function matches(text) {
+    if (!state.filter) return true;
+    return (text || "").toLowerCase().includes(state.filter);
+  }
+
+  function campaignCard(s, c) {
+    const card = el("div", "panel camp" +
+      (c.is_current ? " current" : "") + (c.excluded ? " excluded" : ""));
+
+    const head = el("header");
+    head.append(image(c.box_art_url, "art", c.game));
+
+    const info = el("div");
+    info.style.minWidth = "0";
+    info.append(el("h3", null, c.name || "(unnamed campaign)"));
+    info.append(el("div", "meta", c.game));
+
+    const tags = el("div", "row");
+    tags.style.marginTop = "6px";
+    tags.style.gap = "5px";
+    if (c.is_current) tags.append(el("span", "pill accent", "mining now"));
+    if (c.excluded) tags.append(el("span", "pill", "excluded"));
+    else if (c.slack_minutes < 0) tags.append(el("span", "pill bad", "cannot finish"));
+    else if (c.at_risk) tags.append(el("span", "pill warn", "at risk"));
+    tags.append(el("span", "pill", until(c.ends_at)));
+    tags.append(el("span", "pill", hours(c.remaining_minutes) + " to go"));
+    if (c.live_channels) tags.append(el("span", "pill", plural(c.live_channels, "channel") + " live"));
+    else tags.append(el("span", "pill", "nobody live"));
+    if (c.allowed_channels.length) {
+      tags.append(el("span", "pill", `only ${plural(c.allowed_channels.length, "channel")}`));
+    }
+    info.append(tags);
+    head.append(info);
+
+    const acts = el("div", "acts");
+    const ex = el("button", "tiny", c.excluded ? "Include" : "Exclude");
+    ex.title = c.excluded ? "Mine this campaign again" : "Never mine this campaign";
+    ex.onclick = () => send(s.account, {
+      command: "set_campaign_excluded", campaign: c.id, excluded: !c.excluded,
+    });
+    acts.append(ex);
+    head.append(acts);
+    card.append(head);
+
+    if (c.drops.length) {
+      const list = el("div", "drops");
+      c.drops.forEach((d) => list.append(dropRow(d)));
+      card.append(list);
+    }
+    return card;
+  }
+
+  function dropRow(d) {
+    const row = el("div", "drop" + (d.is_claimed ? " claimed" : "") + (d.locked ? " locked" : ""));
+    const art = d.benefits.find((b) => b.image_url);
+    row.append(image(art ? art.image_url : null, "", d.name));
+
+    const body = el("div", "body");
+    const name = el("div", "name");
+    name.append(document.createTextNode(d.name || "(unnamed drop)"));
+    if (d.active) {
+      const p = el("span", "pill accent", "earning");
+      p.style.marginLeft = "6px";
+      name.append(p);
+    }
+    body.append(name);
+
+    if (d.benefits.length) {
+      body.append(el("div", "benefits", d.benefits.map((b) => b.name).join(", ")));
+    }
+    if (!d.is_claimed) body.append(bar(d.percent, d.percent >= 100));
+    row.append(body);
+
+    const mins = el("div", "mins");
+    if (d.is_claimed) mins.append(el("span", "pill ok", "claimed"));
+    else if (d.claimable) mins.append(el("span", "pill ok", "claiming"));
+    else if (d.locked) mins.append(el("span", "pill", "locked"));
+    else mins.textContent = `${d.current_minutes}/${d.required_minutes}m`;
+    row.append(mins);
+
+    return row;
+  }
+
+  function campaignsTab(s) {
+    const box = el("div");
+    const list = s.eligible.filter((c) => matches(c.name) || matches(c.game));
+    if (!list.length) {
+      const p = el("div", "panel pad");
+      p.style.marginTop = "16px";
+      p.append(el("div", "empty",
+        state.filter ? "Nothing matches that search." : "No mineable campaigns."));
+      box.append(p);
+      return box;
+    }
+
+    // Sort: what is being mined, then risk, then soonest deadline.
+    list.sort((a, b) =>
+      (b.is_current - a.is_current) ||
+      (a.excluded - b.excluded) ||
+      (b.at_risk - a.at_risk) ||
+      (new Date(a.ends_at) - new Date(b.ends_at)));
+
+    const cards = el("div", "cards");
+    list.forEach((c) => cards.append(campaignCard(s, c)));
+    box.append(cards);
+    return box;
+  }
+
+  function liveTab(s) {
+    const box = el("div");
+    const list = s.live.filter((c) => matches(c.display_name) || matches(c.game));
+    if (!list.length) {
+      const p = el("div", "panel pad");
+      p.append(el("div", "empty",
+        "No live channel is currently confirmed to progress your drops."));
+      box.append(p);
+      return box;
+    }
+
+    const panel = el("div", "panel scroll");
+    panel.style.marginTop = "16px";
+    const table = el("table");
+    const thead = el("thead"), hr = el("tr");
+    ["Channel", "Viewers", "Would advance", "", ""].forEach((h) => hr.append(el("th", null, h)));
     thead.append(hr);
     table.append(thead);
 
     const tbody = el("tbody");
+    list.sort((a, b) => (b.is_current - a.is_current) || (b.drops - a.drops) || (b.viewers - a.viewers));
     list.forEach((c) => {
       const tr = el("tr");
-      const name = el("td");
-      name.append(document.createTextNode(c.name || "(unnamed)"));
-      if (c.at_risk) {
-        name.append(document.createTextNode(" "));
-        name.append(el("span", "pill warn", c.slack_minutes < 0 ? "impossible" : "at risk"));
+
+      const nameCell = el("td");
+      const a = el("a", null, c.display_name);
+      a.href = twitchUrl(c.login);
+      a.target = "_blank";
+      a.rel = "noreferrer noopener";
+      a.style.color = "inherit";
+      nameCell.append(a);
+      if (c.is_current) {
+        const p = el("span", "pill accent", "watching");
+        p.style.marginLeft = "7px";
+        nameCell.append(p);
       }
-      tr.append(name);
-      tr.append(el("td", null, c.game));
-      tr.append(el("td", "num", `${c.remaining_minutes} min`));
-      tr.append(el("td", "num", `${c.slack_minutes} min`));
-      tr.append(el("td", "num", untilText(c.ends_at)));
+      if (c.title) {
+        const sub = el("div", "sub", c.title);
+        sub.style.fontSize = ".78rem";
+        sub.style.maxWidth = "34ch";
+        sub.style.overflow = "hidden";
+        sub.style.textOverflow = "ellipsis";
+        sub.style.whiteSpace = "nowrap";
+        nameCell.append(sub);
+      }
+      tr.append(nameCell);
+
+      tr.append(el("td", "num", c.viewers.toLocaleString()));
+
+      const what = el("td");
+      what.append(document.createTextNode(
+        `${plural(c.campaigns.length, "campaign")}, ${plural(c.drops, "drop")}`));
+      const names = el("div", "sub", c.campaigns.join(", "));
+      names.style.fontSize = ".78rem";
+      what.append(names);
+      tr.append(what);
+
+      const favCell = el("td");
+      const fav = el("button", "tiny icon" + (c.is_favourite ? " on" : ""), c.is_favourite ? "★" : "☆");
+      fav.title = c.is_favourite ? "Remove from favourites" : "Prefer this channel";
+      fav.onclick = () => send(s.account, {
+        command: "set_favourite", login: c.login, on: !c.is_favourite,
+      });
+      favCell.append(fav);
+      tr.append(favCell);
+
+      const actCell = el("td");
+      const watch = el("button", "tiny", "Watch");
+      watch.disabled = c.is_current;
+      watch.onclick = async () => {
+        if (await send(s.account, { command: "watch_channel", login: c.login })) {
+          toast("Switching to " + c.display_name);
+        }
+      };
+      actCell.append(watch);
+      tr.append(actCell);
+
       tbody.append(tr);
     });
     table.append(tbody);
-    wrap.append(table);
-    return wrap;
+    panel.append(table);
+    box.append(panel);
+    return box;
   }
 
-  function rejectedPanel(list) {
-    const details = el("details");
-    details.append(el("summary", null,
-      `${plural(list.length, "campaign")} unavailable — reasons`));
-    const wrap = el("div", "panel scroll");
-    const table = el("table");
-    const tbody = el("tbody");
-    list.forEach((r) => {
-      const tr = el("tr");
-      tr.append(el("td", null, r.name || "(unnamed)"));
-      tr.append(el("td", null, r.game));
-      tr.append(el("td", null, r.reason));
-      tbody.append(tr);
-    });
-    table.append(tbody);
-    wrap.append(table);
-    details.append(wrap);
-    return details;
-  }
-
-  function renderAccount(s) {
-    const box = el("section");
-    const h = el("h2", null,
-      `${s.account}${s.login ? " · " + s.login : ""} · ${s.strategy} · ${s.state}`);
-    box.append(h);
-    box.append(watchingPanel(s.watching));
-
-    const t = s.totals || {};
-    box.append(el("div", "sub",
-      `${t.campaigns_eligible ?? 0} of ${t.campaigns_known ?? 0} campaigns mineable · ` +
-      `${t.drops_claimed ?? 0} claimed · ${t.drops_remaining ?? 0} remaining`));
-
-    const atRisk = (s.eligible || []).filter((c) => c.at_risk);
-    if (atRisk.length) {
-      box.append(el("h2", null, "At risk"));
-      box.append(campaignTable(atRisk));
+  function unavailableTab(s) {
+    const box = el("div");
+    const list = s.rejected.filter((r) => matches(r.name) || matches(r.game) || matches(r.reason));
+    if (!list.length) {
+      const p = el("div", "panel pad");
+      p.append(el("div", "empty", "Nothing is being skipped."));
+      box.append(p);
+      return box;
     }
 
-    box.append(el("h2", null, "Mineable campaigns"));
-    box.append(campaignTable(s.eligible || []));
+    const groups = new Map();
+    list.forEach((r) => {
+      if (!groups.has(r.reason)) groups.set(r.reason, { explanation: r.explanation, items: [] });
+      groups.get(r.reason).items.push(r);
+    });
 
-    if ((s.rejected || []).length) {
-      box.append(el("h2", null, "Unavailable"));
-      box.append(rejectedPanel(s.rejected));
+    [...groups.entries()]
+      .sort((a, b) => b[1].items.length - a[1].items.length)
+      .forEach(([reason, group]) => {
+        const h = el("h2");
+        h.append(document.createTextNode(reason));
+        h.append(el("span", "count", `${group.items.length}`));
+        box.append(h);
+        box.append(el("div", "sub", group.explanation));
+
+        const panel = el("div", "panel scroll");
+        panel.style.marginTop = "10px";
+        const table = el("table"), tbody = el("tbody");
+        group.items
+          .sort((a, b) => (a.game || "").localeCompare(b.game || ""))
+          .forEach((r) => {
+            const tr = el("tr");
+            tr.append(el("td", null, r.name || "(unnamed)"));
+            tr.append(el("td", "sub", r.game));
+            const act = el("td");
+            act.style.textAlign = "right";
+            if (reason !== "excluded") {
+              const ex = el("button", "tiny", "Hide");
+              ex.title = "Never consider this campaign again";
+              ex.onclick = () => send(s.account, {
+                command: "set_campaign_excluded", campaign: r.id, excluded: true,
+              });
+              act.append(ex);
+            } else {
+              const inc = el("button", "tiny", "Un-hide");
+              inc.onclick = () => send(s.account, {
+                command: "set_campaign_excluded", campaign: r.id, excluded: false,
+              });
+              act.append(inc);
+            }
+            tr.append(act);
+            tbody.append(tr);
+          });
+        table.append(tbody);
+        panel.append(table);
+        box.append(panel);
+      });
+    return box;
+  }
+
+  function settingsTab(s) {
+    const box = el("div");
+    const acct = s.account;
+
+    // Priority games
+    const p1 = el("div", "panel pad");
+    p1.style.marginTop = "16px";
+    p1.append(el("h2", null, "Priority games"));
+    p1.append(el("div", "sub",
+      "Used by the priority strategy, top to bottom. Anything not listed is never mined under it."));
+    const chips = el("div", "chips");
+    chips.style.margin = "12px 0";
+    if (!s.settings.priority_games.length) chips.append(el("span", "faint", "Nothing listed yet."));
+    s.settings.priority_games.forEach((g, i) => {
+      const chip = el("div", "chip");
+      chip.append(document.createTextNode(`${i + 1}. ${g}`));
+      const x = el("button", null, "×");
+      x.title = "Remove";
+      x.onclick = () => {
+        const next = s.settings.priority_games.filter((v) => v !== g);
+        send(acct, { command: "set_priority_games", games: next });
+      };
+      chip.append(x);
+      chips.append(chip);
+    });
+    p1.append(chips);
+
+    const addRow = el("div", "row");
+    const gameInput = el("input");
+    gameInput.type = "text";
+    gameInput.placeholder = "Game name, exactly as Twitch spells it";
+    gameInput.style.flex = "1 1 220px";
+    const addBtn = el("button", null, "Add");
+    const doAdd = () => {
+      const v = gameInput.value.trim();
+      if (!v) return;
+      send(acct, { command: "set_priority_games", games: [...s.settings.priority_games, v] });
+      gameInput.value = "";
+    };
+    addBtn.onclick = doAdd;
+    gameInput.onkeydown = (e) => { if (e.key === "Enter") doAdd(); };
+    addRow.append(gameInput, addBtn);
+    p1.append(addRow);
+    box.append(p1);
+
+    // Favourites
+    const p2 = el("div", "panel pad");
+    p2.style.marginTop = "16px";
+    p2.append(el("h2", null, "Favourite channels"));
+    p2.append(el("div", "sub",
+      "Preferred when the choice is otherwise close, under every strategy. Never overrides a real deadline."));
+    const favChips = el("div", "chips");
+    favChips.style.marginTop = "12px";
+    if (!s.settings.favourites.length) favChips.append(el("span", "faint", "None yet — star a channel on the Live now tab."));
+    s.settings.favourites.forEach((f) => {
+      const chip = el("div", "chip");
+      chip.append(document.createTextNode(f));
+      const x = el("button", null, "×");
+      x.onclick = () => send(acct, { command: "set_favourite", login: f, on: false });
+      chip.append(x);
+      favChips.append(chip);
+    });
+    p2.append(favChips);
+    box.append(p2);
+
+    // Excluded games
+    const p3 = el("div", "panel pad");
+    p3.style.marginTop = "16px";
+    p3.append(el("h2", null, "Excluded games"));
+    p3.append(el("div", "sub", "Every campaign for these games is skipped."));
+    const exChips = el("div", "chips");
+    exChips.style.margin = "12px 0";
+    if (!s.settings.excluded_games.length) exChips.append(el("span", "faint", "None."));
+    s.settings.excluded_games.forEach((g) => {
+      const chip = el("div", "chip");
+      chip.append(document.createTextNode(g));
+      const x = el("button", null, "×");
+      x.onclick = () => send(acct, { command: "set_game_excluded", game: g, excluded: false });
+      chip.append(x);
+      exChips.append(chip);
+    });
+    p3.append(exChips);
+
+    const exRow = el("div", "row");
+    const exInput = el("input");
+    exInput.type = "text";
+    exInput.placeholder = "Game name";
+    exInput.style.flex = "1 1 220px";
+    const exBtn = el("button", null, "Exclude");
+    const doExclude = () => {
+      const v = exInput.value.trim();
+      if (!v) return;
+      send(acct, { command: "set_game_excluded", game: v, excluded: true });
+      exInput.value = "";
+    };
+    exBtn.onclick = doExclude;
+    exInput.onkeydown = (e) => { if (e.key === "Enter") doExclude(); };
+    exRow.append(exInput, exBtn);
+    p3.append(exRow);
+    box.append(p3);
+
+    // Diagnostics
+    const p4 = el("div", "panel pad");
+    p4.style.marginTop = "16px";
+    p4.append(el("h2", null, "Status"));
+    const dl = el("div", "sub");
+    const lines = [
+      `Account: ${s.account}${s.login ? " (" + s.login + ")" : ""}`,
+      `State: ${s.state}`,
+      `Watchdog: ${s.health.verdict}`,
+      s.health.last_sync
+        ? `Campaigns refreshed ${ago(Math.round((Date.now() - new Date(s.health.last_sync)) / 1000))}` +
+          (s.health.next_sync_in_seconds != null ? `, next in ${Math.round(s.health.next_sync_in_seconds / 60)}m` : "")
+        : "Campaigns have not been refreshed yet",
+    ];
+    lines.forEach((t) => dl.append(el("div", null, t)));
+    p4.append(dl);
+
+    if (s.health.quarantined_channels.length || s.health.quarantined_campaigns.length) {
+      p4.append(el("h2", null, "Resting after failure"));
+      const ul = el("div", "sub");
+      s.health.quarantined_channels.forEach((q) =>
+        ul.append(el("div", null, `Channel ${q.name} — until ${new Date(q.until).toLocaleTimeString()}`)));
+      s.health.quarantined_campaigns.forEach((q) =>
+        ul.append(el("div", null, `Campaign ${q.name} — until ${new Date(q.until).toLocaleTimeString()}`)));
+      p4.append(ul);
+    }
+    box.append(p4);
+
+    return box;
+  }
+
+  function logTab() {
+    const panel = el("div", "panel");
+    panel.style.marginTop = "16px";
+    panel.id = "log";
+    if (!state.log.length) {
+      const e = el("div", "empty");
+      e.style.padding = "14px";
+      e.textContent = "Nothing has happened yet.";
+      panel.append(e);
+      return panel;
+    }
+    state.log.forEach((item) => {
+      const line = el("div", "line");
+      line.append(el("time", null, new Date(item.at).toLocaleTimeString()));
+      if (state.snapshots.size > 1) line.append(el("span", "who", item.account));
+      line.append(el("span", "sev-" + (item.severity || "info"), item.summary));
+      panel.append(line);
+    });
+    return panel;
+  }
+
+  function banners(s) {
+    const box = el("div");
+    if (s.watching && s.watching.stalled) {
+      box.append(el("div", "banner bad",
+        "Twitch has not confirmed progress recently. The miner is working its recovery ladder — " +
+        "if this persists, check that spade.twitch.tv is not blocked by an adblocker or DNS filter."));
+    }
+    const impossible = s.eligible.filter((c) => c.slack_minutes < 0 && !c.excluded).length;
+    if (impossible) {
+      box.append(el("div", "banner warn",
+        `${plural(impossible, "campaign")} can no longer be finished before the deadline and will not be mined.`));
     }
     return box;
   }
 
-  async function refresh() {
+  function render() {
+    connection();
+    renderAccountPicker();
+
+    const s = snap();
+    const app = $("#app");
+    if (!s) {
+      app.textContent = "";
+      const p = el("div", "panel pad");
+      p.style.marginTop = "20px";
+      p.append(el("div", "empty", "No account has reported yet."));
+      app.append(p);
+      return;
+    }
+    state.current = s.account;
+
+    // Preserve the search box's focus and caret across re-renders, or typing
+    // while the miner publishes a snapshot would lose a character.
+    const oldSearch = $("#search");
+    const hadFocus = oldSearch && document.activeElement === oldSearch;
+    const caret = oldSearch ? oldSearch.selectionStart : null;
+    const scrolled = window.scrollY;
+
+    app.textContent = "";
+    app.append(banners(s));
+
+    const hero = el("div", "hero");
+    hero.append(heroPanel(s));
+    hero.append(controlsPanel(s));
+    app.append(hero);
+
+    const stats = statsStrip(s);
+    stats.style.marginTop = "16px";
+    app.append(stats);
+
+    // Tabs
+    const tabs = el("div", "tabs");
+    const defs = [
+      ["campaigns", "Campaigns", s.eligible.length],
+      ["live", "Live now", s.live.length],
+      ["unavailable", "Unavailable", s.rejected.length],
+      ["settings", "Settings", null],
+      ["log", "Activity", null],
+    ];
+    defs.forEach(([id, label, count]) => {
+      const b = el("button", null, label);
+      b.setAttribute("aria-selected", String(state.tab === id));
+      if (count !== null && count !== undefined) {
+        b.append(el("span", "badge", String(count)));
+      }
+      b.onclick = () => { state.tab = id; render(); };
+      tabs.append(b);
+    });
+    app.append(tabs);
+
+    if (state.tab === "campaigns" || state.tab === "live" || state.tab === "unavailable") {
+      const searchRow = el("div", "row");
+      searchRow.style.marginTop = "14px";
+      const search = el("input");
+      search.id = "search";
+      search.type = "search";
+      search.placeholder = "Filter by campaign, game or channel…";
+      search.value = state.filter;
+      search.style.flex = "1 1 260px";
+      search.oninput = () => { state.filter = search.value.trim().toLowerCase(); render(); };
+      searchRow.append(search);
+      app.append(searchRow);
+    }
+
+    if (state.tab === "campaigns") app.append(campaignsTab(s));
+    else if (state.tab === "live") app.append(liveTab(s));
+    else if (state.tab === "unavailable") app.append(unavailableTab(s));
+    else if (state.tab === "settings") app.append(settingsTab(s));
+    else app.append(logTab());
+
+    const newSearch = $("#search");
+    if (hadFocus && newSearch) {
+      newSearch.focus();
+      if (caret !== null) newSearch.setSelectionRange(caret, caret);
+    }
+    window.scrollTo(0, scrolled);
+  }
+
+  // ---------------------------------------------------------------------
+  // Live stream
+  // ---------------------------------------------------------------------
+  let source = null;
+  function connect() {
+    if (source) source.close();
+    source = new EventSource(api("/api/events"));
+
+    source.addEventListener("snapshot", (msg) => {
+      try {
+        const s = JSON.parse(msg.data);
+        state.snapshots.set(s.account, s);
+        state.connected = true;
+        render();
+      } catch (e) { /* a malformed frame must not kill the page */ }
+    });
+
+    source.addEventListener("log", (msg) => {
+      try {
+        const item = JSON.parse(msg.data);
+        // Heartbeats and per-campaign rejections would drown everything else.
+        if (item.severity === "debug") return;
+        state.log.unshift(item);
+        if (state.log.length > 400) state.log.length = 400;
+        if (state.tab === "log") render();
+      } catch (e) { /* ignore */ }
+    });
+
+    source.onopen = () => { state.connected = true; connection(); };
+    source.onerror = () => { state.connected = false; connection(); };
+  }
+
+  // A slow backstop only, in case the stream dies without firing onerror.
+  async function poll() {
     try {
       const res = await fetch(api("/api/snapshots"));
-      if (!res.ok) throw new Error("HTTP " + res.status);
+      if (!res.ok) return;
       const list = await res.json();
-      const host = $("#accounts");
-      host.textContent = "";
-      if (!list.length) {
-        const p = el("div", "panel");
-        p.append(el("div", "empty", "No account has reported yet."));
-        host.append(p);
-      } else {
-        list.forEach((s) => host.append(renderAccount(s)));
-      }
-      $("#conn").textContent = "live";
-    } catch (e) {
-      $("#conn").textContent = "disconnected — retrying";
-    }
+      list.forEach((s) => state.snapshots.set(s.account, s));
+      if (list.length) { state.connected = true; render(); }
+    } catch (e) { state.connected = false; connection(); }
   }
 
-  function startEvents() {
-    const src = new EventSource(api("/api/events"));
-    const log = $("#log");
-    src.onmessage = (msg) => {
-      let data;
-      try { data = JSON.parse(msg.data); } catch { return; }
-      if (log.firstChild && log.firstChild.className === "empty") log.textContent = "";
-      const row = el("div");
-      row.append(el("time", null, new Date(data.at).toLocaleTimeString()));
-      row.append(document.createTextNode(`[${data.account}] ${data.kind}`));
-      log.prepend(row);
-      while (log.childNodes.length > 300) log.removeChild(log.lastChild);
-      refresh();
-    };
-    src.onerror = () => { $("#conn").textContent = "reconnecting…"; };
-  }
+  // Theme
+  const saved = localStorage.getItem("btdm-theme");
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+  $("#theme").onclick = () => {
+    const root = document.documentElement;
+    const now = root.getAttribute("data-theme");
+    const next = now === "dark" ? "light" : now === "light" ? "" : "dark";
+    if (next) { root.setAttribute("data-theme", next); localStorage.setItem("btdm-theme", next); }
+    else { root.removeAttribute("data-theme"); localStorage.removeItem("btdm-theme"); }
+  };
 
-  refresh();
-  startEvents();
-  // Poll as a backstop, exactly as the miner does with Twitch.
-  setInterval(refresh, 15000);
+  poll();
+  connect();
+  setInterval(poll, 60000);
+  // Deadline countdowns are wall-clock, so refresh them even when nothing
+  // changes. This never touches a progress figure.
+  setInterval(() => { if (state.tab === "campaigns") render(); }, 30000);
 })();
 </script>
 </body>

@@ -28,6 +28,9 @@ pub struct Game {
     pub name: String,
     /// URL slug, needed to query the game's channel directory.
     pub slug: String,
+    /// Box art, when Twitch supplied one. Display only.
+    #[serde(default)]
+    pub box_art_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +66,10 @@ pub struct Benefit {
     pub id: String,
     pub name: String,
     pub kind: BenefitKind,
+    /// Artwork for the reward. Display only — a missing image never affects
+    /// whether a drop is mineable.
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +155,7 @@ mod tests {
                 id: GameId("g1".into()),
                 name: "Game".into(),
                 slug: "game".into(),
+                box_art_url: None,
             },
             starts_at: at(10),
             ends_at: at(20),
@@ -197,6 +205,7 @@ mod tests {
             id: "b1".into(),
             name: "Shiny Badge".into(),
             kind: BenefitKind::Badge,
+            image_url: None,
         });
         assert!(c.has_badge_or_emote());
     }

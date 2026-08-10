@@ -50,6 +50,14 @@ pub struct AccountConfig {
     pub favourite_channels: Vec<String>,
     /// Channel login to watch exclusively, under the `manual` strategy.
     pub pinned_channel: Option<String>,
+    /// Campaign ids never to mine.
+    pub excluded_campaigns: Vec<String>,
+    /// Game names never to mine.
+    pub excluded_games: Vec<String>,
+    /// Start paused. Set by the dashboard's pause button so the state survives
+    /// a restart — a miner that silently resumed on reboot would be mining
+    /// against the user's stated wish.
+    pub paused: bool,
 }
 
 impl Default for AccountConfig {
@@ -60,7 +68,24 @@ impl Default for AccountConfig {
             priority_games: Vec::new(),
             favourite_channels: Vec::new(),
             pinned_channel: None,
+            excluded_campaigns: Vec::new(),
+            excluded_games: Vec::new(),
+            paused: false,
         }
+    }
+}
+
+impl AccountConfig {
+    /// Folds runtime changes back in, so a setting changed on the dashboard
+    /// survives a restart.
+    pub fn apply(&mut self, s: &btdm_core::control::PersistedSettings) {
+        self.strategy = s.strategy.clone();
+        self.priority_games = s.priority_games.clone();
+        self.favourite_channels = s.favourite_channels.clone();
+        self.pinned_channel = s.pinned_channel.clone();
+        self.excluded_campaigns = s.excluded_campaigns.clone();
+        self.excluded_games = s.excluded_games.clone();
+        self.paused = s.paused;
     }
 }
 
@@ -114,6 +139,53 @@ impl Config {
     }
 }
 
+/// Serialises writes to `config.toml`.
+///
+/// Every account runs in its own task and any of them can change a setting
+/// from the dashboard. Each save is a read-modify-write of the whole file, so
+/// without a lock two accounts saving at once would silently discard one of
+/// the changes.
+#[derive(Clone)]
+pub struct ConfigStore {
+    path: PathBuf,
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl ConfigStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Writes one account's settings back, leaving every other account and
+    /// every unrelated key untouched.
+    pub async fn save_account(
+        &self,
+        account: &str,
+        settings: &btdm_core::control::PersistedSettings,
+    ) -> Result<(), ConfigError> {
+        let _guard = self.lock.lock().await;
+
+        // Re-read rather than mutating an in-memory copy: another account may
+        // have saved since this one started.
+        let mut cfg = Config::load(&self.path)?;
+        match cfg.accounts.iter_mut().find(|a| a.name == account) {
+            Some(existing) => existing.apply(settings),
+            None => {
+                let mut fresh = AccountConfig {
+                    name: account.to_owned(),
+                    ..AccountConfig::default()
+                };
+                fresh.apply(settings);
+                cfg.accounts.push(fresh);
+            }
+        }
+        cfg.save_atomic(&self.path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,7 +210,7 @@ mod tests {
                 strategy: "coverage".into(),
                 priority_games: vec!["Deadlock".into()],
                 favourite_channels: vec!["somestreamer".into()],
-                pinned_channel: None,
+                ..AccountConfig::default()
             }],
         };
         cfg.save_atomic(&path).unwrap();
@@ -226,5 +298,107 @@ priority_games = ["Deadlock"]
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.account("main").strategy, "deadline");
         assert_eq!(cfg.account("main").priority_games, vec!["Deadlock"]);
+        assert!(!cfg.account("main").paused);
+        assert!(cfg.account("main").excluded_games.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use btdm_core::control::PersistedSettings;
+
+    fn settings(strategy: &str) -> PersistedSettings {
+        PersistedSettings {
+            strategy: strategy.into(),
+            priority_games: vec!["deadlock".into()],
+            favourite_channels: vec!["someone".into()],
+            pinned_channel: None,
+            excluded_campaigns: vec!["c1".into()],
+            excluded_games: vec![],
+            paused: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runtime_change_is_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_atomic(&path).unwrap();
+
+        let store = ConfigStore::new(path.clone());
+        store.save_account("default", &settings("coverage")).await.unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        let a = reloaded.account("default");
+        assert_eq!(a.strategy, "coverage");
+        assert!(a.paused);
+        assert_eq!(a.excluded_campaigns, vec!["c1"]);
+    }
+
+    #[tokio::test]
+    async fn saving_an_unknown_account_adds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_atomic(&path).unwrap();
+
+        let store = ConfigStore::new(path.clone());
+        store.save_account("alt", &settings("priority")).await.unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.account("alt").strategy, "priority");
+        // The pre-existing account must survive.
+        assert_eq!(reloaded.account("default").strategy, "deadline");
+    }
+
+    /// Two accounts saving at once must not lose one another's changes. Before
+    /// the lock and the re-read, the second write was based on a stale copy.
+    #[tokio::test]
+    async fn concurrent_saves_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_atomic(&path).unwrap();
+
+        let store = ConfigStore::new(path.clone());
+        let a = store.clone();
+        let b = store.clone();
+
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { a.save_account("one", &settings("coverage")).await }),
+            tokio::spawn(async move { b.save_account("two", &settings("priority")).await }),
+        );
+        ra.unwrap().unwrap();
+        rb.unwrap().unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.account("one").strategy, "coverage");
+        assert_eq!(reloaded.account("two").strategy, "priority");
+    }
+
+    /// Other keys in the file must survive a settings write.
+    #[tokio::test]
+    async fn unrelated_settings_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config {
+            bind: "0.0.0.0:9999".into(),
+            data_dir: None,
+            discord_webhook: Some("https://example.invalid/hook".into()),
+            accounts: vec![AccountConfig::default()],
+        }
+        .save_atomic(&path)
+        .unwrap();
+
+        ConfigStore::new(path.clone())
+            .save_account("default", &settings("manual"))
+            .await
+            .unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.bind, "0.0.0.0:9999");
+        assert_eq!(
+            reloaded.discord_webhook.as_deref(),
+            Some("https://example.invalid/hook")
+        );
     }
 }

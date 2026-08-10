@@ -53,6 +53,21 @@ pub enum RecoveryStep {
 }
 
 impl RecoveryStep {
+    /// What this rung is trying, in words. Shown live on the dashboard so a
+    /// stall reads as "the miner is doing something about it" rather than as
+    /// a frozen progress bar.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::ResendWatch => "sending another heartbeat",
+            Self::RefreshStreamInfo => "checking whether the stream restarted",
+            Self::ReverifyEligibility => "asking Twitch if this channel still earns our drops",
+            Self::SwitchChannel => "giving up on this channel and finding another",
+            Self::ResyncCampaigns => "re-fetching campaigns in case one ended",
+            Self::ValidateAuth => "checking the Twitch token is still valid",
+            Self::QuarantineCampaign => "resting this campaign and moving on",
+        }
+    }
+
     pub const LADDER: [RecoveryStep; 7] = [
         RecoveryStep::ResendWatch,
         RecoveryStep::RefreshStreamInfo,
@@ -174,7 +189,8 @@ impl Quarantine {
     }
 
     /// Quarantine `key`, doubling the penalty for each repeat offence.
-    pub fn punish(&mut self, key: &str, now: DateTime<Utc>) {
+    /// Returns when the penalty expires, so the caller can say so.
+    pub fn punish(&mut self, key: &str, now: DateTime<Utc>) -> DateTime<Utc> {
         let strikes = self.entries.get(key).map_or(1, |e| e.strikes.saturating_add(1));
         // Saturating shift: 2^30 minutes already exceeds any sane ceiling.
         let factor = 1i64 << strikes.min(30);
@@ -184,13 +200,9 @@ impl Quarantine {
                 .saturating_mul(factor)
                 .min(self.ceiling.num_seconds()),
         );
-        self.entries.insert(
-            key.to_owned(),
-            Entry {
-                until: now + penalty,
-                strikes,
-            },
-        );
+        let until = now + penalty;
+        self.entries.insert(key.to_owned(), Entry { until, strikes });
+        until
     }
 
     pub fn is_quarantined(&self, key: &str, now: DateTime<Utc>) -> bool {
@@ -209,6 +221,28 @@ impl Quarantine {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Entries still in force, sorted by key so the dashboard does not
+    /// reshuffle between refreshes. The user is entitled to know why a channel
+    /// they can see is live is not being picked.
+    pub fn active(&self, now: DateTime<Utc>) -> Vec<(String, DateTime<Utc>)> {
+        let mut out: Vec<(String, DateTime<Utc>)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| now < e.until)
+            .map(|(k, e)| (k.clone(), e.until))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Forget every penalty, including the strike counts. Used by the
+    /// dashboard's "try everything again" control: a user who has just fixed
+    /// their adblocker should not wait out an exponential backoff earned while
+    /// it was broken.
+    pub fn clear(&mut self) {
+        self.entries.clear();
     }
 }
 

@@ -4,7 +4,7 @@
 //! stalled campaign on one account cannot affect another, which is exactly
 //! what "independent miners, shared UI" has to mean to be worth anything.
 
-use crate::config::Config;
+use crate::config::{Config, ConfigStore};
 use crate::run::{self, RunOptions};
 use crate::storage::Storage;
 use btdm_web::Hub;
@@ -28,6 +28,8 @@ pub struct SupervisorOptions {
     pub headless: bool,
     /// Mine only this account rather than every linked one.
     pub only: Option<String>,
+    /// Where settings changed from the dashboard are written back.
+    pub config_store: ConfigStore,
 }
 
 pub async fn run(
@@ -58,12 +60,16 @@ pub async fn run(
         let storage = Arc::clone(&storage);
         let config = config.clone();
         let hub = hub.clone();
+        let config_store = opts.config_store.clone();
         tasks.spawn(async move {
             let result = run::mine(
                 &storage,
                 &account,
                 &config,
-                RunOptions { probe: false },
+                RunOptions {
+                    probe: false,
+                    config_store: Some(config_store),
+                },
                 Some(hub),
             )
             .await;
