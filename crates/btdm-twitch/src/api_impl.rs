@@ -196,4 +196,14 @@ impl TwitchApi for TwitchClient {
             .await?;
         Ok(())
     }
+
+    async fn claim_points(&self, channel: &ChannelId, claim_id: &str) -> Result<(), ApiError> {
+        self.gql
+            .run(
+                &ops::CLAIM_POINTS,
+                json!({ "input": { "claimID": claim_id, "channelID": channel.0 } }),
+            )
+            .await?;
+        Ok(())
+    }
 }

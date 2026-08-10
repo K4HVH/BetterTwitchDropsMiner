@@ -1,6 +1,7 @@
 //! Wires config, storage, auth, PubSub and the engine into a running miner.
 
 use crate::config::Config;
+use crate::notify::Discord;
 use crate::storage::Storage;
 use btdm_core::api::TwitchApi;
 use btdm_core::engine::{Engine, EngineConfig, MiningState};
@@ -69,6 +70,11 @@ pub async fn mine(
     // owns reconnection, so the main loop never blocks on it.
     let mut pubsub_rx =
         spawn_pubsub_supervisor(tokens.access_token.clone(), validated.user_id.clone());
+
+    let notifier = config
+        .discord_webhook
+        .as_ref()
+        .map(|w| Discord::new(build_http_client().unwrap_or_default(), w.clone()));
 
     let mut last_sync = None;
     let mut last_auth_check = Utc::now();
@@ -140,7 +146,7 @@ pub async fn mine(
             }
         }
 
-        drain_events(&mut engine, storage, account, hub.as_ref())?;
+        drain_events(&mut engine, storage, account, hub.as_ref(), notifier.as_ref()).await?;
         report_status(&engine, now);
         if let Some(hub) = &hub {
             hub.publish(engine.snapshot(account, Some(&validated.login), now));
@@ -170,8 +176,15 @@ pub async fn mine(
                 msg = pubsub_rx.recv() => {
                     match msg {
                         Some(event) => {
-                            handle_pubsub(&mut engine, event);
-                            drain_events(&mut engine, storage, account, hub.as_ref())?;
+                            handle_pubsub(&mut engine, event).await;
+                            drain_events(
+                                &mut engine,
+                                storage,
+                                account,
+                                hub.as_ref(),
+                                notifier.as_ref(),
+                            )
+                            .await?;
                             if let Some(hub) = &hub {
                                 hub.publish(engine.snapshot(
                                     account,
@@ -317,7 +330,7 @@ fn spawn_pubsub_supervisor(
     rx
 }
 
-fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {
+async fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {
     let now = Utc::now();
     match msg {
         PubSubMessage::DropProgress(p) => engine.on_pushed_progress(p, now),
@@ -331,21 +344,33 @@ fn handle_pubsub<A: TwitchApi>(engine: &mut Engine<A>, msg: PubSubMessage) {
                 engine.switch_away(now);
             }
         }
-        PubSubMessage::StreamUp { .. }
-        | PubSubMessage::PointsClaimable { .. }
-        | PubSubMessage::Disconnected => {}
+        PubSubMessage::PointsClaimable {
+            channel_id,
+            claim_id,
+        } => {
+            // Claiming is best-effort: points are a bonus, never a reason to
+            // interrupt mining.
+            if let Err(e) = engine.claim_points(&channel_id, &claim_id, now).await {
+                tracing::debug!(error = %e, "channel points claim failed");
+            }
+        }
+        PubSubMessage::StreamUp { .. } | PubSubMessage::Disconnected => {}
     }
 }
 
-fn drain_events<A: TwitchApi>(
+async fn drain_events<A: TwitchApi>(
     engine: &mut Engine<A>,
     storage: &Storage,
     account: &str,
     hub: Option<&Hub>,
+    notifier: Option<&Discord>,
 ) -> anyhow::Result<()> {
     for event in engine.drain_events() {
         tracing::info!(kind = ?event.kind, "event");
         storage.append_event(account, &event)?;
+        if let Some(notifier) = notifier {
+            notifier.notify(account, &event).await;
+        }
         if let Some(hub) = hub {
             hub.emit(account, event);
         }

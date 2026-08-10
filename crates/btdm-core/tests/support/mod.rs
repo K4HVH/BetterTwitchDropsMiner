@@ -24,6 +24,7 @@ pub struct FakeTwitch {
     pub progress: Mutex<Option<DropProgress>>,
     pub watches_sent: Mutex<Vec<ChannelId>>,
     pub claims: Mutex<Vec<String>>,
+    pub point_claims: Mutex<Vec<String>>,
     /// When set, every call fails with this error.
     pub fail_with: Mutex<Option<ApiError>>,
     /// When set, only `available_drops` fails.
@@ -118,6 +119,12 @@ impl TwitchApi for FakeTwitch {
     async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError> {
         self.guard()?;
         self.claims.lock().unwrap().push(claim_id.to_owned());
+        Ok(())
+    }
+
+    async fn claim_points(&self, _channel: &ChannelId, claim_id: &str) -> Result<(), ApiError> {
+        self.guard()?;
+        self.point_claims.lock().unwrap().push(claim_id.to_owned());
         Ok(())
     }
 }

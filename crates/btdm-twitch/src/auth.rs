@@ -205,7 +205,7 @@ impl AuthClient {
         }
 
         let body = resp.text().await.unwrap_or_default();
-        Ok(classify_poll_failure(status, &body)?)
+        classify_poll_failure(status, &body)
     }
 
     pub async fn validate(&self, token: &str) -> Result<ValidatedToken, TwitchError> {

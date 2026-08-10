@@ -1,0 +1,30 @@
+[Unit]
+Description=Better Twitch Drops Miner
+Documentation=https://github.com/K4HVH/BetterTwitchDropsMiner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/btdm --data-dir %h/.local/share/btdm mine
+Restart=on-failure
+# Long enough that a Twitch outage does not become a restart loop.
+RestartSec=30s
+
+# The miner needs nothing but its own data directory and the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/btdm
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

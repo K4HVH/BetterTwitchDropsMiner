@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # musl gives a genuinely static binary; rustls means no OpenSSL to link.
+      - run: cargo install cross --locked
+      - run: cross build --release --locked --target ${{ matrix.target }} -p btdm
+      - run: |
+          mv target/${{ matrix.target }}/release/btdm btdm-${{ matrix.target }}
+          sha256sum btdm-${{ matrix.target }} > btdm-${{ matrix.target }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: btdm-${{ matrix.target }}
+          path: |
+            btdm-${{ matrix.target }}
+            btdm-${{ matrix.target }}.sha256
