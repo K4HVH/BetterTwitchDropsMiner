@@ -8,7 +8,7 @@
 //! failure the user only notices as "nothing is happening".
 
 use crate::TwitchError;
-use crate::client::{CLIENT_ID, GQL_URL};
+use crate::client::CLIENT_ID;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -95,7 +95,7 @@ impl RateLimiter {
 
 impl GqlClient {
     pub fn new(http: reqwest::Client, token: Option<String>) -> Self {
-        Self::with_endpoint(http, token, GQL_URL.to_owned())
+        Self::with_endpoint(http, token, crate::endpoints::gql())
     }
 
     /// Test seam: point the client at a mock server.

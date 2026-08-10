@@ -100,15 +100,22 @@ Honest list of what a serious miner could do that this does not.
 
 ## Test coverage, and where it is thin
 
-381 tests, no clippy warnings.
+442 tests, no clippy warnings.
 
-Well covered: the engine against a scripted Twitch (93 scenarios), strategies,
+Well covered: the whole binary end to end against a fake Twitch, the engine
+against a scripted one (100+ scenarios), hostile data at every layer, strategies,
 eligibility and feasibility maths, the watchdog ladder, parsing, the control
 plane end to end over HTTP, retry behaviour against a real socket, and the
 dashboard rendered in jsdom against a real snapshot.
 
-Thin: `run.rs`'s outer loop sequencing and the PubSub supervisor are still
-verified by running the binary rather than by tests — the dynamic
-subscription's plumbing is unit-tested, but nothing proves the supervisor
-re-subscribes correctly after a reconnect except watching it. The JSON fixtures
-are hand-built from observed shapes rather than captured responses.
+`run.rs`'s loop is now covered too: six end-to-end tests drive the whole binary
+against a fake Twitch — stored token, validation, sync, selection, discovering
+the spade endpoint by scraping, the heartbeat, the poll, and claiming a
+finished drop. Every URL is overridable by environment variable, which is what
+made that possible; the binary could not be tested at all before.
+
+Thin: the PubSub supervisor's reconnect-and-resubscribe path is still verified
+by running the binary — the dynamic subscription's plumbing is unit-tested, but
+nothing proves the supervisor restores its topics after a reconnect except
+watching it do so. The JSON fixtures are hand-built from observed shapes rather
+than captured responses.
