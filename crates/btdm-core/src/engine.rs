@@ -475,10 +475,12 @@ impl<A: TwitchApi> Engine<A> {
         // reproducible rather than dependent on hash iteration order.
         eligible.sort_by(|a, b| a.ends_at.cmp(&b.ends_at).then(a.id.cmp(&b.id)));
 
+        // Report everything Twitch offered, not just what was expanded — the
+        // unlinked majority is real, and omitting it understates the picture.
         self.emit(
             now,
             EventKind::CampaignsSynced {
-                total,
+                total: total + skipped_unlinked,
                 eligible: eligible.len(),
             },
         );
