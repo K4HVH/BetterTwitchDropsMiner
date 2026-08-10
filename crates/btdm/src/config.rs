@@ -38,17 +38,41 @@ impl Default for Config {
 #[serde(default)]
 pub struct AccountConfig {
     pub name: String,
+    /// One of: deadline, priority, coverage, completionist, manual.
+    pub strategy: String,
+    /// Game names in priority order. Used by the `priority` strategy.
     pub priority_games: Vec<String>,
+    /// Channel logins preferred when the choice is otherwise a tie. Applies
+    /// under every strategy.
     pub favourite_channels: Vec<String>,
+    /// Channel login to watch exclusively, under the `manual` strategy.
+    pub pinned_channel: Option<String>,
 }
 
 impl Default for AccountConfig {
     fn default() -> Self {
         Self {
             name: "default".into(),
+            strategy: "deadline".into(),
             priority_games: Vec::new(),
             favourite_channels: Vec::new(),
+            pinned_channel: None,
         }
+    }
+}
+
+impl Config {
+    /// Settings for one account, falling back to defaults when the account is
+    /// not described in the file.
+    pub fn account(&self, name: &str) -> AccountConfig {
+        self.accounts
+            .iter()
+            .find(|a| a.name == name)
+            .cloned()
+            .unwrap_or_else(|| AccountConfig {
+                name: name.to_owned(),
+                ..AccountConfig::default()
+            })
     }
 }
 

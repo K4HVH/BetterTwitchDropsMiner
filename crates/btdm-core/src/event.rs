@@ -66,4 +66,6 @@ pub enum RejectReason {
     NotStarted,
     AllDropsClaimed,
     NoEligibleChannel,
+    /// Cannot be finished before its deadline, so mining it wastes the slot.
+    Infeasible,
 }

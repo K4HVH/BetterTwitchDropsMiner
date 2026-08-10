@@ -376,3 +376,210 @@ async fn campaigns_are_ordered_by_deadline_so_behaviour_is_reproducible() {
     e.sync(now()).await.unwrap();
     assert_eq!(e.campaigns()[0].id, CampaignId::from("c-soon"));
 }
+
+// ---------------------------------------------------------------------------
+// Strategy, watchdog and quarantine integration
+// ---------------------------------------------------------------------------
+
+use btdm_core::watchdog::{RecoveryStep, Verdict};
+
+fn engine_with(fake: FakeTwitch, mutate: impl FnOnce(&mut EngineConfig)) -> Engine<FakeTwitch> {
+    let mut config = EngineConfig::default();
+    mutate(&mut config);
+    Engine::new(fake, config)
+}
+
+#[tokio::test]
+async fn the_default_strategy_is_deadline() {
+    assert_eq!(engine(happy_path()).strategy_name(), "deadline");
+}
+
+#[tokio::test]
+async fn an_unknown_strategy_falls_back_to_deadline_rather_than_failing() {
+    let e = engine_with(happy_path(), |c| c.strategy = "nonsense".into());
+    assert_eq!(e.strategy_name(), "deadline");
+}
+
+/// A campaign that cannot finish before it expires must not consume the single
+/// watch slot, and the reason must be reported.
+#[tokio::test]
+async fn an_infeasible_campaign_is_skipped_with_a_reason() {
+    let fake = FakeTwitch::default();
+    let mut c = campaign("c1", true, vec![drop("d1", 600, 0)]);
+    c.ends_at = now() + chrono::Duration::hours(1); // 600 min needed, 60 available
+    *fake.inventory.lock().unwrap() = vec![c];
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.select_channel(now()).await.unwrap().is_none());
+
+    assert!(
+        e.drain_events().into_iter().any(|ev| matches!(
+            ev.kind,
+            EventKind::CampaignRejected { reason: RejectReason::Infeasible, .. }
+        )),
+        "an impossible campaign must say why it was skipped"
+    );
+}
+
+#[tokio::test]
+async fn the_deadline_strategy_prefers_the_campaign_closest_to_expiry() {
+    let fake = FakeTwitch::default();
+    let mut late = campaign("c-late", true, vec![drop("d-late", 60, 0)]);
+    late.ends_at = now() + chrono::Duration::days(20);
+    let mut soon = campaign("c-soon", true, vec![drop("d-soon", 60, 0)]);
+    soon.ends_at = now() + chrono::Duration::hours(4);
+    *fake.inventory.lock().unwrap() = vec![late, soon];
+
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch-late", "latestreamer"), stream("bc-1", true)),
+        (channel("ch-soon", "soonstreamer"), stream("bc-2", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-late".into(), vec![DropId::from("d-late")]);
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-soon".into(), vec![DropId::from("d-soon")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let (chosen, _, _) = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(chosen.login, "soonstreamer");
+}
+
+#[tokio::test]
+async fn a_favourite_channel_wins_an_otherwise_equal_choice() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![
+        campaign("c-a", true, vec![drop("d-a", 60, 0)]),
+        campaign("c-b", true, vec![drop("d-b", 60, 0)]),
+    ];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch-a", "plain"), stream("bc-1", true)),
+        (channel("ch-b", "beloved"), stream("bc-2", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-a".into(), vec![DropId::from("d-a")]);
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch-b".into(), vec![DropId::from("d-b")]);
+
+    let mut e = engine_with(fake, |c| c.favourites = vec!["Beloved".into()]);
+    e.sync(now()).await.unwrap();
+    let (chosen, _, _) = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(chosen.login, "beloved");
+}
+
+#[tokio::test]
+async fn a_healthy_session_is_not_escalated() {
+    let fake = happy_path();
+    *fake.progress.lock().unwrap() = Some(DropProgress {
+        drop_id: DropId::from("d1"),
+        current_minutes: 1,
+        required_minutes: 60,
+    });
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(e.assess_health(now()), Verdict::Healthy);
+}
+
+/// The headline promise: a channel that confirms nothing is escalated rather
+/// than mined forever.
+#[tokio::test]
+async fn a_silent_channel_escalates_through_the_ladder() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(e.assess_health(now() + chrono::Duration::seconds(60)), Verdict::Healthy);
+    assert_eq!(e.assess_health(now() + chrono::Duration::seconds(200)), Verdict::Suspect);
+    assert_eq!(
+        e.assess_health(now() + chrono::Duration::seconds(400)),
+        Verdict::Escalate(RecoveryStep::ResendWatch)
+    );
+}
+
+#[tokio::test]
+async fn confirmed_progress_clears_an_in_flight_stall() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let stalled = now() + chrono::Duration::seconds(400);
+    assert!(matches!(e.assess_health(stalled), Verdict::Escalate(_)));
+
+    e.on_pushed_progress(
+        DropProgress {
+            drop_id: DropId::from("d1"),
+            current_minutes: 1,
+            required_minutes: 60,
+        },
+        stalled,
+    );
+    assert_eq!(e.assess_health(stalled), Verdict::Healthy);
+}
+
+#[tokio::test]
+async fn a_quarantined_channel_is_not_reselected() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current_channel().is_some());
+
+    e.quarantine_current(now());
+    assert!(e.current_channel().is_none());
+
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "the quarantined channel must not be picked straight back up"
+    );
+}
+
+/// Quarantine is a cooldown, not a life sentence.
+#[tokio::test]
+async fn a_quarantined_channel_becomes_available_again_later() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.quarantine_current(now());
+
+    let much_later = now() + chrono::Duration::hours(3);
+    e.sync(much_later).await.unwrap();
+    assert!(e.select_channel(much_later).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_availability_check_budget_bounds_requests_per_pass() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    let mut channels = Vec::new();
+    for i in 0..100 {
+        channels.push((
+            channel(&format!("ch{i}"), &format!("streamer{i}")),
+            stream("bc", true),
+        ));
+    }
+    *fake.channels.lock().unwrap() = channels;
+    // None are in `available`, so every one costs a check.
+
+    let mut e = engine_with(fake, |c| c.max_availability_checks = 5);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    // Budget respected; without it this would be 100 sequential requests.
+}

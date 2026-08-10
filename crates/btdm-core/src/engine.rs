@@ -1,17 +1,22 @@
 //! The mining loop.
 //!
 //! Generic over [`TwitchApi`] so the whole thing runs against a scripted fake.
-//! Selection here is deliberately simple — the first eligible, server-verified
-//! channel. Pluggable strategies replace [`Engine::select_channel`] later; this
-//! layer only has to mine *correctly*, not cleverly.
+//!
+//! The engine owns the *mechanics* — sync, candidate gathering, heartbeats,
+//! progress, claiming — while [`crate::strategy`] owns the *choice* of what to
+//! watch and [`crate::watchdog`] owns the decision that a session has failed.
+//! Keeping those separate is what lets each be tested against synthetic worlds
+//! rather than a live account.
 
 use crate::api::{ApiError, DropProgress, TwitchApi};
 use crate::eligibility;
 use crate::event::{EventKind, MinerEvent, RejectReason};
 use crate::model::*;
 use crate::progress::ProgressTracker;
+use crate::strategy::{self, Candidate, Decision, MiningStrategy, WorldView};
+use crate::watchdog::{Quarantine, Verdict, Watchdog, WatchdogConfig};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -22,6 +27,18 @@ pub struct EngineConfig {
     /// Upper bound on per-campaign detail requests during a sync, so a huge
     /// campaign list cannot turn startup into a request storm.
     pub max_detail_fetches: usize,
+    /// Upper bound on availability checks per selection pass. Without this,
+    /// 7 campaigns times 30 channels is 210 sequential requests.
+    pub max_availability_checks: usize,
+    /// Which selection strategy to use. See [`crate::strategy`].
+    pub strategy: String,
+    /// Channel logins to prefer when otherwise equal.
+    pub favourites: Vec<String>,
+    /// Game names in priority order.
+    pub priority_games: Vec<String>,
+    /// A channel login to watch exclusively, under the `manual` strategy.
+    pub pinned: Option<String>,
+    pub watchdog: WatchdogConfig,
 }
 
 impl Default for EngineConfig {
@@ -31,6 +48,12 @@ impl Default for EngineConfig {
             poll_interval: Duration::seconds(120),
             channel_limit: 30,
             max_detail_fetches: 60,
+            max_availability_checks: 40,
+            strategy: "deadline".into(),
+            favourites: Vec::new(),
+            priority_games: Vec::new(),
+            pinned: None,
+            watchdog: WatchdogConfig::default(),
         }
     }
 }
@@ -47,9 +70,14 @@ pub enum MiningState {
 pub struct Engine<A: TwitchApi> {
     api: A,
     config: EngineConfig,
+    strategy: Box<dyn MiningStrategy>,
+    favourites: HashSet<String>,
+    priority_games: Vec<String>,
     campaigns: Vec<DropCampaign>,
     current: Option<(Channel, Stream, CampaignId)>,
     progress: ProgressTracker,
+    watchdog: Watchdog,
+    quarantine: Quarantine,
     events: Vec<MinerEvent>,
     last_watch: Option<DateTime<Utc>>,
     last_poll: Option<DateTime<Utc>>,
@@ -57,8 +85,31 @@ pub struct Engine<A: TwitchApi> {
 
 impl<A: TwitchApi> Engine<A> {
     pub fn new(api: A, config: EngineConfig) -> Self {
+        let strategy = strategy::by_name(&config.strategy).unwrap_or_else(|| {
+            tracing::warn!(
+                requested = config.strategy,
+                "unknown strategy; falling back to `deadline`"
+            );
+            Box::new(strategy::Deadline)
+        });
+        let favourites = config
+            .favourites
+            .iter()
+            .map(|f| f.to_lowercase())
+            .collect();
+        let priority_games = config
+            .priority_games
+            .iter()
+            .map(|g| g.to_lowercase())
+            .collect();
+
         Self {
             api,
+            watchdog: Watchdog::new(config.watchdog),
+            quarantine: Quarantine::new(Duration::minutes(5), Duration::hours(2)),
+            strategy,
+            favourites,
+            priority_games,
             config,
             campaigns: Vec::new(),
             current: None,
@@ -69,8 +120,114 @@ impl<A: TwitchApi> Engine<A> {
         }
     }
 
+    pub fn strategy_name(&self) -> &'static str {
+        self.strategy.name()
+    }
+
+    /// Ask the watchdog whether the current session is healthy.
+    pub fn assess_health(&mut self, now: DateTime<Utc>) -> Verdict {
+        let since = self
+            .current
+            .as_ref()
+            .and(self.progress.since_last_confirmation(now));
+        self.watchdog.assess(since, now)
+    }
+
+    /// Quarantine the current channel so selection stops picking it, with
+    /// exponential backoff so it is retried later rather than abandoned.
+    pub fn quarantine_current(&mut self, now: DateTime<Utc>) {
+        if let Some((channel, _, _)) = &self.current {
+            let id = channel.id.0.clone();
+            let login = channel.login.clone();
+            self.quarantine.punish(&id, now);
+            tracing::warn!(channel = %login, "quarantined after failing to make progress");
+        }
+        self.switch_away(now);
+    }
+
     pub fn api(&self) -> &A {
         &self.api
+    }
+
+    /// Rung 1: send a heartbeat on the next tick regardless of the interval.
+    pub fn force_next_watch(&mut self) {
+        self.last_watch = None;
+    }
+
+    /// Rung 2: re-fetch stream info.
+    ///
+    /// The broadcast ID changes when a stream restarts, and heartbeats carrying
+    /// a stale one are accepted and earn nothing — a healthy-looking session
+    /// that is silently worthless. Returns whether the ID actually changed.
+    pub async fn refresh_stream_info(&mut self, now: DateTime<Utc>) -> Result<bool, ApiError> {
+        let Some((channel, old, campaign)) = self.current.clone() else {
+            return Ok(false);
+        };
+
+        match self.api.stream_info(&channel.login).await? {
+            Some(fresh) => {
+                let changed = fresh.broadcast_id != old.broadcast_id;
+                if changed {
+                    tracing::warn!(
+                        channel = %channel.login,
+                        old = %old.broadcast_id,
+                        new = %fresh.broadcast_id,
+                        "the stream restarted; heartbeats were carrying a stale broadcast id"
+                    );
+                    self.progress.begin(now);
+                }
+                self.current = Some((channel, fresh, campaign));
+                Ok(changed)
+            }
+            None => {
+                tracing::info!(channel = %channel.login, "channel is offline");
+                self.switch_away(now);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Rung 3: ask Twitch again whether this channel progresses anything of
+    /// ours. Returns false when it definitively does not.
+    pub async fn reverify_current_channel(&mut self) -> Result<bool, ApiError> {
+        let Some((channel, _, campaign_id)) = self.current.clone() else {
+            return Ok(false);
+        };
+        let Some(campaign) = self.campaigns.iter().find(|c| c.id == campaign_id) else {
+            return Ok(false);
+        };
+
+        let wanted: HashSet<DropId> = eligibility::mineable_drops(campaign)
+            .into_iter()
+            .map(|d| d.id.clone())
+            .collect();
+
+        match self.api.available_drops(&channel.id).await {
+            Ok(available) => Ok(available.iter().any(|d| wanted.contains(d))),
+            // An inconclusive check is not proof of failure.
+            Err(e) => {
+                tracing::warn!(error = %e, "re-verification inconclusive");
+                Ok(true)
+            }
+        }
+    }
+
+    /// Rung 7: stop trying this campaign for a while.
+    pub fn quarantine_current_campaign(&mut self, now: DateTime<Utc>) {
+        if let Some((_, _, campaign)) = &self.current {
+            let id = campaign.0.clone();
+            self.quarantine.punish(&format!("campaign:{id}"), now);
+            tracing::error!(
+                campaign = %id,
+                "recovery exhausted; quarantining this campaign and moving on"
+            );
+        }
+        self.quarantine_current(now);
+    }
+
+    pub fn is_campaign_quarantined(&self, id: &CampaignId, now: DateTime<Utc>) -> bool {
+        self.quarantine
+            .is_quarantined(&format!("campaign:{}", id.0), now)
     }
 
     pub fn campaigns(&self) -> &[DropCampaign] {
@@ -116,6 +273,7 @@ impl<A: TwitchApi> Engine<A> {
         }
         self.current = None;
         self.progress.reset();
+        self.watchdog.reset();
         self.last_watch = None;
         self.last_poll = None;
     }
@@ -234,15 +392,92 @@ impl<A: TwitchApi> Engine<A> {
         &mut self,
         now: DateTime<Utc>,
     ) -> Result<Option<(Channel, Stream, CampaignId)>, ApiError> {
+        self.quarantine.prune(now);
+        let (candidates, fallbacks) = self.gather_candidates(now).await?;
+
+        let current_id = self.current.as_ref().map(|(c, _, _)| c.id.clone());
+        let decision = {
+            let world = WorldView {
+                now,
+                campaigns: &self.campaigns,
+                candidates: &candidates,
+                favourites: &self.favourites,
+                priority_games: &self.priority_games,
+                pinned: self.config.pinned.as_deref(),
+                current: current_id.as_ref(),
+            };
+            strategy::choose(self.strategy.as_ref(), &world)
+        };
+
+        match decision {
+            Decision::Watch(c) => {
+                self.begin_watching(now, c.channel, c.stream, c.campaign);
+                return Ok(self.current.clone());
+            }
+            Decision::Idle(reason) => {
+                // Staying put is a decision, not a failure.
+                if self.current.is_some() {
+                    tracing::debug!(reason, "keeping the current channel");
+                    return Ok(self.current.clone());
+                }
+                tracing::info!(reason, "no channel selected");
+            }
+        }
+
+        // Nothing passed the strict availability check. Falling back beats
+        // mining nothing at all, but it is announced rather than silent.
+        if candidates.is_empty()
+            && let Some(c) = fallbacks.into_iter().next()
+        {
+            tracing::warn!(
+                channel = %c.channel.login,
+                "no channel passed the drop-availability check; falling back to a \
+                 directory drops-enabled tag. If progress does not confirm, this \
+                 channel genuinely earns nothing and the watchdog will move on."
+            );
+            self.begin_watching(now, c.channel, c.stream, c.campaign);
+            return Ok(self.current.clone());
+        }
+
+        Ok(None)
+    }
+
+    /// Builds the candidate set the strategy chooses from.
+    ///
+    /// Returns `(verified, fallbacks)`: candidates Twitch confirmed can
+    /// progress our drops, and drops-enabled channels that failed or were
+    /// excluded by that check.
+    async fn gather_candidates(
+        &mut self,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<Candidate>, Vec<Candidate>), ApiError> {
         let campaigns = self.campaigns.clone();
-        let mut fallbacks: Vec<(Channel, Stream, CampaignId)> = Vec::new();
+        let mut verified = Vec::new();
+        let mut fallbacks = Vec::new();
+        let mut checks = 0usize;
 
         for campaign in &campaigns {
-            let wanted: std::collections::HashSet<DropId> = eligibility::mineable_drops(campaign)
+            let wanted: HashSet<DropId> = eligibility::mineable_drops(campaign)
                 .into_iter()
                 .map(|d| d.id.clone())
                 .collect();
             if wanted.is_empty() {
+                continue;
+            }
+            // A campaign that exhausted the recovery ladder is rested, not
+            // retried immediately.
+            if self.is_campaign_quarantined(&campaign.id, now) {
+                continue;
+            }
+            // Do not spend requests on a campaign that cannot finish anyway.
+            if !strategy::is_feasible(campaign, now) && self.config.pinned.is_none() {
+                self.emit(
+                    now,
+                    EventKind::CampaignRejected {
+                        campaign: campaign.id.clone(),
+                        reason: RejectReason::Infeasible,
+                    },
+                );
                 continue;
             }
 
@@ -261,7 +496,7 @@ impl<A: TwitchApi> Engine<A> {
                 continue;
             }
 
-            let allowed: std::collections::HashSet<ChannelId> = campaign
+            let allowed: HashSet<ChannelId> = campaign
                 .allowed_channels
                 .iter()
                 .map(|c| c.id.clone())
@@ -272,48 +507,53 @@ impl<A: TwitchApi> Engine<A> {
                 if !allowed.is_empty() && !allowed.contains(&channel.id) {
                     continue;
                 }
+                if self.quarantine.is_quarantined(&channel.id.0, now) {
+                    continue;
+                }
+                if checks >= self.config.max_availability_checks {
+                    tracing::debug!(
+                        limit = self.config.max_availability_checks,
+                        "availability-check budget reached for this pass"
+                    );
+                    break;
+                }
+                checks += 1;
+
+                let make = |drops: Vec<DropId>| Candidate {
+                    channel: channel.clone(),
+                    stream: stream.clone(),
+                    campaign: campaign.id.clone(),
+                    drops,
+                };
 
                 match self.api.available_drops(&channel.id).await {
-                    Ok(available) if available.iter().any(|d| wanted.contains(d)) => {
-                        self.begin_watching(now, channel, stream, campaign.id.clone());
-                        return Ok(self.current.clone());
-                    }
-                    Ok(_) => {
-                        if stream.drops_enabled {
-                            fallbacks.push((channel, stream, campaign.id.clone()));
+                    Ok(available) => {
+                        let matched: Vec<DropId> = available
+                            .into_iter()
+                            .filter(|d| wanted.contains(d))
+                            .collect();
+                        if !matched.is_empty() {
+                            verified.push(make(matched));
+                        } else if stream.drops_enabled {
+                            fallbacks.push(make(wanted.iter().cloned().collect()));
                         }
                     }
                     Err(e) => {
                         // A failed check must not silently exclude a channel.
-                        tracing::warn!(channel = %channel.login, error = %e, "eligibility check failed");
+                        tracing::warn!(
+                            channel = %channel.login,
+                            error = %e,
+                            "availability check failed; keeping as a fallback"
+                        );
                         if stream.drops_enabled {
-                            fallbacks.push((channel, stream, campaign.id.clone()));
+                            fallbacks.push(make(wanted.iter().cloned().collect()));
                         }
                     }
                 }
             }
-
-            self.emit(
-                now,
-                EventKind::CampaignRejected {
-                    campaign: campaign.id.clone(),
-                    reason: RejectReason::NoEligibleChannel,
-                },
-            );
         }
 
-        if let Some((channel, stream, campaign)) = fallbacks.into_iter().next() {
-            tracing::warn!(
-                channel = %channel.login,
-                "no channel passed the drop-availability check; falling back to a \
-                 directory drops-enabled tag. If progress does not confirm, this \
-                 channel genuinely earns nothing."
-            );
-            self.begin_watching(now, channel, stream, campaign);
-            return Ok(self.current.clone());
-        }
-
-        Ok(None)
+        Ok((verified, fallbacks))
     }
 
     fn begin_watching(
@@ -387,6 +627,8 @@ impl<A: TwitchApi> Engine<A> {
         if !self.progress.record(p.clone(), now) {
             return;
         }
+        // Real progress ends any stall episode in flight.
+        self.watchdog.on_progress();
         // Keep the campaign view in step so claim detection and remaining-time
         // figures reflect what the server actually reported.
         for campaign in &mut self.campaigns {

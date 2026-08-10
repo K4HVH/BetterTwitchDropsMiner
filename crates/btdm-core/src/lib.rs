@@ -12,4 +12,5 @@ pub mod engine;
 pub mod event;
 pub mod model;
 pub mod progress;
+pub mod strategy;
 pub mod watchdog;
