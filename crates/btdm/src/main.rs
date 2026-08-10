@@ -1,5 +1,6 @@
 mod auth_flow;
 mod config;
+mod run;
 mod storage;
 
 use clap::{Parser, Subcommand};
@@ -35,6 +36,10 @@ enum Command {
     Status,
     /// Remove a stored token.
     Logout,
+    /// Mine drops until interrupted.
+    Mine,
+    /// Run a single pass and report what the miner sees, then exit.
+    Probe,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -72,9 +77,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Login { force } => auth_flow::login(&storage, &args.account, force).await,
         Command::Status => auth_flow::status(&storage, &args.account).await,
         Command::Logout => {
-            storage.clear_tokens(&args.account)?;
-            println!("Removed the stored token for account '{}'.", args.account);
+            if storage.clear_tokens(&args.account)? {
+                println!("Removed the stored token for account '{}'.", args.account);
+            } else {
+                println!("No stored token found for account '{}'.", args.account);
+            }
             Ok(())
+        }
+        Command::Mine => {
+            run::mine(&storage, &args.account, &cfg, run::RunOptions { probe: false }).await
+        }
+        Command::Probe => {
+            run::mine(&storage, &args.account, &cfg, run::RunOptions { probe: true }).await
         }
     }
 }

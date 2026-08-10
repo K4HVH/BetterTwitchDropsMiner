@@ -40,6 +40,45 @@ pub struct ValidatedToken {
     pub expires_in_secs: u64,
 }
 
+/// Decides whether a failed token poll means "keep waiting" or "give up now".
+///
+/// Twitch's OAuth error strings arrive either as `{"message": "..."}` or the
+/// RFC-standard `{"error": "..."}`, so both are matched.
+fn classify_poll_failure(status: u16, body: &str) -> Result<PollOutcome, TwitchError> {
+    let lower = body.to_ascii_lowercase();
+
+    // Still waiting on the human. `slow_down` also means keep going.
+    if lower.contains("authorization_pending") || lower.contains("slow_down") {
+        return Ok(PollOutcome::Pending);
+    }
+
+    // Terminal: no amount of waiting fixes these.
+    for terminal in [
+        "expired_token",
+        "access_denied",
+        "invalid_client",
+        "invalid_grant",
+        "unauthorized_client",
+    ] {
+        if lower.contains(terminal) {
+            return Err(TwitchError::Malformed(format!(
+                "device authorisation failed: {terminal}"
+            )));
+        }
+    }
+
+    // An unrecognised 400 is most likely a pending variant, so keep waiting but
+    // leave a trail. Anything else is a genuine transport problem.
+    if status == 400 {
+        tracing::debug!(status, body, "unrecognised token-poll response; still waiting");
+        return Ok(PollOutcome::Pending);
+    }
+    if status == 429 {
+        return Err(TwitchError::RateLimited);
+    }
+    Err(TwitchError::Network(format!("HTTP {status}: {body}")))
+}
+
 pub struct AuthClient {
     http: reqwest::Client,
     device_id: String,
@@ -124,8 +163,15 @@ impl AuthClient {
         })
     }
 
-    /// One poll. Twitch answers 400 until the user authorises, which is normal
-    /// and must not be treated as an error.
+    /// One poll.
+    ///
+    /// Twitch answers 400 with `authorization_pending` until the user enters
+    /// the code, which is normal. It also answers 400 for terminal failures
+    /// like `invalid_client` or `access_denied`. Treating every 400 as "keep
+    /// waiting" — as the reference implementation does — means a flow that was
+    /// broken from the first request polls silently for the full 30 minutes
+    /// and then blames the user for being too slow. Terminal errors are
+    /// surfaced immediately instead.
     pub async fn poll_once(&self, dc: &DeviceCode) -> Result<PollOutcome, TwitchError> {
         #[derive(Deserialize)]
         struct Resp {
@@ -146,7 +192,8 @@ impl AuthClient {
             .await
             .map_err(|e| TwitchError::Network(e.to_string()))?;
 
-        if resp.status().as_u16() == 200 {
+        let status = resp.status().as_u16();
+        if status == 200 {
             let r: Resp = resp
                 .json()
                 .await
@@ -156,7 +203,9 @@ impl AuthClient {
                 refresh_token: r.refresh_token,
             });
         }
-        Ok(PollOutcome::Pending)
+
+        let body = resp.text().await.unwrap_or_default();
+        Ok(classify_poll_failure(status, &body)?)
     }
 
     pub async fn validate(&self, token: &str) -> Result<ValidatedToken, TwitchError> {
@@ -191,5 +240,63 @@ impl AuthClient {
             401 | 403 => Err(TwitchError::Unauthorized),
             s => Err(TwitchError::Network(format!("HTTP {s}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_authorisation_keeps_polling() {
+        assert_eq!(
+            classify_poll_failure(400, r#"{"message":"authorization_pending"}"#).unwrap(),
+            PollOutcome::Pending
+        );
+        assert_eq!(
+            classify_poll_failure(400, r#"{"error":"slow_down"}"#).unwrap(),
+            PollOutcome::Pending
+        );
+    }
+
+    /// Polling for 30 minutes and then reporting "you were too slow" when the
+    /// client ID was rejected on the very first request is a misleading
+    /// failure, not a slow one.
+    #[test]
+    fn terminal_oauth_errors_stop_immediately() {
+        for terminal in [
+            "expired_token",
+            "access_denied",
+            "invalid_client",
+            "invalid_grant",
+            "unauthorized_client",
+        ] {
+            let body = format!(r#"{{"message":"{terminal}"}}"#);
+            let err = classify_poll_failure(400, &body).unwrap_err();
+            assert!(
+                err.to_string().contains(terminal),
+                "{terminal} must be surfaced verbatim, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_400_keeps_waiting_rather_than_aborting_a_valid_login() {
+        assert_eq!(
+            classify_poll_failure(400, r#"{"message":"something new"}"#).unwrap(),
+            PollOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn transport_failures_are_not_mistaken_for_pending() {
+        assert!(matches!(
+            classify_poll_failure(429, ""),
+            Err(TwitchError::RateLimited)
+        ));
+        assert!(matches!(
+            classify_poll_failure(503, "gateway down"),
+            Err(TwitchError::Network(_))
+        ));
     }
 }

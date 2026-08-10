@@ -71,6 +71,25 @@ pub fn build_watch_payload(
     base64::engine::general_purpose::STANDARD.encode(payload.to_string())
 }
 
+/// Turns a transport failure against the spade host into an actionable message.
+///
+/// `spade.twitch.tv` is an analytics domain, so it appears on most ad-blocking
+/// and tracker blocklists — and it is also the *only* endpoint that advances
+/// drop time. A blocked spade host therefore produces a miner that looks
+/// perfectly healthy and earns nothing, which is the exact failure this project
+/// exists to prevent. A bare "error sending request" would bury it, so the
+/// likely cause is named outright.
+pub fn classify_spade_transport_error(url: &str, e: &reqwest::Error) -> TwitchError {
+    if e.is_connect() || e.is_timeout() {
+        TwitchError::SpadeUnreachable {
+            url: url.to_owned(),
+            detail: e.to_string(),
+        }
+    } else {
+        TwitchError::Network(e.to_string())
+    }
+}
+
 pub struct WatchClient {
     http: reqwest::Client,
 }
@@ -131,7 +150,7 @@ impl WatchClient {
             .form(&[("data", data)])
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| classify_spade_transport_error(spade_url, &e))?;
 
         match resp.status().as_u16() {
             200 | 204 => Ok(()),

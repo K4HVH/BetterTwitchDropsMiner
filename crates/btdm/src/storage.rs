@@ -56,6 +56,10 @@ impl Storage {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
+        // ORDERING IS LOAD-BEARING: chmod must happen before `init` enables WAL.
+        // SQLite creates the -wal and -shm sidecars with permissions copied from
+        // the main database file, so tightening it first means they inherit 0600
+        // too. Moving this below `init` would silently leak the token store.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -123,10 +127,13 @@ impl Storage {
         Ok(row)
     }
 
-    pub fn clear_tokens(&self, account: &str) -> Result<(), StorageError> {
-        self.lock()
+    /// Returns whether a token was actually removed, so the caller cannot
+    /// report a purge that never happened.
+    pub fn clear_tokens(&self, account: &str) -> Result<bool, StorageError> {
+        let removed = self
+            .lock()
             .execute("DELETE FROM tokens WHERE account = ?1", params![account])?;
-        Ok(())
+        Ok(removed > 0)
     }
 
     pub fn append_event(
@@ -239,8 +246,38 @@ mod tests {
     fn clearing_tokens_forces_a_fresh_login() {
         let s = Storage::open_in_memory().unwrap();
         s.put_tokens("main", &tokens()).unwrap();
-        s.clear_tokens("main").unwrap();
+        assert!(s.clear_tokens("main").unwrap(), "a token was removed");
         assert!(s.get_tokens("main").unwrap().is_none());
+    }
+
+    /// Reporting a purge that never happened is the same class of lie as a
+    /// progress bar that advances without progress.
+    #[test]
+    fn clearing_an_unknown_account_reports_that_nothing_was_removed() {
+        let s = Storage::open_in_memory().unwrap();
+        assert!(!s.clear_tokens("never-existed").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_sidecar_files_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let s = Storage::open(&path).unwrap();
+        // Force a write so the WAL definitely exists.
+        s.put_tokens("main", &tokens()).unwrap();
+
+        for suffix in ["-wal", "-shm"] {
+            let side = path.with_file_name(format!("state.db{suffix}"));
+            if let Ok(meta) = std::fs::metadata(&side) {
+                assert_eq!(
+                    meta.permissions().mode() & 0o777,
+                    0o600,
+                    "{suffix} sidecar leaks the token store"
+                );
+            }
+        }
     }
 
     #[test]
