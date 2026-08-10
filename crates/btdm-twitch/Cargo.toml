@@ -20,4 +20,8 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tracing.workspace = true
 
 [dev-dependencies]
+# Accepting connections, so the PubSub protocol can be tested against a real
+# socket rather than only observed in production.
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 wiremock = "0.6.5"

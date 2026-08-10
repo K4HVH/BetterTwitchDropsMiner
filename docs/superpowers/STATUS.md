@@ -100,7 +100,7 @@ Honest list of what a serious miner could do that this does not.
 
 ## Test coverage, and where it is thin
 
-442 tests, no clippy warnings.
+449 tests, no clippy warnings.
 
 Well covered: the whole binary end to end against a fake Twitch, the engine
 against a scripted one (100+ scenarios), hostile data at every layer, strategies,
@@ -114,8 +114,14 @@ the spade endpoint by scraping, the heartbeat, the poll, and claiming a
 finished drop. Every URL is overridable by environment variable, which is what
 made that possible; the binary could not be tested at all before.
 
-Thin: the PubSub supervisor's reconnect-and-resubscribe path is still verified
-by running the binary — the dynamic subscription's plumbing is unit-tested, but
-nothing proves the supervisor restores its topics after a reconnect except
-watching it do so. The JSON fixtures are hand-built from observed shapes rather
-than captured responses.
+PubSub is covered against a real websocket server too: acknowledgement, a
+rejected subscription, a server that accepts and then says nothing, a dropped
+connection being reported, changing subscriptions on a live socket in
+correctly-sized frames, unsubscribing, and every frame carrying the token.
+Each of those failure modes produces a socket that looks perfectly healthy and
+delivers nothing.
+
+Thin: the supervisor's own reconnect *loop* — the backoff and the decision to
+try again — is still exercised only by running the binary; the protocol
+underneath it is not. The JSON fixtures are hand-built from observed shapes
+rather than captured responses.
