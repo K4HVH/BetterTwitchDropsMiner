@@ -85,11 +85,31 @@ pub struct TimedDrop {
     pub is_claimed: bool,
     /// Drops that must be claimed before this tier unlocks.
     pub precondition_ids: Vec<DropId>,
+    /// When this tier itself can be earned, when Twitch narrows it.
+    ///
+    /// A four-week campaign whose third tier only opens in week three was
+    /// otherwise treated as earnable immediately, which made the campaign look
+    /// achievable when it was not yet possible to start on it.
+    #[serde(default)]
+    pub starts_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ends_at: Option<DateTime<Utc>>,
 }
 
 impl TimedDrop {
     pub fn remaining_minutes(&self) -> u32 {
         self.required_minutes.saturating_sub(self.current_minutes)
+    }
+
+    /// Whether this tier's own window is open.
+    pub fn is_open_at(&self, now: DateTime<Utc>) -> bool {
+        self.starts_at.is_none_or(|t| now >= t) && self.ends_at.is_none_or(|t| now < t)
+    }
+
+    /// Whether this tier can never be earned again, because its own window has
+    /// closed. Distinct from "not open yet", which is only a matter of waiting.
+    pub fn window_has_closed(&self, now: DateTime<Utc>) -> bool {
+        self.ends_at.is_some_and(|t| now >= t)
     }
 
     /// Whether this drop is waiting to be claimed.
@@ -159,6 +179,8 @@ mod tests {
             claim_id: None,
             is_claimed: false,
             precondition_ids: vec![],
+            starts_at: None,
+            ends_at: None,
         }
     }
 

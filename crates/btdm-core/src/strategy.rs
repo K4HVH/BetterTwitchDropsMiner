@@ -121,7 +121,7 @@ pub enum Decision {
 /// How much spare time a campaign has: time until its deadline minus the
 /// watching still needed. Negative means it is already impossible.
 pub fn slack(campaign: &DropCampaign, now: DateTime<Utc>) -> Duration {
-    let needed = Duration::minutes(eligibility::remaining_minutes(campaign) as i64);
+    let needed = Duration::minutes(eligibility::remaining_minutes_at(campaign, now) as i64);
     (campaign.ends_at - now) - needed
 }
 
@@ -553,6 +553,8 @@ mod tests {
                 claim_id: None,
                 is_claimed: false,
                 precondition_ids: vec![],
+                starts_at: None,
+                ends_at: None,
             }],
         }
     }

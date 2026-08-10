@@ -24,7 +24,7 @@ pub const INVENTORY: GqlOperation = GqlOperation {
         self { isAccountConnected }
         allow { channels { id name displayName } }
         timeBasedDrops {
-          id name requiredMinutesWatched
+          id name requiredMinutesWatched startAt endAt
           benefitEdges { benefit { id name distributionType imageAssetURL } }
           self { currentMinutesWatched isClaimed dropInstanceID }
           preconditionDrops { id }
@@ -61,7 +61,7 @@ pub const CAMPAIGN_DETAILS: GqlOperation = GqlOperation {
       self { isAccountConnected }
       allow { channels { id name displayName } }
       timeBasedDrops {
-        id name requiredMinutesWatched
+        id name requiredMinutesWatched startAt endAt
         benefitEdges { benefit { id name distributionType imageAssetURL } }
         self { currentMinutesWatched isClaimed dropInstanceID }
         preconditionDrops { id }

@@ -149,6 +149,17 @@ fn parse_drop(v: &Value) -> Result<TimedDrop, TwitchError> {
             .and_then(|s| s.get("isClaimed"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Twitch only sometimes narrows a tier's window inside its campaign's.
+        starts_at: v
+            .get("startAt")
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc)),
+        ends_at: v
+            .get("endAt")
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc)),
         precondition_ids: v
             .get("preconditionDrops")
             .and_then(Value::as_array)
@@ -236,7 +247,70 @@ fn campaign_list(data: &Value, path: &[&str]) -> Result<Vec<DropCampaign>, Twitc
 }
 
 pub fn parse_inventory(data: &Value) -> Result<Vec<DropCampaign>, TwitchError> {
-    campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])
+    let mut campaigns =
+        campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])?;
+
+    // Cross-reference the claimed-benefit ledger.
+    //
+    // `gameEventDrops` was requested and thrown away. It matters because a
+    // campaign whose detail response carries no `self` edge parses as
+    // "unclaimed, zero minutes", so an already-claimed drop is mined all over
+    // again. If every one of a drop's benefits was awarded inside that drop's
+    // own window, it has been claimed.
+    let awarded = claimed_benefits(data);
+    if !awarded.is_empty() {
+        for campaign in &mut campaigns {
+            let window = (campaign.starts_at, campaign.ends_at);
+            for drop in &mut campaign.drops {
+                if drop.is_claimed || drop.benefits.is_empty() {
+                    continue;
+                }
+                let from = drop.starts_at.unwrap_or(window.0);
+                let until = drop.ends_at.unwrap_or(window.1);
+                let all_awarded = drop.benefits.iter().all(|b| {
+                    awarded
+                        .get(&b.id)
+                        .is_some_and(|at| *at >= from && *at < until)
+                });
+                if all_awarded {
+                    tracing::debug!(
+                        drop = %drop.id,
+                        "inferred claimed from the awarded-benefit ledger"
+                    );
+                    drop.is_claimed = true;
+                }
+            }
+        }
+    }
+    Ok(campaigns)
+}
+
+/// Benefit id to when it was last awarded.
+fn claimed_benefits(data: &Value) -> std::collections::HashMap<String, DateTime<Utc>> {
+    let mut out = std::collections::HashMap::new();
+    let Some(list) = data
+        .get("currentUser")
+        .and_then(|u| u.get("inventory"))
+        .and_then(|i| i.get("gameEventDrops"))
+        .and_then(Value::as_array)
+    else {
+        return out;
+    };
+
+    for entry in list {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(at) = entry
+            .get("lastAwardedAt")
+            .and_then(Value::as_str)
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+        else {
+            continue;
+        };
+        out.insert(id.to_owned(), at.with_timezone(&Utc));
+    }
+    out
 }
 
 pub fn parse_campaigns(data: &Value) -> Result<Vec<DropCampaign>, TwitchError> {
@@ -467,5 +541,116 @@ mod claim_tests {
         assert!(claim_granted(&json!({"claimDropRewards": null})).is_err());
         assert!(claim_granted(&json!({})).is_err());
         assert!(claim_granted(&json!({"claimDropRewards": {}})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn inventory(drops: Value, awarded: Value) -> Value {
+        json!({
+            "currentUser": {
+                "inventory": {
+                    "dropCampaignsInProgress": [{
+                        "id": "c1",
+                        "name": "Camp",
+                        "startAt": "2026-08-01T00:00:00Z",
+                        "endAt": "2026-09-01T00:00:00Z",
+                        "game": { "id": "g1", "name": "Game", "slug": "game" },
+                        "self": { "isAccountConnected": true },
+                        "timeBasedDrops": drops,
+                    }],
+                    "gameEventDrops": awarded,
+                }
+            }
+        })
+    }
+
+    fn tier(id: &str, benefit: &str) -> Value {
+        json!({
+            "id": id,
+            "name": id,
+            "requiredMinutesWatched": 60,
+            "benefitEdges": [{ "benefit": { "id": benefit, "name": benefit } }],
+        })
+    }
+
+    /// A campaign whose detail response carries no `self` edge parses as
+    /// "unclaimed, zero minutes", so an already-claimed drop is mined all over
+    /// again. The awarded-benefit ledger is how Twitch's own client knows
+    /// better, and it was being fetched and discarded.
+    #[test]
+    fn a_drop_whose_benefits_were_all_awarded_is_treated_as_claimed() {
+        let data = inventory(
+            json!([tier("d1", "b1")]),
+            json!([{ "id": "b1", "lastAwardedAt": "2026-08-05T12:00:00Z" }]),
+        );
+        let campaigns = parse_inventory(&data).unwrap();
+        assert!(campaigns[0].drops[0].is_claimed);
+    }
+
+    /// Awarded *before* the campaign began is a different campaign's reward
+    /// that happens to grant the same benefit.
+    #[test]
+    fn a_benefit_awarded_outside_the_window_proves_nothing() {
+        let data = inventory(
+            json!([tier("d1", "b1")]),
+            json!([{ "id": "b1", "lastAwardedAt": "2020-01-01T00:00:00Z" }]),
+        );
+        let campaigns = parse_inventory(&data).unwrap();
+        assert!(!campaigns[0].drops[0].is_claimed);
+    }
+
+    /// Every benefit must have been awarded, not just one of them.
+    #[test]
+    fn a_partially_awarded_drop_is_not_claimed() {
+        let mut two = tier("d1", "b1");
+        two["benefitEdges"] = json!([
+            { "benefit": { "id": "b1", "name": "one" } },
+            { "benefit": { "id": "b2", "name": "two" } },
+        ]);
+        let data = inventory(
+            json!([two]),
+            json!([{ "id": "b1", "lastAwardedAt": "2026-08-05T12:00:00Z" }]),
+        );
+        let campaigns = parse_inventory(&data).unwrap();
+        assert!(!campaigns[0].drops[0].is_claimed);
+    }
+
+    #[test]
+    fn an_absent_or_malformed_ledger_changes_nothing() {
+        for ledger in [json!([]), json!(null), json!("nonsense"),
+                       json!([{ "id": "b1" }, { "lastAwardedAt": "x" }])] {
+            let data = inventory(json!([tier("d1", "b1")]), ledger);
+            let campaigns = parse_inventory(&data).unwrap();
+            assert!(!campaigns[0].drops[0].is_claimed);
+        }
+    }
+
+    /// An explicit `self.isClaimed` from Twitch always wins over inference.
+    #[test]
+    fn the_servers_own_answer_is_not_overridden() {
+        let mut t = tier("d1", "b1");
+        t["self"] = json!({ "isClaimed": false, "currentMinutesWatched": 10 });
+        let data = inventory(
+            json!([t]),
+            json!([{ "id": "b1", "lastAwardedAt": "2020-01-01T00:00:00Z" }]),
+        );
+        let campaigns = parse_inventory(&data).unwrap();
+        assert!(!campaigns[0].drops[0].is_claimed);
+        assert_eq!(campaigns[0].drops[0].current_minutes, 10);
+    }
+
+    #[test]
+    fn a_per_drop_window_is_parsed_when_present() {
+        let mut t = tier("d1", "b1");
+        t["startAt"] = json!("2026-08-10T00:00:00Z");
+        t["endAt"] = json!("2026-08-12T00:00:00Z");
+        let data = inventory(json!([t]), json!([]));
+        let campaigns = parse_inventory(&data).unwrap();
+        assert!(campaigns[0].drops[0].starts_at.is_some());
+        assert!(campaigns[0].drops[0].ends_at.is_some());
     }
 }

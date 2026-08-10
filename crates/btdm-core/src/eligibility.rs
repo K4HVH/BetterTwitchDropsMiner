@@ -26,11 +26,27 @@ pub fn assess(campaign: &DropCampaign, now: DateTime<Utc>) -> Result<(), RejectR
     if mineable_drops(campaign).is_empty() {
         return Err(RejectReason::AllDropsClaimed);
     }
+    // Every remaining tier's own window has closed, so nothing here can be
+    // earned again however long we watch.
+    if mineable_drops(campaign)
+        .iter()
+        .all(|d| d.window_has_closed(now))
+    {
+        return Err(RejectReason::Expired);
+    }
     Ok(())
 }
 
-/// Drops that can be progressed right now: unclaimed, and with every
-/// precondition tier already claimed.
+/// Drops that can be progressed right now: unclaimed, inside their own time
+/// window, and with every precondition tier already claimed.
+pub fn mineable_drops_at(campaign: &DropCampaign, now: DateTime<Utc>) -> Vec<&TimedDrop> {
+    mineable_drops(campaign)
+        .into_iter()
+        .filter(|d| d.is_open_at(now))
+        .collect()
+}
+
+/// As [`mineable_drops_at`], ignoring per-drop windows.
 pub fn mineable_drops(campaign: &DropCampaign) -> Vec<&TimedDrop> {
     let claimed: std::collections::HashSet<&DropId> = campaign
         .drops
@@ -109,6 +125,20 @@ pub fn remaining_minutes(campaign: &DropCampaign) -> u32 {
         .unwrap_or(0)
 }
 
+/// As [`remaining_minutes`], but ignoring tiers whose own window has closed —
+/// they can never be earned, so counting them would make a finishable campaign
+/// look impossible.
+pub fn remaining_minutes_at(campaign: &DropCampaign, now: DateTime<Utc>) -> u32 {
+    campaign
+        .drops
+        .iter()
+        .filter(|d| !d.is_claimed)
+        .filter(|d| !d.window_has_closed(now))
+        .map(|d| total_remaining_minutes(campaign, d))
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +177,8 @@ mod tests {
                 claim_id: None,
                 is_claimed: claimed,
                 precondition_ids: vec![],
+                starts_at: None,
+                ends_at: None,
             }],
         }
     }
@@ -215,6 +247,8 @@ mod tests {
             is_claimed: false,
             // Blocked until d1 is claimed.
             precondition_ids: vec![DropId::from("d1")],
+            starts_at: None,
+            ends_at: None,
         });
         let ids: Vec<_> = mineable_drops(&c).iter().map(|d| d.id.clone()).collect();
         assert_eq!(
@@ -245,6 +279,8 @@ mod tests {
             claim_id: None,
             is_claimed: false,
             precondition_ids: vec![],
+            starts_at: None,
+            ends_at: None,
         });
         assert_eq!(remaining_minutes(&c), 160);
     }
@@ -269,6 +305,8 @@ mod remaining_minutes_tests {
             claim_id: None,
             is_claimed: false,
             precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
+            starts_at: None,
+            ends_at: None,
         }
     }
 
@@ -392,6 +430,8 @@ mod diamond_tests {
             claim_id: None,
             is_claimed: false,
             precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
+            starts_at: None,
+            ends_at: None,
         }
     }
 
@@ -471,5 +511,98 @@ mod diamond_tests {
             drops.push(tier(&format!("t{i}"), 10, &[&prev]));
         }
         assert_eq!(remaining_minutes(&with(drops)), 100);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 10, h, 0, 0).unwrap()
+    }
+
+    fn windowed(id: &str, required: u32, from: Option<u32>, until: Option<u32>) -> TimedDrop {
+        TimedDrop {
+            id: DropId::from(id),
+            name: id.into(),
+            benefits: vec![],
+            required_minutes: required,
+            current_minutes: 0,
+            claim_id: None,
+            is_claimed: false,
+            precondition_ids: vec![],
+            starts_at: from.map(at),
+            ends_at: until.map(at),
+        }
+    }
+
+    fn with(drops: Vec<TimedDrop>) -> DropCampaign {
+        DropCampaign {
+            id: CampaignId::from("c1"),
+            name: "Camp".into(),
+            game: Game {
+                id: GameId::from("g1"),
+                name: "Game".into(),
+                slug: "game".into(),
+                box_art_url: None,
+            },
+            starts_at: at(0),
+            ends_at: at(23),
+            is_account_linked: true,
+            allowed_channels: vec![],
+            account_link_url: None,
+            drops,
+        }
+    }
+
+    /// A tier that only opens next week is not mineable today, however much
+    /// the campaign as a whole is.
+    #[test]
+    fn a_tier_whose_window_has_not_opened_is_not_mineable_yet() {
+        let c = with(vec![windowed("later", 60, Some(20), None)]);
+        assert!(mineable_drops_at(&c, at(12)).is_empty());
+        assert_eq!(mineable_drops_at(&c, at(21)).len(), 1);
+    }
+
+    /// ...but it is still work the campaign requires, so it must count towards
+    /// the total. Otherwise a campaign looks finishable when it is not.
+    #[test]
+    fn a_tier_that_has_not_opened_still_counts_towards_the_work_left() {
+        let c = with(vec![windowed("later", 300, Some(20), None)]);
+        assert_eq!(remaining_minutes_at(&c, at(12)), 300);
+    }
+
+    /// A tier whose window has closed can never be earned, so counting it
+    /// would make a finishable campaign look impossible.
+    #[test]
+    fn a_tier_whose_window_has_closed_stops_counting() {
+        let c = with(vec![
+            windowed("gone", 600, None, Some(10)),
+            windowed("open", 30, None, None),
+        ]);
+        assert_eq!(
+            remaining_minutes_at(&c, at(12)),
+            30,
+            "the missed tier is lost, not outstanding"
+        );
+        // Without the window it would have dominated.
+        assert_eq!(remaining_minutes(&c), 600);
+    }
+
+    /// A campaign whose every remaining tier has closed cannot be mined at all.
+    #[test]
+    fn a_campaign_whose_tiers_have_all_closed_is_rejected() {
+        let c = with(vec![windowed("gone", 60, None, Some(10))]);
+        assert_eq!(assess(&c, at(12)), Err(RejectReason::Expired));
+    }
+
+    #[test]
+    fn a_drop_with_no_window_is_always_open() {
+        let d = windowed("any", 60, None, None);
+        assert!(d.is_open_at(at(0)));
+        assert!(d.is_open_at(at(23)));
+        assert!(!d.window_has_closed(at(23)));
     }
 }
