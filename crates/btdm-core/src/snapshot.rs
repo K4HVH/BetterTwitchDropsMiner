@@ -350,6 +350,8 @@ mod tests {
                 claim_id: None,
                 is_claimed: false,
                 precondition_ids: vec![],
+                starts_at: None,
+                ends_at: None,
             }],
         }
     }
@@ -432,6 +434,8 @@ mod tests {
             claim_id: None,
             is_claimed: false,
             precondition_ids: vec![first],
+            starts_at: None,
+            ends_at: None,
         });
 
         let v = view(&c);

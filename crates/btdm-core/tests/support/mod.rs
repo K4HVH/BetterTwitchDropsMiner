@@ -207,5 +207,7 @@ pub fn drop(id: &str, required: u32, current: u32) -> TimedDrop {
         claim_id: None,
         is_claimed: false,
         precondition_ids: vec![],
+        starts_at: None,
+        ends_at: None,
     }
 }
