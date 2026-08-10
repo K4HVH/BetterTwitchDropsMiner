@@ -58,4 +58,7 @@ pub trait TwitchApi: Send + Sync {
     -> Result<Option<DropProgress>, ApiError>;
 
     async fn claim_drop(&self, claim_id: &str) -> Result<(), ApiError>;
+
+    /// Claims the channel-points bonus chest on a channel.
+    async fn claim_points(&self, channel: &ChannelId, claim_id: &str) -> Result<(), ApiError>;
 }

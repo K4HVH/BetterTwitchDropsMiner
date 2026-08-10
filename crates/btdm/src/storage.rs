@@ -1,6 +1,10 @@
 //! Runtime state. SQLite rather than JSON because a half-written JSON file is
 //! a corrupted config, whereas a half-written transaction is simply rolled back.
 
+// `recent_events`, `event_count` and `open_in_memory` are the stored-history
+// API and the test seam. They are exercised by tests rather than by the binary.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;

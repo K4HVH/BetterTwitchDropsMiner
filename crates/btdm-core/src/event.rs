@@ -56,6 +56,9 @@ pub enum EventKind {
     ChannelOffline {
         channel: ChannelId,
     },
+    PointsClaimed {
+        channel: ChannelId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

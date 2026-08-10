@@ -766,6 +766,29 @@ impl<A: TwitchApi> Engine<A> {
         );
     }
 
+    /// Claims a channel-points bonus.
+    ///
+    /// Only on the channel being watched: claiming elsewhere would mean acting
+    /// on a session this miner is not running.
+    pub async fn claim_points(
+        &mut self,
+        channel: &ChannelId,
+        claim_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApiError> {
+        if self.current_channel().is_none_or(|c| &c.id != channel) {
+            return Ok(());
+        }
+        self.api.claim_points(channel, claim_id).await?;
+        self.emit(
+            now,
+            EventKind::PointsClaimed {
+                channel: channel.clone(),
+            },
+        );
+        Ok(())
+    }
+
     /// Marks a drop as claimable, as reported over the websocket.
     pub fn on_drop_claimable(&mut self, drop_id: &DropId, claim_id: &str) {
         for campaign in &mut self.campaigns {

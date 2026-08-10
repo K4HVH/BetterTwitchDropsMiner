@@ -21,6 +21,8 @@ pub struct Config {
     /// once the dashboard lands, because the state DB holds live OAuth tokens.
     pub bind: String,
     pub data_dir: Option<PathBuf>,
+    /// Optional Discord webhook for drop claims and anything needing attention.
+    pub discord_webhook: Option<String>,
     pub accounts: Vec<AccountConfig>,
 }
 
@@ -29,6 +31,7 @@ impl Default for Config {
         Self {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
+            discord_webhook: None,
             accounts: vec![AccountConfig::default()],
         }
     }
@@ -129,6 +132,7 @@ mod tests {
         let cfg = Config {
             bind: "0.0.0.0:9000".into(),
             data_dir: None,
+            discord_webhook: None,
             accounts: vec![AccountConfig {
                 name: "main".into(),
                 strategy: "coverage".into(),
@@ -176,6 +180,7 @@ mod account_tests {
         let cfg = Config {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
+            discord_webhook: None,
             accounts: vec![],
         };
         let a = cfg.account("whoever");
@@ -189,6 +194,7 @@ mod account_tests {
         let cfg = Config {
             bind: "127.0.0.1:8080".into(),
             data_dir: None,
+            discord_webhook: None,
             accounts: vec![
                 AccountConfig {
                     name: "alt".into(),

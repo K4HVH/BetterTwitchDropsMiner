@@ -1,2 +1,153 @@
-# BetterTwitchDropsMiner
-A better miner for collecting twitch drops
+# Better Twitch Drops Miner
+
+A Twitch drops miner that tells you the truth about what it is doing.
+
+Existing miners fail in ways you cannot see: the progress bar advances, the log
+looks healthy, and nothing is earned. This one only ever displays progress
+Twitch has confirmed, treats a stall as an event rather than a mystery, and
+works a defined recovery ladder before giving up.
+
+Single static binary. Runs headless on a Raspberry Pi. Multi-account.
+
+## What makes it different
+
+**Progress is server-confirmed, never a local timer.** The reference
+implementation's own README admits its countdown "does not represent nor affect
+actual mining speed". Here, if Twitch has not confirmed a minute, nothing moves
+— and the dashboard shows how long it has been since the last confirmation, so
+a stall is the most obvious thing on screen.
+
+**Eligibility is verified, not assumed.** A campaign your account is not linked
+to is never mined, regardless of any setting. This is a real defect in the tool
+this replaces: enabling its badges/emotes option skips the account-link check
+entirely, so it grinds at campaigns that can never progress.
+
+**Feasibility is computed.** A campaign needing four hours with three hours left
+is impossible; it is dropped with a reason instead of consuming the watch slot.
+
+**Recovery is a ladder, not a restart.** On a confirmed stall: resend the
+heartbeat, re-fetch stream info (a restarted broadcast earns nothing while
+looking healthy), re-verify eligibility, switch channel, re-sync campaigns,
+validate auth, quarantine the campaign. Every rung is logged.
+
+**Stale API hashes degrade, not break.** Twitch's private GraphQL uses persisted
+query hashes that rot without notice. Every operation also carries its raw query
+text, so a stale hash becomes a logged warning and an automatic retry.
+
+## Quick start
+
+```sh
+cargo build --release
+./target/release/btdm login      # shows a code to enter at twitch.tv/activate
+./target/release/btdm mine       # mines, with the dashboard on 127.0.0.1:8080
+```
+
+There is no JavaScript toolchain in the build. `cargo build` produces the
+finished binary, dashboard included.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `btdm login [--force]` | Link an account via the device-code flow |
+| `btdm status` | Whether the stored token still works |
+| `btdm logout` | Remove a stored token |
+| `btdm mine [--headless]` | Mine every linked account |
+| `btdm probe` | One diagnostic pass, then exit |
+
+Add `--account <name>` to any command to manage a second account, and
+`--only-this-account` to `mine` to run just that one.
+
+## Configuration
+
+`config.toml` lives in the data directory (`$XDG_DATA_HOME/btdm` by default,
+override with `--data-dir`). It is the source of truth for settings; runtime
+state lives in `state.db` beside it. Both are created mode `0600`.
+
+```toml
+bind = "127.0.0.1:8080"
+# discord_webhook = "https://discord.com/api/webhooks/..."
+
+[[accounts]]
+name = "default"
+strategy = "deadline"
+priority_games = ["Deadlock", "Sea of Thieves"]
+favourite_channels = ["somestreamer"]
+# pinned_channel = "somestreamer"
+```
+
+### Strategies
+
+| Strategy | Behaviour |
+|---|---|
+| `deadline` *(default)* | Earliest deadline first over campaigns that can still be finished. Nothing achievable is lost to expiry. |
+| `priority` | Strict top-down ordering of `priority_games`. |
+| `coverage` | Prefer the channel advancing the most drops at once. |
+| `completionist` | Finish one campaign before starting another. |
+| `manual` | Watch `pinned_channel` and nothing else. |
+
+`favourite_channels` is not a strategy — it is a tie-break applied under all of
+them, so when two channels are equally good for drops the one you care about
+wins, and your channel points accumulate there.
+
+## Deployment
+
+**Docker**
+
+```sh
+docker build -t btdm .
+docker run -d --name btdm -p 8080:8080 -v btdm-data:/data btdm
+docker exec -it btdm btdm --data-dir /data login
+```
+
+**systemd** — copy `packaging/btdm.service` to `~/.config/systemd/user/`, then:
+
+```sh
+systemctl --user enable --now btdm
+journalctl --user -u btdm -f
+```
+
+## Troubleshooting
+
+**Nothing progresses, and the log says the watch endpoint is unreachable.**
+Allow-list `spade.twitch.tv`. It is an analytics domain, so ad-blockers, Pi-hole
+and VPN filters commonly block it — and it is the *only* endpoint that advances
+drop time. Every miner depends on it; most fail silently when it is blocked.
+This one says so.
+
+**A campaign shows as `NotLinked`.** Link your game account at
+<https://www.twitch.tv/drops/campaigns>. The miner will never mine an unlinked
+campaign, because doing so cannot earn anything.
+
+**A campaign shows as `Infeasible`.** It cannot be finished before it expires.
+This is a statement about the clock, not a bug.
+
+## Security
+
+`state.db` holds live Twitch OAuth tokens in plaintext, mode `0600`. Treat it
+like a password file. There is no keyring on a headless Pi, so this is a
+deliberate, documented trade-off rather than an oversight.
+
+The dashboard binds to loopback by default. Binding anywhere else generates a
+bearer token, printed once at startup and required thereafter.
+
+## Architecture
+
+Four crates. The load-bearing constraint is that **`btdm-core` cannot make a
+network call** — it talks to a `TwitchApi` trait, so the mining engine, the
+strategies and the watchdog are all tested against synthetic worlds rather than
+a live account. A test that fails the build if a networking dependency enters
+`btdm-core` enforces this.
+
+| Crate | Responsibility |
+|---|---|
+| `btdm-core` | Domain model, eligibility, feasibility, strategies, watchdog, engine |
+| `btdm-twitch` | Auth, GraphQL transport, spade heartbeat, PubSub |
+| `btdm-web` | Dashboard: axum, SSE, embedded assets |
+| `btdm` | Config, storage, CLI, supervisor |
+
+Design and implementation notes live in `docs/superpowers/`.
+
+## Licence
+
+MIT.

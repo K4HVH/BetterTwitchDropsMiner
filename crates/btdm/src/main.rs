@@ -1,5 +1,6 @@
 mod auth_flow;
 mod config;
+mod notify;
 mod run;
 mod storage;
 mod supervisor;
