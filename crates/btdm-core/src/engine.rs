@@ -912,6 +912,57 @@ impl<A: TwitchApi> Engine<A> {
         self.current.as_ref()
     }
 
+    /// Channels whose stream state is worth following, best first.
+    ///
+    /// The channel being watched always comes first — losing that one is the
+    /// urgent case. After it come the candidates the strategy would consider
+    /// next, so a better channel coming online is noticed within seconds
+    /// rather than at the next scheduled re-evaluation.
+    pub fn channels_worth_following(&self, limit: usize) -> Vec<ChannelId> {
+        let mut out: Vec<ChannelId> = Vec::with_capacity(limit);
+        if let Some(w) = &self.current {
+            out.push(w.channel.id.clone());
+        }
+
+        let mut rest: Vec<&Candidate> = self
+            .live
+            .iter()
+            .filter(|c| !out.contains(&c.channel.id))
+            .collect();
+        // Most campaigns advanced, then most drops, then busiest — the same
+        // order the strategy would broadly favour.
+        rest.sort_by(|a, b| {
+            b.campaign_count()
+                .cmp(&a.campaign_count())
+                .then(b.drop_count().cmp(&a.drop_count()))
+                .then(b.stream.viewers.cmp(&a.stream.viewers))
+                .then(a.channel.login.cmp(&b.channel.login))
+        });
+
+        for candidate in rest {
+            if out.len() >= limit {
+                break;
+            }
+            out.push(candidate.channel.id.clone());
+        }
+        out
+    }
+
+    /// Asks for the choice to be reconsidered on the next pass.
+    ///
+    /// Used when a channel we were following comes online: it may be a better
+    /// option than whatever is being watched, and waiting out the re-selection
+    /// timer would miss it.
+    pub fn request_reselect(&mut self) {
+        self.reselect_forced = true;
+    }
+
+    /// Drops a channel that has gone offline from the candidate view, so the
+    /// dashboard does not keep offering a stream that has ended.
+    pub fn on_channel_offline(&mut self, channel: &ChannelId) {
+        self.live.retain(|c| &c.channel.id != channel);
+    }
+
     pub fn current_channel(&self) -> Option<&Channel> {
         self.current.as_ref().map(|w| &w.channel)
     }

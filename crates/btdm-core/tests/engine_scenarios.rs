@@ -2264,3 +2264,102 @@ async fn a_claim_is_retried_once_the_backoff_elapses() {
     assert_eq!(e.api().claims.lock().unwrap().len(), 1, "and it succeeded");
     assert!(e.campaigns()[0].drops[0].is_claimed, "and it is claimed");
 }
+
+// ---------------------------------------------------------------------------
+// The live channel pool
+//
+// Following only the channel being watched meant a better one coming online
+// was noticed at the next scheduled re-evaluation, up to ten minutes later.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_watched_channel_is_always_followed_first() {
+    let fake = happy_path();
+    for i in 2..6 {
+        fake.channels
+            .lock()
+            .unwrap()
+            .push((channel(&format!("ch{i}"), &format!("s{i}")), stream("bc", true)));
+        fake.available
+            .lock()
+            .unwrap()
+            .insert(format!("ch{i}"), vec![DropId::from("d1")]);
+    }
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let watch = e.select_channel(now()).await.unwrap().unwrap();
+
+    let pool = e.channels_worth_following(10);
+    assert_eq!(
+        pool.first(),
+        Some(&watch.channel.id),
+        "losing the watched channel is the urgent case"
+    );
+    assert!(pool.len() > 1, "and the alternatives are followed too");
+    let mut unique = pool.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), pool.len(), "no channel is followed twice");
+}
+
+/// Twitch drops subscriptions past its per-connection limit silently, which
+/// would look exactly like channels that never go offline.
+#[tokio::test]
+async fn the_pool_is_bounded() {
+    let fake = happy_path();
+    for i in 2..60 {
+        fake.channels
+            .lock()
+            .unwrap()
+            .push((channel(&format!("ch{i}"), &format!("s{i}")), stream("bc", true)));
+        fake.available
+            .lock()
+            .unwrap()
+            .insert(format!("ch{i}"), vec![DropId::from("d1")]);
+    }
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    assert!(e.channels_worth_following(10).len() <= 10);
+}
+
+#[tokio::test]
+async fn an_idle_miner_still_follows_the_channels_it_might_pick() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.stop_watching(now(), btdm_core::event::StopReason::UserRequest);
+
+    assert!(
+        !e.channels_worth_following(10).is_empty(),
+        "the candidates are still worth hearing about"
+    );
+}
+
+/// A channel that has ended must stop being offered by the dashboard.
+#[tokio::test]
+async fn a_channel_that_goes_offline_leaves_the_candidate_list() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert_eq!(e.snapshot("main", None, now()).live.len(), 1);
+
+    e.on_channel_offline(&ChannelId::from("ch1"));
+    assert!(e.snapshot("main", None, now()).live.is_empty());
+}
+
+/// A better channel coming online must prompt a rethink rather than waiting
+/// out the re-selection timer.
+#[tokio::test]
+async fn a_channel_coming_online_prompts_a_rethink() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(!e.needs_selection(now()), "just chose");
+
+    e.request_reselect();
+    assert!(e.needs_selection(now()));
+}
