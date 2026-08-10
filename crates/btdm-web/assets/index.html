@@ -284,6 +284,8 @@
     accountErrors: {},
     rewards: [],
     rewardsFor: null,
+    rewardsLoaded: false,
+    historyLoaded: false,
   };
 
   const el = (tag, cls, text) => {
@@ -325,10 +327,12 @@
   async function loadHistory(account) {
     if (state.historyFor === account) return;
     state.historyFor = account;
+    state.historyLoaded = false;
     try {
       const res = await fetch(api(`/api/history?account=${encodeURIComponent(account)}&limit=300`));
       if (!res.ok) return;
       state.history = await res.json();
+      state.historyLoaded = true;
       if (state.tab === "log") render();
     } catch (e) { /* the live stream still works without it */ }
   }
@@ -362,10 +366,12 @@
   async function loadRewards(account) {
     if (state.rewardsFor === account) return;
     state.rewardsFor = account;
+    state.rewardsLoaded = false;
     try {
       const res = await fetch(api(`/api/rewards?account=${encodeURIComponent(account)}&limit=500`));
       if (!res.ok) return;
       state.rewards = await res.json();
+      state.rewardsLoaded = true;
       if (state.tab === "rewards") render();
     } catch (e) { /* nothing to show is better than a broken page */ }
   }
@@ -534,6 +540,17 @@
     const panel = el("div", "panel pad");
     const w = s.watching;
 
+    // Which account this is. With one account it was nowhere on screen, and
+    // with several the picker alone does not tell you whose numbers these are.
+    const who = el("div", "sub");
+    who.style.marginBottom = "6px";
+    who.append(el("span", "pill", s.account));
+    if (s.login) {
+      who.append(document.createTextNode(" "));
+      who.append(el("span", null, s.login));
+    }
+    panel.append(who);
+
     if (s.paused) {
       panel.append(el("div", "headline", "Paused"));
       panel.append(el("div", "sub", "Mining is stopped. Campaigns are still tracked so nothing expires unnoticed."));
@@ -627,13 +644,20 @@
     const acts = el("div", "row");
     const pause = el("button", s.paused ? "primary" : "", s.paused ? "Resume mining" : "Pause mining");
     pause.onclick = async () => {
-      await send(acct, { command: s.paused ? "resume" : "pause" });
+      // The miner applies commands between passes, and a pass that is
+      // gathering candidates can take a few seconds. Saying so beats a button
+      // that appears to do nothing.
+      if (await send(acct, { command: s.paused ? "resume" : "pause" })) {
+        toast(s.paused ? "Resuming…" : "Pausing…");
+      }
     };
     acts.append(pause);
 
     const sw = el("button", null, "Switch channel");
     sw.disabled = !s.watching;
-    sw.onclick = () => send(acct, { command: "switch_channel" });
+    sw.onclick = async () => {
+      if (await send(acct, { command: "switch_channel" })) toast("Choosing another channel…");
+    };
     acts.append(sw);
 
     const sync = el("button", null, "Refresh campaigns");
@@ -1120,9 +1144,14 @@
     if (!list.length) {
       const p = el("div", "panel pad");
       p.style.marginTop = "16px";
-      p.append(el("div", "empty", state.rewards.length
-        ? "Nothing matches that search."
-        : "Nothing claimed yet. Rewards appear here as they are earned."));
+      // Saying "nothing claimed" before the answer has arrived would be
+      // telling the user something untrue, which is the one thing this
+      // project is built not to do.
+      p.append(el("div", "empty", !state.rewardsLoaded
+        ? "Loading…"
+        : state.rewards.length
+          ? "Nothing matches that search."
+          : "Nothing claimed yet. Rewards appear here as they are earned."));
       box.append(p);
       return box;
     }
@@ -1182,7 +1211,7 @@
     if (!merged.length) {
       const e = el("div", "empty");
       e.style.padding = "14px";
-      e.textContent = "Nothing has happened yet.";
+      e.textContent = state.historyLoaded ? "Nothing has happened yet." : "Loading…";
       panel.append(e);
       return panel;
     }

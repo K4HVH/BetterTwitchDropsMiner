@@ -22,8 +22,16 @@ the page.
 curl -s localhost:8080/api/snapshots > tools/render-check/snapshot.json
 cd tools/render-check && npm install jsdom     # once
 node check.js          # does it work on real data?
-node adversarial.js    # can it be broken?   (needs no snapshot)
+node adversarial.js    # can it be broken?          (needs no snapshot)
+node live.js           # drive the real thing       (needs a running miner)
 ```
+
+`live.js` is the only check that covers the whole path — browser to axum to
+the engine and back. It loads the page from the miner's own server, opens a
+real SSE stream, clicks real controls, and then asks the miner over a separate
+connection whether it actually did what it was told. It changes strategy,
+pauses, excludes a campaign and stars a channel, and puts all of it back
+afterwards. Run it against a miner you do not mind poking.
 
 Exit status is 0 when every check passes, 1 on a failure, 2 when there is no
 snapshot to render.
