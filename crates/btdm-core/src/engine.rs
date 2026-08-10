@@ -40,6 +40,14 @@ pub struct EngineConfig {
     /// Without this the miner only ever chooses when idle, so a campaign that
     /// becomes urgent is ignored until the current stream ends.
     pub reselect_interval: Duration,
+    /// The same, but while something is close to being lost.
+    ///
+    /// Deadline pressure is the only time a ten-minute wait actually costs
+    /// anything: a campaign with days of slack does not care when it is
+    /// picked up, and one with an hour of slack very much does. Reacting
+    /// faster exactly then is cheaper and more targeted than subscribing to
+    /// every channel's stream state in the hope of noticing sooner.
+    pub urgent_reselect_interval: Duration,
     /// How many channels to consider per game.
     pub channel_limit: u32,
     /// Upper bound on per-campaign detail requests during a sync, so a huge
@@ -91,6 +99,7 @@ impl Default for EngineConfig {
             poll_interval: Duration::seconds(120),
             sync_interval: Duration::minutes(10),
             reselect_interval: Duration::minutes(10),
+            urgent_reselect_interval: Duration::minutes(2),
             channel_limit: 30,
             max_detail_fetches: 60,
             max_availability_checks: 160,
@@ -1073,11 +1082,29 @@ impl<A: TwitchApi> Engine<A> {
         if self.paused {
             return false;
         }
-        self.current.is_none()
-            || self.reselect_forced
-            || self
-                .last_selection
-                .is_none_or(|t| now - t >= self.config.reselect_interval)
+        if self.current.is_none() || self.reselect_forced {
+            return true;
+        }
+
+        let interval = if self.anything_at_risk(now) {
+            self.config.urgent_reselect_interval
+        } else {
+            self.config.reselect_interval
+        };
+        self.last_selection.is_none_or(|t| now - t >= interval)
+    }
+
+    /// Whether any mineable campaign is close enough to its deadline that a
+    /// delay in picking it up could lose it.
+    fn anything_at_risk(&self, now: DateTime<Utc>) -> bool {
+        self.campaigns
+            .iter()
+            .filter(|c| !self.excluded_campaigns.contains(&c.id.0))
+            .filter(|c| !self.excluded_games.contains(&c.game.name.to_lowercase()))
+            .any(|c| {
+                let slack = strategy::slack(c, now).num_minutes();
+                (0..snapshot::AT_RISK_SLACK_MINUTES).contains(&slack)
+            })
     }
 
     /// Whether campaigns are due to be re-fetched.

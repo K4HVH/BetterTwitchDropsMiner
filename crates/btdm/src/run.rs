@@ -23,12 +23,24 @@ const AUTH_CHECK_INTERVAL: Duration = Duration::minutes(60);
 const PUBSUB_MAX_BACKOFF: StdDuration = StdDuration::from_secs(180);
 /// How many queued commands before the dashboard is told to slow down.
 const COMMAND_QUEUE: usize = 32;
-/// How many channels to follow for stream state at once.
+/// How many channels to follow for stream state.
 ///
-/// The point is to hear about a stream ending, or a better one starting,
-/// within seconds rather than at the next scheduled re-evaluation. Bounded by
-/// what one PubSub connection can carry; the supervisor clamps it again.
-const CHANNEL_POOL: usize = 45;
+/// One — the channel being watched — by default, and that one is genuinely
+/// load-bearing: without it a stream ending goes unnoticed until the watchdog
+/// fires six minutes later, heartbeating a dead broadcast the whole time.
+///
+/// Following the alternatives too is mostly redundant here. The reference
+/// implementation subscribes to hundreds because it rebuilds its channel list
+/// only once an hour and has no other liveness signal in between. This miner
+/// re-queries the directory every ten minutes while mining and every sixty
+/// seconds while idle, and that query returns only live channels — so it
+/// already knows who is up. The extra subscriptions buy "notice a better
+/// channel sooner", which hysteresis is specifically designed not to act on
+/// anyway, and they cost a much larger reconnect surface.
+///
+/// Raise `followed_channels` in the config if you want earlier discovery;
+/// the mechanism handles it, bounded by what one connection carries.
+const DEFAULT_CHANNEL_POOL: usize = 1;
 
 pub struct RunOptions {
     /// Run a single diagnostic pass and exit, rather than mining forever.
@@ -80,6 +92,11 @@ pub async fn mine(
     };
     config.timing.apply(&mut engine_config);
     let watch_interval = engine_config.watch_interval.to_std()?;
+    let pool_size = if config.timing.followed_channels == 0 {
+        DEFAULT_CHANNEL_POOL
+    } else {
+        config.timing.followed_channels as usize
+    };
     let mut engine = Engine::new(api, engine_config);
     tracing::info!(
         strategy = engine.strategy_name(),
@@ -186,7 +203,7 @@ pub async fn mine(
 
         // Never awaited: the supervisor stops polling this while it reconnects,
         // and blocking the main loop here would stall mining and Ctrl-C alike.
-        let pool = engine.channels_worth_following(CHANNEL_POOL);
+        let pool = engine.channels_worth_following(pool_size);
         if pool != followed {
             let _ = pubsub_follow.send(pool.clone());
             followed = pool;

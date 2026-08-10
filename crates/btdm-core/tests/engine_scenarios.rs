@@ -2363,3 +2363,104 @@ async fn a_channel_coming_online_prompts_a_rethink() {
     e.request_reselect();
     assert!(e.needs_selection(now()));
 }
+
+// ---------------------------------------------------------------------------
+// Reacting faster only when it matters
+//
+// Following every channel's stream state over the websocket buys "notice a
+// better channel sooner". Deadline pressure is the only time that is worth
+// anything, and checking more often exactly then is cheaper and more targeted.
+// ---------------------------------------------------------------------------
+
+/// A campaign with days of slack does not care when it is picked up.
+#[tokio::test]
+async fn a_comfortable_world_is_reconsidered_on_the_slow_interval() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    assert!(!e.needs_selection(now() + chrono::Duration::minutes(5)));
+    assert!(e.needs_selection(now() + chrono::Duration::minutes(11)));
+}
+
+/// A campaign about to be lost very much does.
+#[tokio::test]
+async fn deadline_pressure_shortens_the_interval() {
+    let fake = happy_path();
+    // Needs 60 minutes, has 90 left: inside the at-risk window.
+    let mut tight = campaign("c1", true, vec![drop("d1", 60, 0)]);
+    tight.starts_at = now() - chrono::Duration::days(1);
+    tight.ends_at = now() + chrono::Duration::minutes(90);
+    *fake.inventory.lock().unwrap() = vec![tight];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    assert!(
+        e.needs_selection(now() + chrono::Duration::minutes(3)),
+        "with something about to be lost, three minutes is already too long"
+    );
+}
+
+/// ...but not for a campaign the user excluded, which cannot be lost because
+/// it was never going to be mined.
+#[tokio::test]
+async fn an_excluded_campaign_does_not_count_as_urgent() {
+    let fake = happy_path();
+    let mut tight = campaign("c1", true, vec![drop("d1", 60, 0)]);
+    tight.starts_at = now() - chrono::Duration::days(1);
+    tight.ends_at = now() + chrono::Duration::minutes(90);
+    let mut relaxed = campaign("c2", true, vec![drop("d2", 60, 0)]);
+    relaxed.ends_at = now() + chrono::Duration::days(20);
+    *fake.inventory.lock().unwrap() = vec![tight, relaxed];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1"), DropId::from("d2")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.apply_command(
+        Command::SetCampaignExcluded {
+            campaign: CampaignId::from("c1"),
+            excluded: true,
+        },
+        now(),
+    );
+    e.select_channel(now()).await.unwrap();
+
+    assert!(
+        !e.needs_selection(now() + chrono::Duration::minutes(3)),
+        "nothing the miner will actually mine is at risk"
+    );
+}
+
+/// An impossible campaign is not urgent either — it is already lost, and
+/// treating it as urgent would poll hard forever for no reason.
+#[tokio::test]
+async fn an_already_impossible_campaign_does_not_count_as_urgent() {
+    let fake = happy_path();
+    // One campaign that cannot be finished, and one comfortable one so the
+    // miner is actually watching something rather than idle.
+    let mut doomed = campaign("c-doomed", true, vec![drop("d-doomed", 600, 0)]);
+    doomed.starts_at = now() - chrono::Duration::days(1);
+    doomed.ends_at = now() + chrono::Duration::hours(1);
+    let mut relaxed = campaign("c-relaxed", true, vec![drop("d-relaxed", 60, 0)]);
+    relaxed.ends_at = now() + chrono::Duration::days(20);
+    *fake.inventory.lock().unwrap() = vec![doomed, relaxed];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d-relaxed")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.select_channel(now()).await.unwrap().is_some());
+
+    assert!(
+        !e.needs_selection(now() + chrono::Duration::minutes(3)),
+        "a campaign that is already lost is not a reason to poll hard forever"
+    );
+}
