@@ -593,3 +593,298 @@ async fn a_miner_that_cannot_enrol_says_so() {
         .unwrap();
     assert_eq!(res.status(), 503);
 }
+
+// ---------------------------------------------------------------------------
+// Hostile HTTP
+//
+// Everything here is what an unfriendly client, a confused proxy or a broken
+// script would send. None of it may take the dashboard down, and none of it
+// may reach past the authorisation guard.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_giant_body_is_rejected_without_taking_the_server_down() {
+    let hub = Hub::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    hub.register("main", tx);
+    let base = start(hub, None).await;
+    let http = reqwest::Client::new();
+
+    let huge = "x".repeat(8 * 1024 * 1024);
+    let res = http
+        .post(format!("{base}/api/accounts/main/command"))
+        .header("content-type", "application/json")
+        .body(format!(r#"{{"command":"set_strategy","name":"{huge}"}}"#))
+        .send()
+        .await;
+
+    // Rejected or accepted, but the server must still be alive afterwards.
+    let _ = res;
+    let health = reqwest::get(format!("{base}/api/health")).await.unwrap();
+    assert!(health.status().is_success() || health.status().as_u16() == 503);
+}
+
+#[tokio::test]
+async fn deeply_nested_json_does_not_blow_the_stack() {
+    let hub = Hub::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    hub.register("main", tx);
+    let base = start(hub, None).await;
+
+    let nested = format!("{}{}", "[".repeat(20_000), "]".repeat(20_000));
+    let res = reqwest::Client::new()
+        .post(format!("{base}/api/accounts/main/command"))
+        .header("content-type", "application/json")
+        .body(nested)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+
+    // Still serving.
+    assert!(
+        reqwest::get(format!("{base}/api/snapshots"))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+}
+
+/// An account name is a path segment. It must not be able to address another
+/// route, and it must not be able to reach an account that is not registered.
+#[tokio::test]
+async fn an_account_name_cannot_traverse_the_path() {
+    let hub = Hub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    hub.register("main", tx);
+    let base = start(hub, None).await;
+    let http = reqwest::Client::new();
+
+    for hostile in [
+        "..%2F..%2Fmain",
+        "%2E%2E%2Fmain",
+        "main%00",
+        "MAIN",
+        "main%20",
+    ] {
+        let res = http
+            .post(format!("{base}/api/accounts/{hostile}/command"))
+            .json(&Command::Pause)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            404,
+            "'{hostile}' must not resolve to the registered account"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "nothing should have reached the miner");
+}
+
+/// Names Twitch actually permits must still work.
+#[tokio::test]
+async fn an_unusual_but_legitimate_account_name_works() {
+    let hub = Hub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    hub.register("my account 日本語", tx);
+    let base = start(hub, None).await;
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{base}/api/accounts/{}/command",
+            urlencoding_lite("my account 日本語")
+        ))
+        .json(&Command::Pause)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(rx.recv().await.unwrap(), Command::Pause);
+}
+
+/// Minimal percent-encoding, so the test does not need a dependency.
+fn urlencoding_lite(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// Wrong types in the right shape must be refused, not coerced into something
+/// the miner then acts on.
+#[tokio::test]
+async fn commands_with_wrong_types_are_refused() {
+    let hub = Hub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    hub.register("main", tx);
+    let base = start(hub, None).await;
+    let http = reqwest::Client::new();
+
+    for body in [
+        r#"{"command":"set_strategy","name":123}"#,
+        r#"{"command":"set_strategy"}"#,
+        r#"{"command":"set_favourite","login":"x"}"#,
+        r#"{"command":"set_priority_games","games":"not an array"}"#,
+        r#"{"command":"pin","channel":[]}"#,
+        r#"{"command":null}"#,
+        r#"[]"#,
+        r#""pause""#,
+        r#"null"#,
+        "",
+    ] {
+        let res = http
+            .post(format!("{base}/api/accounts/main/command"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400, "body {body:?} should be refused");
+    }
+    assert!(rx.try_recv().is_err(), "nothing malformed may reach the miner");
+}
+
+/// A queue that has filled up must say so rather than silently dropping the
+/// user's command.
+#[tokio::test]
+async fn a_full_command_queue_is_reported() {
+    let hub = Hub::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    hub.register("main", tx);
+    let base = start(hub, None).await;
+    let http = reqwest::Client::new();
+
+    // The first fills the queue of one; the second cannot be accepted.
+    let first = http
+        .post(format!("{base}/api/accounts/main/command"))
+        .json(&Command::Pause)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    let second = http
+        .post(format!("{base}/api/accounts/main/command"))
+        .json(&Command::Pause)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 503, "a dropped command must not look accepted");
+}
+
+/// Many dashboards open at once must not starve each other or the miner.
+#[tokio::test]
+async fn many_concurrent_readers_are_served() {
+    let hub = Hub::new();
+    hub.publish(snapshot("main"));
+    let base = start(hub, None).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let url = format!("{base}/api/snapshots");
+        handles.push(tokio::spawn(async move {
+            reqwest::get(url).await.unwrap().status().as_u16()
+        }));
+    }
+    for h in handles {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+}
+
+/// A token must not be accepted merely because it is a prefix, a suffix, or
+/// present under a different key.
+#[tokio::test]
+async fn token_comparison_cannot_be_fooled() {
+    let base = start(Hub::new(), Some("secret")).await;
+    let http = reqwest::Client::new();
+
+    for query in [
+        "token=sec",
+        "token=secretx",
+        "token=xsecret",
+        "tokenx=secret",
+        "atoken=secret",
+        "token=SECRET",
+        "token=",
+        "token=secret%20",
+    ] {
+        let res = http
+            .get(format!("{base}/api/snapshots?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401, "'{query}' must not authorise");
+    }
+
+    // ...and the real one still does, wherever it sits in the query string.
+    for query in ["token=secret", "a=1&token=secret", "token=secret&b=2"] {
+        let res = http
+            .get(format!("{base}/api/snapshots?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "'{query}' should authorise");
+    }
+}
+
+/// An unknown route must not fall through to something that serves state.
+#[tokio::test]
+async fn unknown_routes_are_not_served() {
+    let hub = Hub::new();
+    hub.publish(snapshot("main"));
+    let base = start(hub, Some("secret")).await;
+
+    for path in [
+        "/api",
+        "/api/",
+        "/api/snapshot",
+        "/api/snapshots/",
+        "/../index.html",
+        "/api/accounts//command",
+        "/api/accounts/main",
+    ] {
+        let res = reqwest::get(format!("{base}{path}?token=secret"))
+            .await
+            .unwrap();
+        assert!(
+            res.status().as_u16() == 404 || res.status().as_u16() == 405,
+            "{path} returned {}",
+            res.status()
+        );
+    }
+}
+
+/// Reading state must never be possible through a method that skips the guard.
+#[tokio::test]
+async fn other_methods_do_not_bypass_the_guard() {
+    let hub = Hub::new();
+    hub.publish(snapshot("main"));
+    let base = start(hub, Some("secret")).await;
+    let http = reqwest::Client::new();
+
+    for method in [reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::DELETE] {
+        let res = http
+            .request(method.clone(), format!("{base}/api/snapshots"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.status().as_u16() != 200,
+            "{method} on /api/snapshots returned 200"
+        );
+    }
+
+    // HEAD is a read, and must be guarded exactly like GET.
+    let head = http
+        .request(reqwest::Method::HEAD, format!("{base}/api/snapshots"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.status(), 401);
+}

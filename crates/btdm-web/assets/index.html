@@ -431,7 +431,8 @@
     return b;
   }
 
-  function image(url, cls, alt) {
+  function image(rawUrl, cls, alt) {
+    const url = safeUrl(rawUrl);
     if (!url) {
       const ph = el("div", cls + " noimg");
       return ph;
@@ -445,11 +446,61 @@
     return img;
   }
 
-  const twitchUrl = (login) => "https://twitch.tv/" + encodeURIComponent(login);
+  const twitchUrl = (login) => "https://twitch.tv/" + encodeURIComponent(login || "");
+
+  /// A URL safe to put in an href or an img src.
+  ///
+  /// Everything on this page comes from Twitch by way of the miner, and a
+  /// `javascript:` URL in a link the user is being *encouraged* to click —
+  /// "Link account →" — would run on click. Only http(s) is ever emitted;
+  /// anything else is dropped, so the link simply does not appear.
+  function safeUrl(url) {
+    if (typeof url !== "string") return null;
+    const trimmed = url.trim();
+    return /^https?:\/\//i.test(trimmed) ? trimmed : null;
+  }
 
   // ---------------------------------------------------------------------
   // Rendering
   // ---------------------------------------------------------------------
+  /// Fills in anything the payload is missing.
+  ///
+  /// The page builds itself top to bottom, so one absent field used to throw
+  /// part-way through and leave a half-rendered page — header and hero, no
+  /// tabs, no way back. A snapshot from an older miner, or a partial one from
+  /// a proxy, must degrade to "that section is empty" rather than to a broken
+  /// page with no navigation.
+  function normalise(s) {
+    if (!s || typeof s !== "object" || Array.isArray(s)) return null;
+    return {
+      ...s,
+      account: typeof s.account === "string" ? s.account : "unknown",
+      strategy: s.strategy || "unknown",
+      state: s.state || "Unknown",
+      eligible: Array.isArray(s.eligible) ? s.eligible : [],
+      rejected: Array.isArray(s.rejected) ? s.rejected : [],
+      live: Array.isArray(s.live) ? s.live : [],
+      strategies: Array.isArray(s.strategies) ? s.strategies : [],
+      settings: {
+        strategy: "", priority_games: [], favourites: [], pinned: null,
+        excluded_campaigns: [], excluded_games: [],
+        ...(s.settings && typeof s.settings === "object" ? s.settings : {}),
+      },
+      health: {
+        verdict: "unknown", seconds_since_confirmation: null, recovery_step: null,
+        last_sync: null, next_sync_in_seconds: null,
+        quarantined_channels: [], quarantined_campaigns: [],
+        ...(s.health && typeof s.health === "object" ? s.health : {}),
+      },
+      totals: {
+        campaigns_known: 0, campaigns_eligible: 0, campaigns_at_risk: 0,
+        drops_claimed: 0, drops_remaining: 0, drops_claimable: 0,
+        minutes_remaining: 0,
+        ...(s.totals && typeof s.totals === "object" ? s.totals : {}),
+      },
+    };
+  }
+
   function snap() {
     if (state.current && state.snapshots.has(state.current)) {
       return state.snapshots.get(state.current);
@@ -507,8 +558,9 @@
     link.rel = "noreferrer noopener";
     head.append(link);
     head.append(el("span", "pill " + (w.stalled ? "bad" : "ok"), w.stalled ? "STALLED" : "mining"));
-    if (w.campaigns.length > 1) {
-      head.append(el("span", "pill accent", `${w.campaigns.length} campaigns at once`));
+    const watchedCampaigns = Array.isArray(w.campaigns) ? w.campaigns : [];
+    if (watchedCampaigns.length > 1) {
+      head.append(el("span", "pill accent", `${watchedCampaigns.length} campaigns at once`));
     }
     panel.append(head);
 
@@ -518,7 +570,7 @@
       t.style.marginTop = "2px";
       panel.append(t);
     }
-    panel.append(el("div", "sub", w.campaigns.join(" · ")));
+    panel.append(el("div", "sub", watchedCampaigns.join(" · ")));
 
     const line = el("div", "confirm");
     if (w.current_minutes === null || w.current_minutes === undefined) {
@@ -674,7 +726,7 @@
     tags.append(el("span", "pill", hours(c.remaining_minutes) + " to go"));
     if (c.live_channels) tags.append(el("span", "pill", plural(c.live_channels, "channel") + " live"));
     else tags.append(el("span", "pill", "nobody live"));
-    if (c.allowed_channels.length) {
+    if ((c.allowed_channels || []).length) {
       tags.append(el("span", "pill", `only ${plural(c.allowed_channels.length, "channel")}`));
     }
     info.append(tags);
@@ -690,9 +742,9 @@
     head.append(acts);
     card.append(head);
 
-    if (c.drops.length) {
+    if ((c.drops || []).length) {
       const list = el("div", "drops");
-      c.drops.forEach((d) => list.append(dropRow(d)));
+      (c.drops || []).forEach((d) => list.append(dropRow(d)));
       card.append(list);
     }
     return card;
@@ -700,7 +752,8 @@
 
   function dropRow(d) {
     const row = el("div", "drop" + (d.is_claimed ? " claimed" : "") + (d.locked ? " locked" : ""));
-    const art = d.benefits.find((b) => b.image_url);
+    const benefits = Array.isArray(d.benefits) ? d.benefits : [];
+    const art = benefits.find((b) => b.image_url);
     row.append(image(art ? art.image_url : null, "", d.name));
 
     const body = el("div", "body");
@@ -713,8 +766,8 @@
     }
     body.append(name);
 
-    if (d.benefits.length) {
-      body.append(el("div", "benefits", d.benefits.map((b) => b.name).join(", ")));
+    if (benefits.length) {
+      body.append(el("div", "benefits", benefits.map((b) => b.name).join(", ")));
     }
     if (!d.is_claimed) body.append(bar(d.percent, d.percent >= 100));
     row.append(body);
@@ -804,9 +857,10 @@
       tr.append(el("td", "num", c.viewers.toLocaleString()));
 
       const what = el("td");
+      const chanCampaigns = Array.isArray(c.campaigns) ? c.campaigns : [];
       what.append(document.createTextNode(
-        `${plural(c.campaigns.length, "campaign")}, ${plural(c.drops, "drop")}`));
-      const names = el("div", "sub", c.campaigns.join(", "));
+        `${plural(chanCampaigns.length, "campaign")}, ${plural(c.drops || 0, "drop")}`));
+      const names = el("div", "sub", chanCampaigns.join(", "));
       names.style.fontSize = ".78rem";
       what.append(names);
       tr.append(what);
@@ -891,9 +945,10 @@
             // "Your account is not linked" without saying where to link it is
             // a dead end, and this is by far the largest group of campaigns.
             const fix = el("td");
-            if (r.action_url) {
+            const actionUrl = safeUrl(r.action_url);
+            if (actionUrl) {
                 const a = el("a", null, "Link account →");
-                a.href = r.action_url;
+                a.href = actionUrl;
                 a.target = "_blank";
                 a.rel = "noreferrer noopener";
                 a.style.color = "var(--accent)";
@@ -1176,7 +1231,7 @@
         code.style.letterSpacing = "0.12em";
         row.append(code);
         const link = el("a", null, "Open twitch.tv/activate →");
-        link.href = l.verification_uri;
+        link.href = safeUrl(l.verification_uri) || "https://www.twitch.tv/activate";
         link.target = "_blank";
         link.rel = "noreferrer noopener";
         link.style.color = "inherit";
@@ -1324,7 +1379,8 @@
 
     source.addEventListener("snapshot", (msg) => {
       try {
-        const s = JSON.parse(msg.data);
+        const s = normalise(JSON.parse(msg.data));
+        if (!s) return;
         const isNewAccount = !state.snapshots.has(s.account);
         state.snapshots.set(s.account, s);
         state.connected = true;
@@ -1358,8 +1414,10 @@
       const res = await fetch(api("/api/snapshots"));
       if (!res.ok) return;
       const list = await res.json();
-      list.forEach((s) => state.snapshots.set(s.account, s));
-      if (list.length) { state.connected = true; render(); }
+      if (!Array.isArray(list)) return;
+      const clean = list.map(normalise).filter(Boolean);
+      clean.forEach((s) => state.snapshots.set(s.account, s));
+      if (clean.length) { state.connected = true; render(); }
     } catch (e) { state.connected = false; connection(); }
   }
 
