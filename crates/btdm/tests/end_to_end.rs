@@ -185,11 +185,16 @@ fn answer(op: &Value, seen: &Seen, drop_minutes: u32) -> Value {
                 }
             }
         }),
+        // What Twitch actually returns today: only sitewide reward campaigns,
+        // never the game campaign the channel is visibly earning. Answering
+        // with `c1` here would test a Twitch that no longer exists, and is
+        // precisely why nothing caught the miner selecting channels
+        // alphabetically for hours.
         "DropsHighlightService_AvailableDrops" => json!({
             "channel": {
                 "viewerDropCampaigns": [{
-                    "id": "c1",
-                    "timeBasedDrops": [{ "id": "d1" }],
+                    "id": "sitewide-reward",
+                    "timeBasedDrops": [{ "id": "unrelated-drop" }],
                 }]
             }
         }),
@@ -441,6 +446,33 @@ fn an_unknown_configured_strategy_falls_back_rather_than_failing() {
         seen.heartbeats.load(Ordering::SeqCst),
         1,
         "a typo in the config must not stop mining"
+    );
+    });
+}
+
+/// The whole binary, against a Twitch that confirms nothing.
+///
+/// This is the shape production actually returns: `viewerDropCampaigns` names
+/// only a sitewide reward and never the game campaign the channel is earning.
+/// The miner must still choose a channel on merit and send a heartbeat for it.
+/// It did not — it fell through to a path that ignored the strategy entirely
+/// and took whichever channel sorted first — and no test noticed, because the
+/// fake above used to answer with exactly the drop the test wanted.
+#[test]
+fn the_miner_mines_a_twitch_that_confirms_nothing() {
+    serial(async {
+    let seen = Arc::new(Seen::default());
+    let base = fake_twitch(Arc::clone(&seen), 5).await;
+    let (storage, config, _dir) = miner(&base);
+
+    probe(&storage, &config, "default")
+        .await
+        .expect("a pass must complete");
+
+    assert_eq!(
+        seen.heartbeats.load(Ordering::SeqCst),
+        1,
+        "the miner must watch something even though Twitch confirmed nothing"
     );
     });
 }
