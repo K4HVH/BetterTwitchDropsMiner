@@ -18,7 +18,9 @@ use crate::snapshot::{
     self, HealthView, LiveChannelView, QuarantineView, RejectedView, SettingsView, Snapshot,
     StrategyView, Totals, ViewContext, WatchingView,
 };
-use crate::strategy::{self, Advance, Candidate, Decision, MiningStrategy, WorldView};
+use crate::strategy::{
+    self, Advance, Candidate, Confidence, Decision, MiningStrategy, WorldView,
+};
 use crate::watchdog::{Quarantine, RecoveryStep, Verdict, Watchdog, WatchdogConfig};
 use futures_util::StreamExt;
 use chrono::{DateTime, Duration, Utc};
@@ -1167,7 +1169,12 @@ impl<A: TwitchApi> Engine<A> {
         let mut wanted_details: Vec<CampaignId> = Vec::new();
         let mut skipped_unlinked = 0usize;
         let mut unlinked: Vec<RejectedView> = Vec::new();
+        // The listing is the only source of some presentation fields, and the
+        // detail response that replaces it does not always carry them. Kept so
+        // the richer answer can be reassembled from both.
+        let mut listed: HashMap<CampaignId, DropCampaign> = HashMap::new();
         for campaign in offered {
+            listed.insert(campaign.id.clone(), campaign.clone());
             if merged.contains_key(&campaign.id) {
                 continue;
             }
@@ -1204,13 +1211,35 @@ impl<A: TwitchApi> Engine<A> {
         // and asking about them one at a time was most of a sync's wall time.
         for (id, result) in self.api.campaign_details_many(&wanted_details).await {
             match result {
-                Ok(Some(full)) => {
+                Ok(Some(mut full)) => {
+                    // The detail response is richer about drops but poorer
+                    // about presentation: it frequently returns a game with no
+                    // box art where the campaign list had one. Replacing
+                    // wholesale therefore *lost* artwork on exactly the
+                    // campaigns the user cares about — the mineable ones, which
+                    // are the only ones that get expanded. Every rejected
+                    // campaign kept its image and over half the eligible ones
+                    // showed a blank tile.
+                    if let Some(existing) = merged.get(&full.id).or_else(|| listed.get(&full.id)) {
+                        full.fill_presentation_from(existing);
+                    }
                     merged.insert(full.id.clone(), full);
                 }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(campaign = %id, error = %e, "campaign details failed");
                 }
+            }
+        }
+
+        // Campaigns already in the inventory are never detail-fetched — there
+        // is nothing to learn — so they never passed through the merge above
+        // and kept whatever the inventory knew, which is no artwork at all.
+        // That is precisely the set the user has been mining, so those were
+        // the blank tiles.
+        for (id, campaign) in merged.iter_mut() {
+            if let Some(from_list) = listed.get(id) {
+                campaign.fill_presentation_from(from_list);
             }
         }
 
@@ -1354,17 +1383,19 @@ impl<A: TwitchApi> Engine<A> {
         // user's command: `select_channel` returned Err, the caller logged it,
         // and `needs_selection` then reported nothing was due for another ten
         // minutes — with the dashboard already told the command succeeded.
-        let (candidates, fallbacks) = self.gather_candidates(now).await?;
+        let candidates = self.gather_candidates(now).await?;
         self.last_selection = Some(now);
         self.reselect_forced = false;
-        // Kept for the dashboard, so the user sees the choice we faced.
+        // Kept for the dashboard, so the user sees the choice we faced. This
+        // is every channel considered, not just the ones Twitch confirmed —
+        // when it held only confirmed ones it was empty on every real pass,
+        // and the dashboard showed nobody live while the miner was mining.
         self.live = candidates.clone();
 
         // An explicit "watch this one" beats the strategy outright.
         if let Some(login) = self.forced_channel.take() {
             match candidates
                 .iter()
-                .chain(fallbacks.iter())
                 .find(|c| c.channel.login.eq_ignore_ascii_case(&login))
             {
                 Some(c) => {
@@ -1438,26 +1469,6 @@ impl<A: TwitchApi> Engine<A> {
                 }
                 tracing::info!(reason, "no channel selected");
             }
-        }
-
-        // Nothing passed the strict availability check. Falling back beats
-        // mining nothing at all, but it is announced rather than silent.
-        if candidates.is_empty()
-            && let Some(c) = fallbacks.into_iter().next()
-        {
-            tracing::warn!(
-                channel = %c.channel.login,
-                "no channel passed the drop-availability check; falling back to a \
-                 directory drops-enabled tag. If progress does not confirm, this \
-                 channel genuinely earns nothing and the watchdog will move on."
-            );
-            let reason = format!(
-                "unverified fallback: nobody passed the drop check, so {} was tried \
-                 on the directory's drops-enabled tag alone",
-                c.channel.display_name
-            );
-            self.begin_watching(now, c, reason);
-            return Ok(self.current.clone());
         }
 
         Ok(None)
@@ -1538,10 +1549,10 @@ impl<A: TwitchApi> Engine<A> {
     async fn gather_candidates(
         &mut self,
         now: DateTime<Utc>,
-    ) -> Result<(Vec<Candidate>, Vec<Candidate>), ApiError> {
+    ) -> Result<Vec<Candidate>, ApiError> {
         let wants = self.wants(now);
         if wants.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
 
         // --- one directory query per distinct game --------------------------
@@ -1779,13 +1790,13 @@ impl<A: TwitchApi> Engine<A> {
             })
             .collect();
 
-        let mut verified = Vec::new();
-        let mut fallbacks = Vec::new();
+        let mut candidates = Vec::new();
+        let mut unusable = 0usize;
 
         for (item, outcome) in results {
-            // Everything this channel could serve, if the check comes back
-            // inconclusive and we fall back to trusting the directory.
-            let hoped: Vec<Advance> = item
+            // What the channel serves on the strength of the directory alone:
+            // it is streaming the campaign's game and passes its allow-list.
+            let by_game: Vec<Advance> = item
                 .wants
                 .iter()
                 .map(|i| Advance {
@@ -1794,11 +1805,16 @@ impl<A: TwitchApi> Engine<A> {
                 })
                 .collect();
 
-            match outcome {
+            // The per-channel check can only *add* to that.
+            //
+            // It used to replace it, which is why nothing was ever selected on
+            // merit: Twitch stopped listing game campaigns here, so the
+            // intersection was empty for every channel on every pass and the
+            // strategy was never consulted at all. See [`Confidence`].
+            let confirmed: Vec<Advance> = match &outcome {
                 Ok(available) => {
-                    let available: HashSet<DropId> = available.into_iter().collect();
-                    let advances: Vec<Advance> = item
-                        .wants
+                    let available: HashSet<&DropId> = available.iter().collect();
+                    item.wants
                         .iter()
                         .filter_map(|i| {
                             let want = &wants[*i];
@@ -1813,33 +1829,45 @@ impl<A: TwitchApi> Engine<A> {
                                 drops,
                             })
                         })
-                        .collect();
-
-                    if !advances.is_empty() {
-                        verified.push(make_candidate(&item, advances, &wants));
-                    } else if item.stream.drops_enabled {
-                        fallbacks.push(make_candidate(&item, hoped, &wants));
-                    }
+                        .collect()
                 }
                 Err(e) => {
-                    // A failed check must not silently exclude a channel.
-                    tracing::warn!(
+                    // Inconclusive, not negative. The directory still stands.
+                    tracing::debug!(
                         channel = %item.channel.login,
                         error = %e,
-                        "availability check failed; keeping as a fallback"
+                        "availability check failed; falling back to the directory tag"
                     );
-                    if item.stream.drops_enabled {
-                        fallbacks.push(make_candidate(&item, hoped, &wants));
-                    }
+                    Vec::new()
                 }
-            }
+            };
+
+            let (advances, confidence) = if !confirmed.is_empty() {
+                (confirmed, Confidence::Confirmed)
+            } else if item.stream.drops_enabled {
+                (by_game, Confidence::Tagged)
+            } else {
+                // No tag and no confirmation is the one case with nothing to
+                // go on. Channels resolved by name for an allow-list arrive
+                // with no tag, so this is where the check earns its keep.
+                unusable += 1;
+                continue;
+            };
+
+            candidates.push(make_candidate(&item, advances, &wants, confidence));
+        }
+
+        if unusable > 0 {
+            tracing::debug!(
+                unusable,
+                "channels had neither a drops-enabled tag nor a confirmed drop"
+            );
         }
 
         // Concurrency makes completion order arbitrary; sort so selection is
-        // reproducible rather than a race.
-        let order = |c: &Candidate| c.channel.login.clone();
-        verified.sort_by_key(order);
-        fallbacks.sort_by_key(order);
+        // reproducible rather than a race. The strategy scores them properly;
+        // this only settles ties.
+        candidates.sort_by_key(|c: &Candidate| c.channel.login.clone());
 
         if skipped > 0 {
             // Silently checking only some of the channels would make "nobody
@@ -1862,7 +1890,7 @@ impl<A: TwitchApi> Engine<A> {
             );
         }
 
-        Ok((verified, fallbacks))
+        Ok(candidates)
     }
 
     fn begin_watching(&mut self, now: DateTime<Utc>, candidate: Candidate, reason: String) {
@@ -2159,7 +2187,12 @@ struct ChannelWork {
 
 /// Builds a candidate with its advances ordered most-urgent-first, which is
 /// what makes `primary_campaign` meaningful.
-fn make_candidate(item: &ChannelWork, mut advances: Vec<Advance>, wants: &[Want]) -> Candidate {
+fn make_candidate(
+    item: &ChannelWork,
+    mut advances: Vec<Advance>,
+    wants: &[Want],
+    confidence: Confidence,
+) -> Candidate {
     advances.sort_by(|a, b| {
         let slack = |id: &CampaignId| {
             wants
@@ -2176,6 +2209,7 @@ fn make_candidate(item: &ChannelWork, mut advances: Vec<Advance>, wants: &[Want]
         channel: item.channel.clone(),
         stream: item.stream.clone(),
         advances,
+        confidence,
     }
 }
 

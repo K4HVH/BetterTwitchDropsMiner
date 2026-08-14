@@ -195,7 +195,11 @@ impl TwitchApi for TwitchClient {
                         "includeRestricted": ["SUB_ONLY_LIVE"],
                         "recommendationsContext": { "platform": "web" },
                         "sort": "RELEVANCE",
-                        "systemFilters": [],
+                        // Let Twitch do the filtering. Asking for every live
+                        // stream and then reading the drops-enabled tag off
+                        // the result spent the page budget on channels that
+                        // cannot earn: 3 of any 10 returned for a busy game.
+                        "systemFilters": ["DROPS_ENABLED"],
                         "tags": [],
                         "requestID": "JIRA-VXP-2397"
                     },
@@ -205,7 +209,15 @@ impl TwitchApi for TwitchClient {
                 }),
             )
             .await?;
-        Ok(parse::parse_directory(&data)?)
+        let mut channels = parse::parse_directory(&data)?;
+        // The query above asked Twitch for drops-enabled streams only, so
+        // every row is drops-enabled whether or not the broadcaster also set a
+        // matching freeform tag. Re-deriving it from tags here would throw
+        // away channels the server already vouched for.
+        for (_, stream) in &mut channels {
+            stream.drops_enabled = true;
+        }
+        Ok(channels)
     }
 
     async fn stream_info(&self, login: &str) -> Result<Option<Stream>, ApiError> {

@@ -34,6 +34,36 @@ pub struct Advance {
     pub drops: Vec<DropId>,
 }
 
+/// How we know a channel can earn what we think it can.
+///
+/// Twitch's per-channel `viewerDropCampaigns` used to list the campaigns a
+/// channel could progress, which made it a precise filter. It no longer does:
+/// as of August 2026 it returns only sitewide reward campaigns, so a channel
+/// visibly earning a game's drops reports none of them. Treating that as a veto
+/// rejected every candidate and left selection running on whatever fell out of
+/// the fallback path.
+///
+/// So the check is now a *rescue*, never a veto — the same way the reference
+/// implementation uses it. It can raise confidence, and it can save a channel
+/// that carries no drops-enabled tag, but it can never remove one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Confidence {
+    /// Twitch's directory tagged the stream drops-enabled and it is streaming
+    /// the campaign's game. This is the ordinary case.
+    Tagged,
+    /// Twitch named these exact drops as progressable on this channel.
+    Confirmed,
+}
+
+impl Confidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Confidence::Confirmed => "confirmed by Twitch",
+            Confidence::Tagged => "drops-enabled tag",
+        }
+    }
+}
+
 /// A channel that could be watched, and everything it would earn at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -41,6 +71,8 @@ pub struct Candidate {
     pub stream: Stream,
     /// Every campaign this one channel advances, most urgent first.
     pub advances: Vec<Advance>,
+    /// How the advances above were established.
+    pub confidence: Confidence,
 }
 
 impl Candidate {
@@ -80,6 +112,7 @@ impl Candidate {
             channel: self.channel.clone(),
             stream: self.stream.clone(),
             advances,
+            confidence: self.confidence,
         })
     }
 }
@@ -158,6 +191,10 @@ const EXTRA_CAMPAIGN_BONUS: f64 = 3.0;
 /// A challenger must beat the incumbent by this much to trigger a switch,
 /// so the miner does not thrash between two near-equal channels.
 const HYSTERESIS_MARGIN: f64 = 10.0;
+/// Preference for a channel Twitch named outright over one inferred from the
+/// directory tag. Deliberately below [`FAVOURITE_BONUS`]: it is a nicety, and
+/// on today's Twitch almost nothing is confirmed.
+const CONFIRMED_BONUS: f64 = 1.0;
 
 /// Runs the shared pipeline and returns what to do.
 ///
@@ -240,6 +277,13 @@ fn tie_break_bonus(candidate: &Candidate, world: &WorldView) -> f64 {
     bonus += candidate.drop_count() as f64;
     // ...and an extra whole campaign is worth more than an extra tier.
     bonus += candidate.campaign_count().saturating_sub(1) as f64 * EXTRA_CAMPAIGN_BONUS;
+    // A channel Twitch explicitly confirmed beats an equally-good one we only
+    // inferred from the drops-enabled tag. Small on purpose: since Twitch
+    // stopped listing game campaigns per channel this is rarely available, and
+    // it must never outweigh a real deadline.
+    if candidate.confidence == Confidence::Confirmed {
+        bonus += CONFIRMED_BONUS;
+    }
     // Viewer count as a stability proxy, deliberately tiny.
     bonus += (candidate.stream.viewers as f64).ln_1p() * 0.01;
     bonus
@@ -598,6 +642,7 @@ mod tests {
                         .collect(),
                 })
                 .collect(),
+            confidence: Confidence::Tagged,
         }
     }
 
@@ -1206,6 +1251,7 @@ mod priority_naming_tests {
                 campaign: CampaignId::from(campaign_id),
                 drops: vec![DropId::from(&format!("{campaign_id}-d")[..])],
             }],
+            confidence: Confidence::Tagged,
         }
     }
 

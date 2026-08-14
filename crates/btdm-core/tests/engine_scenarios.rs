@@ -2547,3 +2547,242 @@ async fn an_unlinked_upcoming_campaign_is_not_woken_for() {
         "a campaign nobody can mine is not worth waking for"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What Twitch actually returns
+//
+// `viewerDropCampaigns` stopped listing a channel's game drop campaigns some
+// time before August 2026: a channel visibly earning a game's drops reports
+// none of them, and returns only sitewide reward campaigns instead. The engine
+// treated that response as authoritative, so the intersection with the drops
+// we wanted was empty on every channel on every pass.
+//
+// The whole scoring pipeline was dead as a result — nothing reached the
+// strategy, and the miner watched whichever drops-enabled channel sorted first
+// alphabetically. Against a real account it sat on the same channel for hours
+// believing it had chosen it.
+// ---------------------------------------------------------------------------
+
+/// Twitch answers the availability check with a drop from a campaign we are
+/// not mining, which is what it does today for every channel.
+fn twitch_as_it_is_now() -> FakeTwitch {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "zeta"), stream("bc-1", true)),
+        (channel("ch2", "alpha"), stream("bc-2", true)),
+    ];
+    // The sitewide reward campaign, on every channel, and nothing else.
+    for id in ["ch1", "ch2"] {
+        fake.available
+            .lock()
+            .unwrap()
+            .insert(id.into(), vec![DropId::from("sitewide-reward")]);
+    }
+    fake
+}
+
+#[tokio::test]
+async fn mines_when_twitch_lists_no_campaign_for_any_channel() {
+    let mut e = engine(twitch_as_it_is_now());
+    e.sync(now()).await.unwrap();
+
+    let selected = e
+        .select_channel(now())
+        .await
+        .unwrap()
+        .expect("a drops-enabled channel streaming the game is still mineable");
+    assert_eq!(
+        selected.campaigns,
+        vec![CampaignId::from("c1")],
+        "the campaign it advances comes from the directory, not the check"
+    );
+}
+
+/// The symptom the user sees: the dashboard reports nobody live while the
+/// miner is mining, and every campaign claims zero live channels.
+#[tokio::test]
+async fn live_channels_are_reported_even_when_twitch_confirms_nothing() {
+    let mut e = engine(twitch_as_it_is_now());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let snap = e.snapshot("default", Some("me"), now());
+    assert_eq!(
+        snap.live.len(),
+        2,
+        "both live channels were considered, so both must be shown"
+    );
+    let campaign = &snap.eligible[0];
+    assert_eq!(
+        campaign.live_channels, 2,
+        "a campaign with two live channels must not report zero"
+    );
+}
+
+/// Selection must be a decision, not an accident of sort order. `alpha` sorts
+/// first; `zeta` is the favourite, so `zeta` must win.
+#[tokio::test]
+async fn the_strategy_still_decides_when_nothing_is_confirmed() {
+    let mut e = engine(twitch_as_it_is_now());
+    e.apply_command(
+        btdm_core::control::Command::SetFavourite {
+            login: "zeta".into(),
+            on: true,
+        },
+        now(),
+    );
+    e.sync(now()).await.unwrap();
+
+    let selected = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(
+        selected.channel.login, "zeta",
+        "the favourite must win; picking `alpha` means sort order decided"
+    );
+}
+
+/// The check keeps its one real job: a channel with no drops-enabled tag is
+/// only mineable if Twitch names a drop for it. Allow-listed channels resolved
+/// by name arrive with no tag, which is where this matters.
+#[tokio::test]
+async fn a_channel_with_no_tag_is_rescued_only_by_a_confirmed_drop() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "untagged"), stream("bc-1", false)),
+        (channel("ch2", "alsountagged"), stream("bc-2", false)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let selected = e.select_channel(now()).await.unwrap();
+
+    assert_eq!(
+        selected.map(|w| w.channel.login),
+        Some("untagged".to_string()),
+        "the confirmed channel is mineable and the unconfirmed untagged one is not"
+    );
+}
+
+/// A confirmed channel should edge out an equal unconfirmed one, without that
+/// preference ever outweighing a deadline.
+#[tokio::test]
+async fn a_confirmed_channel_wins_an_otherwise_equal_choice() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    *fake.channels.lock().unwrap() = vec![
+        (channel("ch1", "aaa-unconfirmed"), stream("bc-1", true)),
+        (channel("ch2", "zzz-confirmed"), stream("bc-2", true)),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch2".into(), vec![DropId::from("d1")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    let selected = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(selected.channel.login, "zzz-confirmed");
+}
+
+/// A failed check is inconclusive, not a rejection — it must not strip a
+/// channel the directory already vouched for.
+#[tokio::test]
+async fn a_failed_availability_check_does_not_remove_a_tagged_channel() {
+    let fake = happy_path();
+    *fake.fail_available_drops.lock().unwrap() = true;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(
+        e.select_channel(now()).await.unwrap().is_some(),
+        "a broken check must not stop the miner mining"
+    );
+}
+
+/// Twitch answers the same campaign differently depending on which query
+/// asked. The dashboard listing carries box art; the per-campaign detail query
+/// — the only one that carries the drops, so the only one worth asking — often
+/// returns a game with none.
+///
+/// Replacing the listed campaign wholesale therefore blanked the artwork on
+/// exactly the campaigns the user looks at: every *rejected* campaign kept its
+/// image because it was never expanded, and over half the mineable ones lost
+/// theirs.
+#[tokio::test]
+async fn campaign_art_survives_the_detail_upgrade() {
+    let fake = FakeTwitch::default();
+
+    let mut listed = campaign("c-new", true, vec![]);
+    listed.game.box_art_url = Some("https://cdn.example/boxart.jpg".into());
+    listed.account_link_url = Some("https://example.com/link".into());
+
+    // As Twitch returns it: complete about drops, empty about presentation.
+    let mut full = campaign("c-new", true, vec![drop("d1", 60, 0)]);
+    full.game.box_art_url = None;
+    full.account_link_url = None;
+
+    *fake.offered.lock().unwrap() = vec![listed];
+    fake.details.lock().unwrap().insert("c-new".into(), full);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let c = &e.campaigns()[0];
+    assert_eq!(
+        c.game.box_art_url.as_deref(),
+        Some("https://cdn.example/boxart.jpg"),
+        "the listing's artwork must survive the detail fetch"
+    );
+    assert_eq!(
+        c.account_link_url.as_deref(),
+        Some("https://example.com/link"),
+        "and so must the link, or an unlinked campaign becomes a dead end"
+    );
+    assert_eq!(c.drops.len(), 1, "while still taking the drops from the detail");
+}
+
+/// The merge must never invent facts: a detail response that genuinely says
+/// something different about the drops wins outright.
+#[tokio::test]
+async fn the_detail_response_still_wins_on_everything_that_matters() {
+    let fake = FakeTwitch::default();
+    let listed = campaign("c-new", true, vec![drop("stale", 999, 0)]);
+    let full = campaign("c-new", true, vec![drop("d1", 60, 30)]);
+    *fake.offered.lock().unwrap() = vec![listed];
+    fake.details.lock().unwrap().insert("c-new".into(), full);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let c = &e.campaigns()[0];
+    assert_eq!(c.drops.len(), 1);
+    assert_eq!(c.drops[0].id, DropId::from("d1"), "stale drops must not linger");
+}
+
+/// A campaign already in the inventory is never detail-fetched — there is
+/// nothing to learn from asking. It still has to pick up the artwork the
+/// listing carries, or the campaigns the user is actually mining are the only
+/// ones that render blank.
+#[tokio::test]
+async fn art_reaches_campaigns_that_were_never_detail_fetched() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    let mut listed = campaign("c1", true, vec![]);
+    listed.game.box_art_url = Some("https://cdn.example/boxart.jpg".into());
+    *fake.offered.lock().unwrap() = vec![listed];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    assert_eq!(*e.api().detail_fetches.lock().unwrap(), 0, "nothing to fetch");
+    assert_eq!(
+        e.campaigns()[0].game.box_art_url.as_deref(),
+        Some("https://cdn.example/boxart.jpg"),
+        "an inventory campaign must still get the listing's artwork"
+    );
+}
