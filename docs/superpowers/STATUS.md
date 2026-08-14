@@ -83,24 +83,43 @@ Honest list of what a serious miner could do that this does not.
   handled by reconsidering every two minutes while anything is at risk.
   `followed_channels` raises the pool for anyone who wants it; the mechanism
   handles up to what one connection carries.
-- **Per-campaign priority and per-drop targeting.** Priority and exclusion are
-  keyed on games and whole campaigns; two campaigns for the same game cannot be
-  ranked against each other, and "get me tier 1 and stop" cannot be expressed.
-- **`gameEventDrops` cross-referencing.** It is fetched and discarded. The
-  reference implementation uses it to infer claims for campaigns whose detail
-  response carries no `self` edge.
-- **Per-drop time windows.** A tier that only opens in week three of a campaign
-  is treated as available immediately.
-- **Scheduled wake-ups for upcoming campaigns.** Their start dates are shown,
-  but nothing acts on them; a campaign starting in ten minutes is picked up at
-  the next sync rather than at its start.
+- **Per-drop targeting.** "Get me tier 1 and stop" cannot be expressed. Priority
+  entries do now match campaign names as well as game names, so two campaigns
+  for the same game can be ranked against each other, but the unit of both
+  priority and exclusion is still a whole campaign.
+- **Subscription rewards, deliberately.** Campaigns whose drops require a
+  subscription are identified and reported, never mined — buying subs is not a
+  decision a miner gets to make on someone's behalf.
 - **Translations.** English only.
 - **A keyring.** Tokens are plaintext at mode 0600, documented as a deliberate
   trade-off for headless boxes.
 
+## What Twitch changed under us
+
+Worth recording separately, because these were not mistakes in the code when it
+was written — the API moved.
+
+- **`viewerDropCampaigns` stopped listing game campaigns.** The per-channel
+  availability check now returns only sitewide reward campaigns: every
+  drops-enabled Escape from Tarkov streamer reports exactly one campaign, an
+  Audible subscription reward, while visibly earning that game's drops. Used as
+  a veto, as it had been, it rejected every candidate on every pass — so the
+  strategy was never consulted and selection fell through to a fallback that
+  took the alphabetically first channel. It is a rescue now, never a veto,
+  which is how the reference implementation has always used it.
+- **The campaign detail query returns no box art.** Checked against a live
+  account: 124 of 124 campaigns carry `boxArtURL` in the dashboard listing, and
+  0 of 6 in the detail response. Presentation fields are merged field by field
+  rather than the detail response replacing the listing whole.
+- **Integrity challenges.** `ViewerDropsDashboard` and `DropCampaignDetails`
+  answer `IntegrityCheckFailed` to a bare client. The miner's own requests are
+  not currently challenged; nothing implements the integrity handshake, and if
+  Twitch starts challenging in earnest campaign discovery stops working. This
+  is the most likely thing to break next.
+
 ## Test coverage, and where it is thin
 
-449 tests, no clippy warnings.
+471 tests, no clippy warnings.
 
 Well covered: the whole binary end to end against a fake Twitch, the engine
 against a scripted one (100+ scenarios), hostile data at every layer, strategies,
@@ -125,3 +144,16 @@ Thin: the supervisor's own reconnect *loop* — the backoff and the decision to
 try again — is still exercised only by running the binary; the protocol
 underneath it is not. The JSON fixtures are hand-built from observed shapes
 rather than captured responses.
+
+**The gap that mattered most, and what closed it.** Every test passed while the
+miner selected channels alphabetically for hours, because the scripted Twitch
+always answered the availability check with exactly the drops the test wanted.
+The failure needed Twitch to answer with a drop from an *unrelated* campaign,
+which no fixture ever did. Nine tests now model what Twitch actually returns,
+and each one fails against the previous behaviour — that was checked by
+restoring it, not assumed.
+
+The lesson generalises: a fake that only ever returns the useful answer tests
+the happy path twice and the real world never. The same blind spot hid the
+campaign artwork bug (fixtures always carried box art in both responses) and
+the subscription rewards (no fixture had `requiredSubs`).
