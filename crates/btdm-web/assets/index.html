@@ -622,11 +622,26 @@
                        w.current_minutes >= w.required_minutes));
     }
 
-    const since = el("div", "sub");
-    since.style.marginTop = "8px";
-    since.append(document.createTextNode("Last confirmed by Twitch: "));
-    since.append(el("span", w.stalled ? "stale" : "", ago(w.seconds_since_confirmation)));
-    panel.append(since);
+    // Only meaningful once something *has* been confirmed. Printed
+    // unconditionally it produced "No progress confirmed by Twitch yet"
+    // directly above "Last confirmed by Twitch: 1m ago", which are two
+    // different clocks — the session's confirmed minutes, and the account-wide
+    // health clock — and read as the page contradicting itself.
+    const confirmed = w.current_minutes !== null && w.current_minutes !== undefined;
+    if (w.seconds_since_confirmation !== null &&
+        w.seconds_since_confirmation !== undefined &&
+        (confirmed || w.stalled)) {
+      const since = el("div", "sub");
+      since.style.marginTop = "8px";
+      since.append(document.createTextNode("Last confirmed by Twitch: "));
+      since.append(el("span", w.stalled ? "stale" : "", ago(w.seconds_since_confirmation)));
+      panel.append(since);
+    } else if (!confirmed) {
+      const waiting = el("div", "sub");
+      waiting.style.marginTop = "8px";
+      waiting.textContent = "Waiting for Twitch to confirm the first minute on this channel.";
+      panel.append(waiting);
+    }
 
     if (w.reason) panel.append(el("div", "reason", w.reason));
     if (s.health.recovery_step) {

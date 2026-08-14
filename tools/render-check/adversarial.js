@@ -670,6 +670,28 @@ const tab = (label) => {
       throw new Error("the page did not admit it has no confirmation");
     }
     if (/\b0\/0 min confirmed/.test(t)) throw new Error("it invented a zero");
+    // Two different clocks — the session's confirmed minutes and the
+    // account-wide health clock — printed together read as the page
+    // contradicting itself.
+    if (t.includes("Last confirmed by Twitch")) {
+      throw new Error("it claimed a last-confirmed time while claiming nothing is confirmed");
+    }
+  });
+
+  /// A stall is the one case where "nothing confirmed" and a rising clock
+  /// belong together: the clock is the evidence.
+  check("a stall still shows its clock even with nothing confirmed", () => {
+    push(snapshot({
+      watching: {
+        ...snapshot().watching,
+        current_minutes: null, required_minutes: null, drop_name: null,
+        stalled: true, seconds_since_confirmation: 900,
+      },
+    }));
+    const t = text();
+    if (!t.includes("Last confirmed by Twitch")) {
+      throw new Error("a stalled session must show how long it has been stalled");
+    }
   });
 
   check("a stalled session is unmistakable", () => {
