@@ -3215,3 +3215,105 @@ async fn the_reason_is_restated_under_the_strategy_now_in_force() {
         after.reason
     );
 }
+
+/// The recovery ladder has to be able to reach its top.
+///
+/// Rung 4 leaves the channel, and leaving reset the watchdog — so the episode
+/// started over at rung 0 and the rungs above it (resync campaigns, revalidate
+/// the token, rest the campaign) were unreachable. A campaign whose every
+/// channel was failing would switch channels forever rather than escalate to
+/// whatever was actually wrong.
+#[tokio::test]
+async fn the_ladder_climbs_past_the_rung_that_switches_channel() {
+    use btdm_core::watchdog::{RecoveryStep, Verdict};
+    let fake = happy_path();
+    // Several channels, so switching always has somewhere to go.
+    *fake.channels.lock().unwrap() = (0..6)
+        .map(|i| {
+            (
+                channel(&format!("ch{i}"), &format!("streamer{i}")),
+                stream(&format!("bc-{i}"), true),
+            )
+        })
+        .collect();
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let mut reached = Vec::new();
+    let mut t = now();
+    // Nothing ever confirms, so every assessment escalates once its cooldown
+    // has passed.
+    for _ in 0..40 {
+        if e.needs_selection(t) {
+            e.select_channel(t).await.unwrap();
+        }
+        t += chrono::Duration::seconds(120);
+        match e.assess_health(t) {
+            Verdict::Escalate(step) => {
+                reached.push(step);
+                e.apply_recovery(step, t).await.unwrap();
+            }
+            Verdict::Exhausted => {
+                reached.push(RecoveryStep::QuarantineCampaign);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        reached.contains(&RecoveryStep::ResyncCampaigns),
+        "the ladder never got past switching channel: {reached:?}"
+    );
+    assert!(
+        reached.contains(&RecoveryStep::QuarantineCampaign),
+        "a campaign that never earns anywhere must eventually be rested: {reached:?}"
+    );
+}
+
+/// A claim id pushed over the websocket must reach a campaign the miner will
+/// never mine but must still claim from.
+///
+/// A subscription reward needs zero minutes, so `is_claimable()` rests
+/// entirely on that id. Recording it only against the mineable campaigns
+/// dropped it on the floor and the badge was never claimed.
+#[tokio::test]
+async fn a_pushed_claim_id_reaches_a_claim_only_campaign() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c-sub", true, vec![sub_reward_drop("d-sub")])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.campaigns().is_empty(), "not something to mine");
+
+    // Twitch pushes the grant.
+    e.on_drop_claimable(&DropId::from("d-sub"), "instance-9");
+    e.claim_ready(now()).await.unwrap();
+
+    assert_eq!(
+        e.api().claims.lock().unwrap().as_slice(),
+        ["instance-9"],
+        "the pushed claim id must be acted on"
+    );
+}
+
+/// The totals must see it too, or the page says there is nothing to claim
+/// while the miner is claiming.
+#[tokio::test]
+async fn a_claimable_drop_outside_the_mineable_set_is_counted() {
+    let fake = FakeTwitch::default();
+    let mut earned = sub_reward_drop("d-sub");
+    earned.claim_id = Some("instance-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c-sub", true, vec![earned])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let totals = e.snapshot("default", Some("me"), now()).totals;
+    assert_eq!(totals.drops_claimable, 1, "it is waiting to be claimed");
+    assert_eq!(
+        totals.drops_remaining, 0,
+        "but it is not outstanding *work*: watching can never finish it"
+    );
+}

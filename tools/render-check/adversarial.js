@@ -715,6 +715,690 @@ const tab = (label) => {
     if (claimed.querySelector(".bar")) throw new Error("a claimed drop still shows a bar");
   });
 
+  // ==========================================================================
+  // Second pass.
+  //
+  // Everything below this line found a defect that the checks above do not
+  // cover, so most of these fail against the page as it stands. They are
+  // written the way the page ought to behave rather than the way it does, so
+  // that fixing the page turns them green instead of needing them rewritten.
+  //
+  // The three marked "holds" are attempts that could *not* be broken, kept so
+  // a later change cannot quietly undo the hardening.
+  // ==========================================================================
+
+  /// Puts the page back into a known state after every check, passed or
+  /// failed. Without this a check that throws part way leaves its hostile
+  /// snapshot, its half-typed search text or its selected account in place,
+  /// and every check after it is testing something else — quietly passing,
+  /// which is worse than quietly failing.
+  const restore = () => {
+    try {
+      push(snapshot());
+      state_reset("default");
+      const camp = [...doc.querySelectorAll(".tabs button")]
+        .find((b) => b.textContent.startsWith("Campaigns"));
+      if (camp) click(camp);
+      clearFilter();
+    } catch (e) { /* nothing left to restore to */ }
+  };
+
+  function dcheck(label, fn) {
+    checks++;
+    try {
+      fn();
+      console.log("  ok   " + label);
+    } catch (e) {
+      failures.push(`${label}: ${e.message}`);
+      console.log("  FAIL " + label + " -> " + e.message);
+    } finally {
+      restore();
+    }
+  }
+
+  /// `check` runs its body synchronously and throws away any promise it
+  /// returns, so an async body's failure is never recorded. Anything that has
+  /// to wait for a fetch uses this.
+  async function adcheck(label, fn) {
+    checks++;
+    try {
+      await fn();
+      console.log("  ok   " + label);
+    } catch (e) {
+      failures.push(`${label}: ${e.message}`);
+      console.log("  FAIL " + label + " -> " + e.message);
+    } finally {
+      restore();
+    }
+  }
+
+  const baseFetch = window.fetch;
+  /// Answers one endpoint differently for the duration of one check, and
+  /// always puts the harness's own fetch back.
+  async function withFetch(handler, fn) {
+    window.fetch = async (url, opts) => {
+      const answer = await handler(String(url), opts);
+      return answer !== undefined ? answer : baseFetch(url, opts);
+    };
+    try { await fn(); } finally { window.fetch = baseFetch; }
+  }
+
+  const tabs = () => doc.querySelectorAll(".tabs button").length;
+  const pillTexts = () => [...doc.querySelectorAll("#app .pill")].map((p) => p.textContent);
+  const dropMins = () => [...doc.querySelectorAll("#app .drop .mins")].map((m) => m.textContent);
+  const statValues = () => [...doc.querySelectorAll("#app .stat b")].map((b) => b.textContent);
+
+  // ------------------------------------------------------- silent blank page
+  //
+  // `normalise` fills in absent top-level sections, but it does not defend
+  // what is *inside* them, and the SSE handler wraps `render()` in a try/catch
+  // that swallows whatever the renderer throws. So the result is not an error
+  // anyone can see: it is a page that stops half way through building itself
+  // and stays that way, because the next heartbeat carries the same field and
+  // fails in the same place. Each of these pushes its hostile snapshot with
+  // the relevant tab already open, which is how it would really arrive.
+  console.log("\nHostile field contents (normalise only guards the outer shape):");
+
+  dcheck("an explicitly null quarantine list does not blank the whole page", () => {
+    // normalise supplies `quarantined_channels: []` and then spreads the
+    // payload over it, so an explicit null wins. controlsPanel adds `.length`
+    // to it above the tab strip, taking the navigation down with it.
+    push(snapshot({ health: { ...snapshot().health, quarantined_channels: null } }));
+    if (!tabs()) throw new Error("the page is blank: no hero, no stats, no tabs, no way back");
+  });
+
+  dcheck("a priority list that is not an array does not blank the whole page", () => {
+    push(snapshot({
+      strategies: [{ name: "priority", description: "Your order first.", selected: true }],
+      settings: { ...snapshot().settings, priority_games: "AB" },
+    }));
+    if (!tabs()) throw new Error("a string priority list blanked the page");
+  });
+
+  dcheck("a null entry in eligible does not blank the whole page", () => {
+    // `banners` reaches into every campaign before the tab strip is built.
+    push(snapshot({ eligible: [campaign(), null] }));
+    if (!tabs()) throw new Error("one null campaign blanked the page");
+  });
+
+  dcheck("a live channel with no viewer count still renders its row", () => {
+    tab("Live now");
+    const s = snapshot();
+    delete s.live[0].viewers;          // an older miner, or a partial proxy
+    push(s);
+    if (!doc.querySelector("#app table")) {
+      throw new Error("the Live tab emptied itself and said nothing: c.viewers.toLocaleString() threw");
+    }
+  });
+
+  dcheck("a live channel with a null viewer count still renders its row", () => {
+    tab("Live now");
+    push(snapshot({ live: [{ ...snapshot().live[0], viewers: null }] }));
+    if (!doc.querySelector("#app table")) throw new Error("null viewers emptied the Live tab");
+  });
+
+  dcheck("allowed_channels of the wrong type does not empty the Campaigns tab", () => {
+    tab("Campaigns");
+    push(snapshot({ eligible: [campaign({ allowed_channels: "abcdefgh" })] }));
+    if (!doc.querySelectorAll("#app .camp").length) {
+      throw new Error("a string allowed_channels emptied the tab: .slice().join is not a function");
+    }
+  });
+
+  dcheck("a null drop inside a campaign does not empty the Campaigns tab", () => {
+    tab("Campaigns");
+    push(snapshot({ eligible: [campaign({ drops: [drop(), null] })] }));
+    if (!doc.querySelectorAll("#app .camp").length) throw new Error("one null drop emptied the tab");
+  });
+
+  dcheck("a null benefit inside a drop does not empty the Campaigns tab", () => {
+    tab("Campaigns");
+    push(snapshot({ eligible: [campaign({ drops: [drop({ benefits: [null] })] })] }));
+    if (!doc.querySelectorAll("#app .camp").length) throw new Error("one null benefit emptied the tab");
+  });
+
+  dcheck("a favourites list that is not an array does not empty the Settings tab", () => {
+    tab("Settings");
+    push(snapshot({ settings: { ...snapshot().settings, favourites: { a: 1 } } }));
+    if (!doc.querySelectorAll("#app .setting").length) {
+      throw new Error("the Settings tab emptied itself and said nothing");
+    }
+  });
+
+  // -------------------------------------------------------- invented numbers
+  //
+  // The stated premise is that no figure appears which the miner did not
+  // report. Each of these puts one on screen, arrived at by arithmetic on a
+  // value the miner never sent.
+  console.log("\nFigures the miner never reported:");
+
+  dcheck("an unparseable deadline does not become a countdown", () => {
+    tab("Campaigns");
+    push(snapshot({ eligible: [campaign({ ends_at: "not a date" })] }));
+    const bad = pillTexts().filter((t) => /NaN/.test(t));
+    if (bad.length) throw new Error(`a deadline pill reads ${JSON.stringify(bad[0])}`);
+  });
+
+  dcheck("a drop with no minutes says so rather than printing undefined", () => {
+    tab("Campaigns");
+    const d = drop();
+    delete d.current_minutes;
+    delete d.required_minutes;
+    push(snapshot({ eligible: [campaign({ drops: [d] })] }));
+    const mins = dropMins();
+    if (mins.some((m) => /undefined|null|NaN/.test(m))) {
+      throw new Error(`a drop row reads ${JSON.stringify(mins[0])}`);
+    }
+  });
+
+  dcheck("a drop with null minutes says so rather than printing null", () => {
+    tab("Campaigns");
+    push(snapshot({
+      eligible: [campaign({ drops: [drop({ current_minutes: null, required_minutes: null })] })],
+    }));
+    const mins = dropMins();
+    if (mins.some((m) => /undefined|null|NaN/.test(m))) {
+      throw new Error(`a drop row reads ${JSON.stringify(mins[0])}`);
+    }
+  });
+
+  dcheck("the hero needs both halves of the confirmed figure before printing it", () => {
+    // The guard tests current_minutes alone, so a payload carrying one and not
+    // the other prints the half it has and the word "undefined" for the rest.
+    const w = { ...snapshot().watching };
+    delete w.required_minutes;
+    push(snapshot({ watching: w }));
+    const line = doc.querySelector("#app .confirm").textContent;
+    if (/undefined|null|NaN/.test(line)) throw new Error(`the hero reads ${JSON.stringify(line)}`);
+  });
+
+  dcheck("null totals do not become a printed 'null/null'", () => {
+    push(snapshot({
+      totals: { ...snapshot().totals, campaigns_eligible: null, campaigns_known: null },
+    }));
+    const stats = statValues();
+    if (stats.some((v) => /undefined|null|NaN/.test(v))) {
+      throw new Error(`the stats strip reads ${JSON.stringify(stats)}`);
+    }
+  });
+
+  dcheck("a non-numeric total does not become 'NaNd NaNh' of watching left", () => {
+    push(snapshot({ totals: { ...snapshot().totals, minutes_remaining: "many" } }));
+    const stats = statValues();
+    if (stats.some((v) => /NaN/.test(v))) {
+      throw new Error(`the stats strip reads ${JSON.stringify(stats)}`);
+    }
+  });
+
+  dcheck("an unparseable last_sync does not become 'refreshed NaNd ago'", () => {
+    tab("Settings");
+    push(snapshot({ health: { ...snapshot().health, last_sync: "soon" } }));
+    if (/NaN/.test(text())) {
+      throw new Error(`Status reads ${JSON.stringify((text().match(/Campaigns refreshed [^,]*/) || [])[0])}`);
+    }
+  });
+
+  dcheck("a last_sync in the future does not become a negative age", () => {
+    // Clock skew between a headless box and the browser looking at it is the
+    // ordinary cause, and needs no hostility at all.
+    tab("Settings");
+    push(snapshot({
+      health: {
+        ...snapshot().health,
+        last_sync: new Date(Date.now() + 3600000).toISOString(),
+        next_sync_in_seconds: -600,
+      },
+    }));
+    const line = (text().match(/Campaigns refreshed [^A-Z]*/) || [""])[0];
+    if (/-\d/.test(line)) throw new Error(`Status reads ${JSON.stringify(line.trim())}`);
+  });
+
+  dcheck("an unparseable start date does not become 'in NaN days'", () => {
+    tab("Unavailable");
+    push(snapshot({
+      rejected: [{
+        id: "r1", name: "Soon", game: "G", reason: "not started",
+        explanation: "It has not begun.", action_url: null,
+        starts_at: "whenever", ends_at: new Date().toISOString(), box_art_url: null,
+      }],
+    }));
+    if (/NaN|Invalid Date/.test(text())) {
+      throw new Error(`the Unavailable tab reads ${JSON.stringify(pillTexts())}`);
+    }
+  });
+
+  await adcheck("an unparseable reward timestamp does not become an 'Invalid Date' heading", () =>
+    withFetch(async (url) => {
+      if (!url.includes("/api/rewards")) return undefined;
+      return { ok: true, status: 200, json: async () => [{ name: "Hat", at: "nope" }] };
+    }, async () => {
+      push(snapshot({ account: "rw-date" }));
+      state_reset("rw-date");
+      tab("Rewards");
+      await sleep(60);
+      const heads = [...doc.querySelectorAll("#app h2")].map((h) => h.textContent);
+      if (heads.some((h) => /Invalid Date/.test(h))) {
+        throw new Error(`rewards are grouped under ${JSON.stringify(heads)}`);
+      }
+    }));
+
+  // ---------------------------------------------------------- contradictions
+  console.log("\nTwo parts of the page disagreeing:");
+
+  await adcheck("the Watch button does not overwrite the miner's reply with a prediction", () =>
+    withFetch(async (url, opts) => {
+      if (!opts || opts.method !== "POST") return undefined;
+      posted.push({ url, body: JSON.parse(opts.body || "{}") });
+      // A 200 that the miner uses to say it did *not* do the thing. `send`
+      // already toasts this; the caller then talks over it.
+      return {
+        ok: true, status: 200,
+        json: async () => ({ message: "that channel went offline; staying put" }),
+      };
+    }, async () => {
+      push(snapshot({ live: [{ ...snapshot().live[0], is_current: false }] }));
+      tab("Live now");
+      click([...doc.querySelectorAll("#app button")].find((b) => b.textContent === "Watch"));
+      await sleep(60);
+      const shown = doc.querySelector("#toast").textContent;
+      if (!shown.includes("staying put")) {
+        throw new Error(`the miner said "staying put"; the page says ${JSON.stringify(shown)}`);
+      }
+    }));
+
+  dcheck("'confirmed by Twitch' is not printed beside 'no progress confirmed by Twitch'", () => {
+    // Reachable on every switch to a channel Twitch named: the pill is about
+    // how the *channel* was chosen, the sentence is about *progress*. For the
+    // first minute or two of every such switch both are on screen, using the
+    // same four words to mean opposite things.
+    push(snapshot({
+      watching: {
+        ...snapshot().watching, confirmed_by_twitch: true,
+        current_minutes: null, required_minutes: null, drop_name: null,
+      },
+    }));
+    const hero = doc.querySelector("#app .hero .panel").textContent;
+    if (/confirmed by Twitch/.test(hero) && /No progress confirmed by Twitch yet/.test(hero)) {
+      throw new Error("the hero says both 'confirmed by Twitch' and 'No progress confirmed by Twitch yet'");
+    }
+  });
+
+  dcheck("figures are marked stale once the stream is known to be down", () => {
+    push(snapshot({ watching: { ...snapshot().watching, seconds_since_confirmation: 7 } }));
+    window.__es.onerror();                        // the stream drops
+    if (doc.querySelector("#conn-text").textContent !== "reconnecting…") {
+      throw new Error("the header did not notice the disconnection");
+    }
+    // The header knows. The hero goes on asserting a seven-second-old
+    // confirmation for as long as the disconnection lasts, and the campaigns
+    // tab redraws that same sentence every thirty seconds, unchanged.
+    const claim = (text().match(/Last confirmed by Twitch: \S+ ago/) || [])[0];
+    if (claim && !doc.querySelector("#app .stale")) {
+      window.__es.onopen();
+      throw new Error(`disconnected, and the hero still asserts "${claim}" with nothing marking it stale`);
+    }
+    window.__es.onopen();
+  });
+
+  dcheck("the strategy shown by the select is the strategy named in the warnings", () => {
+    // Two sources of truth: the select reads `strategies[].selected`, every
+    // warning reads `settings.strategy`. Nothing reconciles them, and with no
+    // entry flagged the select silently shows whichever option came first.
+    tab("Settings");
+    push(snapshot({
+      settings: { ...snapshot().settings, pinned: "somebody", strategy: "coverage" },
+      strategies: [
+        { name: "deadline", description: "d", selected: true },
+        { name: "coverage", description: "c", selected: false },
+      ],
+    }));
+    const shown = doc.querySelector("#app select").value;
+    const warned = (text().match(/but the (\S+) strategy ignores pins/) || [])[1];
+    if (warned && warned !== shown) {
+      throw new Error(`the select says "${shown}" while the warning beneath it says "${warned}"`);
+    }
+  });
+
+  dcheck("a drop's bar agrees with the two numbers printed next to it", () => {
+    // The bar is drawn from `percent` and the text from two other fields.
+    // Nothing checks that they describe the same thing, so a full green bar
+    // can sit beside "5/60m".
+    tab("Campaigns");
+    push(snapshot({
+      eligible: [campaign({ drops: [drop({ percent: 100, current_minutes: 5, required_minutes: 60 })] })],
+    }));
+    const fill = doc.querySelector("#app .drop .bar > i");
+    const mins = doc.querySelector("#app .drop .mins").textContent;
+    const [cur, req] = mins.split(/[/m]/).map(Number);
+    if (Math.abs(parseFloat(fill.style.width) - (cur / req) * 100) > 1) {
+      throw new Error(`the bar is ${fill.style.width} full beside the text "${mins}"`);
+    }
+  });
+
+  // --------------------------------------------------- state across accounts
+  //
+  // `state.drafts`, `state.rewards` and `state.history` are all global, while
+  // everything they are shown beside belongs to exactly one account.
+  console.log("\nState surviving an account change that should not:");
+
+  dcheck("a draft typed for one account is not offered to another", () => {
+    push(snapshot({ account: "draft-a", settings: { ...snapshot().settings, pinned: "a-chan" } }));
+    state_reset("draft-a");
+    tab("Settings");
+    const box = doc.querySelector("#pin-input");
+    box.focus();
+    box.value = "typed-for-draft-a";
+    box.dispatchEvent(new window.Event("input"));
+
+    push(snapshot({ account: "draft-b", settings: { ...snapshot().settings, pinned: "b-chan" } }));
+    state_reset("draft-b");
+    const shown = doc.querySelector("#pin-input").value;
+    // Worse than showing the wrong text: one click on Pin commits it, so the
+    // half-typed name for one account becomes another account's setting.
+    posted.length = 0;
+    click([...doc.querySelectorAll("#app button")].find((b) => b.textContent === "Pin"));
+    const sent = posted[0] || { url: "", body: {} };
+    if (shown === "typed-for-draft-a") {
+      throw new Error(`draft-b's pin box is pre-filled with draft-a's typing, and Pin posted ` +
+                      `${JSON.stringify(sent.body)} to ${sent.url.split("?")[0]}`);
+    }
+  });
+
+  await adcheck("rewards are not shown under the account they do not belong to", () =>
+    withFetch(async (url) => {
+      if (!url.includes("/api/rewards")) return undefined;
+      const account = new URL(url, "http://x").searchParams.get("account");
+      return {
+        ok: true, status: 200,
+        json: async () => [{ name: `${account}-REWARD`, at: new Date().toISOString() }],
+      };
+    }, async () => {
+      push(snapshot({ account: "rw-a" }));
+      state_reset("rw-a");
+      tab("Rewards");
+      await sleep(60);
+      if (!text().includes("rw-a-REWARD")) throw new Error("the first account's rewards never loaded");
+
+      push(snapshot({ account: "rw-b" }));
+      state_reset("rw-b");
+      // Rendered synchronously, before rw-b's rewards have even been asked for.
+      if (text().includes("rw-a-REWARD")) {
+        const total = (text().match(/\d+ rewards? claimed by this miner\./) || [""])[0];
+        throw new Error(`rw-b's Rewards tab lists rw-a's rewards and totals them: "${total}"`);
+      }
+      await sleep(60);
+    }));
+
+  await adcheck("stored history is not relabelled with the account now on screen", () =>
+    withFetch(async (url) => {
+      if (!url.includes("/api/history")) return undefined;
+      const account = new URL(url, "http://x").searchParams.get("account");
+      return {
+        ok: true, status: 200,
+        json: async () => [{ at: new Date().toISOString(), summary: `${account}-EVENT`, severity: "info" }],
+      };
+    }, async () => {
+      push(snapshot({ account: "hist-a" }));
+      state_reset("hist-a");
+      tab("Activity");
+      await sleep(60);
+      if (!text().includes("hist-a-EVENT")) throw new Error("the first account's history never loaded");
+
+      push(snapshot({ account: "hist-b" }));
+      state_reset("hist-b");
+      // logTab rebuilds every stored line as `{ account: s.account, ... }`, so
+      // the "who" column does not merely show the wrong lines: it states that
+      // they belong to the account being looked at.
+      const lines = [...doc.querySelectorAll("#log .line")].map((l) => l.textContent);
+      const lying = lines.find((l) => l.includes("hist-b") && l.includes("hist-a-EVENT"));
+      if (lying) {
+        throw new Error(`the Activity tab attributes hist-a's event to hist-b: ${JSON.stringify(lying)}`);
+      }
+      await sleep(60);
+    }));
+
+  await adcheck("a failed rewards fetch is retried rather than saying 'Loading…' for ever", () =>
+    withFetch(async (url) => {
+      if (!url.includes("/api/rewards")) return undefined;
+      return { ok: false, status: 503, json: async () => ({}) };
+    }, async () => {
+      // `loadRewards` marks the account as done before the request is made and
+      // never unmarks it, so one failed fetch pins the tab on "Loading…" for
+      // the life of the page. Leaving *and returning to* the tab does not
+      // retry, and neither does anything else.
+      push(snapshot({ account: "rw-down" }));
+      state_reset("rw-down");
+      tab("Rewards");
+      await sleep(60);
+      tab("Campaigns");
+      tab("Rewards");                           // the user tries again
+      await sleep(60);
+      if (/Loading…/.test(text())) {
+        throw new Error("the Rewards tab says 'Loading…' with nothing loading and nothing that will retry");
+      }
+    }));
+
+  // --------------------------------------------------- focus and the rebuild
+  console.log("\nWhat the rebuild takes with it:");
+
+  dcheck("focus on a control other than a text box survives a snapshot", () => {
+    // Only inputs are restored, so a keyboard user cannot hold focus on the
+    // strategy select, a priority chip's ↑, or a campaign's Exclude button for
+    // the few seconds between one heartbeat and the next.
+    const sel = doc.querySelector("#app select");
+    sel.focus();
+    push(snapshot());
+    if (doc.activeElement.tagName !== "SELECT") {
+      throw new Error(`focus moved from the strategy select to <${doc.activeElement.tagName.toLowerCase()}>`);
+    }
+  });
+
+  dcheck("the account picker is not thrown away and rebuilt every heartbeat", () => {
+    const before = doc.querySelector("#account-picker select");
+    if (!before) throw new Error("no picker to test");
+    before.focus();
+    push(snapshot());
+    if (doc.querySelector("#account-picker select") !== before) {
+      throw new Error("the picker is a new element after every snapshot, so an open dropdown shuts itself");
+    }
+  });
+
+  // --------------------------------------------------------- priority editor
+  console.log("\nThe priority editor:");
+
+  const prio = (over = {}) => snapshot({
+    strategy: "priority",
+    strategies: [{ name: "priority", description: "Your order first.", selected: true }],
+    ...over,
+  });
+
+  dcheck("each chip's buttons act on that chip and not on its namesake", () => {
+    // The editor addresses entries by value. Two entries with the same text
+    // are two chips whose ×, ↑ and ↓ send byte-identical commands, so the
+    // second chip's × removes the first one.
+    push(prio({ settings: { ...snapshot().settings, priority_games: ["Dupe", "Dupe", "Other"] } }));
+    const second = [...doc.querySelectorAll("#app .chip")].find((c) => c.textContent.startsWith("2."));
+    posted.length = 0;
+    click([...second.querySelectorAll("button")].find((b) => b.textContent === "×"));
+    const body = posted[0] && posted[0].body;
+    if (body && body.entry === "Dupe" && !("index" in body) && !("position" in body)) {
+      throw new Error("removing the second 'Dupe' sends exactly what removing the first would");
+    }
+  });
+
+  await adcheck("a successful add clears the box it came from", async () => {
+    push(prio({ settings: { ...snapshot().settings, priority_games: [] } }));
+    const box = doc.querySelector("#priority-input");
+    box.value = "Half Life";
+    box.dispatchEvent(new window.Event("input"));
+    posted.length = 0;
+    const add = [...doc.querySelectorAll("#app button")].find((b) => b.textContent === "Add");
+    click(add);
+    await sleep(40);
+    // The draft is dropped from `state`, but nothing re-renders, so the text
+    // sits in the box looking unsent until the next heartbeat arrives.
+    if (doc.querySelector("#priority-input").value === "Half Life") {
+      click(add);
+      await sleep(40);
+      throw new Error(`the box still reads "Half Life" after a successful add, and a ` +
+                      `second click posted it ${posted.length} times`);
+    }
+  });
+
+  dcheck("the priority editor appears whenever the priority list is in use", () => {
+    // `usesPriority` reads strategies[].selected; everything else on the page
+    // reads settings.strategy. When they disagree, the list that decides what
+    // gets mined has no editor anywhere on the page.
+    push(snapshot({
+      strategy: "priority",
+      settings: { ...snapshot().settings, strategy: "priority", priority_games: ["A"] },
+      strategies: [
+        { name: "deadline", description: "d", selected: false },
+        { name: "priority", description: "p", selected: false },
+      ],
+    }));
+    if (!doc.querySelector("#priority-input")) {
+      throw new Error("settings.strategy is 'priority' and its list is unreachable from the page");
+    }
+  });
+
+  // ------------------------------------------------------------ smaller lies
+  console.log("\nSmaller misstatements:");
+
+  dcheck("the search box does not rewrite what is being typed into it", () => {
+    // `oninput` stores `value.trim().toLowerCase()` and the rebuild writes
+    // that back into the box, so a trailing space is deleted as it is typed
+    // and capitals are replaced under the cursor. Two-word searches cannot be
+    // entered at all: the space that would separate them never survives.
+    tab("Campaigns");
+    const box = doc.querySelector("#search");
+    box.focus();
+    box.value = "Rust ";
+    box.setSelectionRange(5, 5);
+    box.dispatchEvent(new window.Event("input"));
+    const after = doc.querySelector("#search").value;
+    if (after !== "Rust ") {
+      throw new Error(`typing "Rust " left "${after}" in the box, so the next keystroke lands mid-word`);
+    }
+  });
+
+  dcheck("an excluded campaign with no name is not listed as 'null'", () => {
+    tab("Settings");
+    push(snapshot({
+      settings: { ...snapshot().settings, excluded_campaigns: ["c1"] },
+      eligible: [campaign({ id: "c1", name: null })],
+    }));
+    const chips = [...doc.querySelectorAll("#app .chip")].map((c) => c.textContent);
+    if (chips.some((c) => /^(null|undefined)/.test(c))) {
+      throw new Error(`the excluded list reads ${JSON.stringify(chips)}`);
+    }
+  });
+
+  dcheck("a group of skipped campaigns does not borrow the first one's explanation", () => {
+    const mk = (id, explanation) => ({
+      id, name: "C" + id, game: "G", reason: "not linked", explanation,
+      action_url: null, starts_at: new Date().toISOString(),
+      ends_at: new Date().toISOString(), box_art_url: null,
+    });
+    tab("Unavailable");
+    push(snapshot({ rejected: [mk("1", "FIRST EXPLANATION"), mk("2", "SECOND EXPLANATION")] }));
+    if (text().includes("FIRST EXPLANATION") && !text().includes("SECOND EXPLANATION")) {
+      throw new Error("both campaigns are described by whichever explanation happened to arrive first");
+    }
+  });
+
+  dcheck("the Live tab says how a channel is known to advance drops", () => {
+    // `confirmed_by_twitch` is on every live channel and the hero uses it, but
+    // the table prints "1 campaign, 1 drop" for a channel Twitch named and one
+    // the miner inferred from a directory tag, identically.
+    tab("Live now");
+    push(snapshot({
+      live: [
+        { ...snapshot().live[0], login: "sure", display_name: "Sure", is_current: false, confirmed_by_twitch: true },
+        { ...snapshot().live[0], login: "guess", display_name: "Guess", is_current: false, confirmed_by_twitch: false },
+      ],
+    }));
+    const rows = [...doc.querySelectorAll("#app tbody tr")].map((r) => r.textContent);
+    if (rows.length === 2 && rows[0].replace("Sure", "") === rows[1].replace("Guess", "")) {
+      throw new Error("a channel Twitch confirmed and one the miner guessed at are shown identically");
+    }
+  });
+
+  dcheck("a negative age is not printed as one", () => {
+    push(snapshot({ watching: { ...snapshot().watching, seconds_since_confirmation: -50 } }));
+    const line = (text().match(/Last confirmed by Twitch: \S+ ago/) || [""])[0];
+    if (/-\d/.test(line)) throw new Error(`the hero reads "${line}"`);
+  });
+
+  // -------------------------------------------------------- hardening (holds)
+  console.log("\nAttempts that failed — these pass, and must keep passing:");
+
+  dcheck("holds: no URL scheme but http(s) reaches an href or a src", () => {
+    const nasty = [
+      "data:text/html,<script>window.__pwned=1</script>",
+      "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' onload='window.__pwned=1'/>",
+      "blob:http://localhost/whatever",
+      "//evil.example.com/x.png",
+      "JaVaScRiPt:window.__pwned=1",
+      "\tjavascript:window.__pwned=1",
+      " javascript:window.__pwned=1",
+      "java\nscript:window.__pwned=1",
+      "vbscript:window.__pwned=1",
+      "https:/\\/\\evil.example.com",
+    ];
+    for (const url of nasty) {
+      push(snapshot({
+        eligible: [campaign({
+          box_art_url: url,
+          drops: [drop({ benefits: [{ name: "b", kind: "k", image_url: url }] })],
+        })],
+        rejected: [{
+          id: "r", name: "n", game: "g", reason: "not linked", explanation: "e",
+          action_url: url, starts_at: new Date().toISOString(),
+          ends_at: new Date().toISOString(), box_art_url: url,
+        }],
+      }));
+      tab("Campaigns");
+      const srcs = [...doc.querySelectorAll("#app img")].map((i) => i.getAttribute("src") || "");
+      tab("Unavailable");
+      const hrefs = [...doc.querySelectorAll("#app a")].map((a) => a.getAttribute("href") || "");
+      for (const got of srcs.concat(hrefs)) {
+        if (got && !/^https?:\/\//i.test(got)) throw new Error(`${JSON.stringify(url)} survived as ${got}`);
+      }
+    }
+    if (window.__pwned) throw new Error("script executed");
+  });
+
+  dcheck("holds: a quote inside an allowed URL cannot break out of the attribute", () => {
+    const url = 'https://evil.example/x" onerror="window.__pwned=1';
+    tab("Campaigns");
+    push(snapshot({ eligible: [campaign({ box_art_url: url })] }));
+    const img = doc.querySelector("#app .camp img");
+    if (img && img.getAttribute("onerror")) throw new Error("an event handler attribute was created");
+    if (window.__pwned) throw new Error("script executed");
+  });
+
+  await adcheck("holds: a 202 is reported as a doubt and keeps the user's text", () =>
+    withFetch(async (url, opts) => {
+      if (!opts || opts.method !== "POST") return undefined;
+      posted.push({ url, body: JSON.parse(opts.body || "{}") });
+      return { ok: true, status: 202, json: async () => ({ message: "queued; the miner is busy" }) };
+    }, async () => {
+      push(prio({ settings: { ...snapshot().settings, priority_games: [] } }));
+      const box = doc.querySelector("#priority-input");
+      box.value = "Kept";
+      box.dispatchEvent(new window.Event("input"));
+      click([...doc.querySelectorAll("#app button")].find((b) => b.textContent === "Add"));
+      await sleep(60);
+      const t = doc.querySelector("#toast");
+      if (!t.className.includes("err")) throw new Error("a 202 was reported in the success style");
+      if (!t.textContent.includes("queued")) throw new Error("the miner's own words were dropped");
+      push(prio({ settings: { ...snapshot().settings, priority_games: [] } }));
+      if (doc.querySelector("#priority-input").value !== "Kept") {
+        throw new Error("a 202 threw away what the user had typed");
+      }
+    }));
+
   console.log("");
   if (failures.length) {
     console.log(`FAILURES (${failures.length} of ${checks}):`);

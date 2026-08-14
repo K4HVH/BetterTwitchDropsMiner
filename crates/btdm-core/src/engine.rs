@@ -200,6 +200,9 @@ pub struct Engine<A: TwitchApi> {
     /// are earned and unclaimed: expired inside Twitch's 24-hour claim window,
     /// or subscription rewards the user genuinely subscribed for.
     claim_only: Vec<DropCampaign>,
+    /// Set when recovery itself left the channel, so the next selection
+    /// continues the episode instead of starting a fresh one.
+    carry_recovery: bool,
     /// Why each unavailable campaign was rejected, for the dashboard.
     rejected: Vec<RejectedView>,
     current: Option<CurrentWatch>,
@@ -269,6 +272,7 @@ impl<A: TwitchApi> Engine<A> {
             campaigns: Vec::new(),
             upcoming: Vec::new(),
             claim_only: Vec::new(),
+            carry_recovery: false,
             rejected: Vec::new(),
             current: None,
             live: Vec::new(),
@@ -731,15 +735,21 @@ impl<A: TwitchApi> Engine<A> {
             campaigns_known: self.campaigns.len() + self.rejected.len(),
             campaigns_eligible: self.campaigns.len(),
             campaigns_at_risk: eligible.iter().filter(|c| c.at_risk && !c.excluded).count(),
+            // Claimed anywhere counts, including in a campaign that has since
+            // expired — it was still earned.
             drops_claimed: self.all_drops().filter(|d| d.is_claimed).count(),
-            // Only what watching can actually finish. A subscription tier
-            // sitting in a mixed campaign is not remaining *work*; counting it
-            // inflates the very total the sub-reward handling exists to keep
-            // honest.
+            // Remaining *work*, so only campaigns still being mined, and only
+            // tiers watching can finish. A subscription tier is not work, and
+            // neither is an unfinished tier in a campaign that has ended.
             drops_remaining: self
-                .all_drops()
+                .campaigns
+                .iter()
+                .flat_map(|c| &c.drops)
                 .filter(|d| !d.is_claimed && d.is_earnable_by_watching())
                 .count(),
+            // Waiting to be claimed, wherever it sits. This is the one total
+            // that must see `claim_only`, or the page reports nothing to claim
+            // while the miner is claiming it.
             drops_claimable: self.all_drops().filter(|d| d.is_claimable()).count(),
             minutes_remaining: self
                 .campaigns
@@ -852,8 +862,13 @@ impl<A: TwitchApi> Engine<A> {
         })
     }
 
+    /// Every drop the miner is responsible for, including those in campaigns
+    /// it will never mine but must still claim from.
     fn all_drops(&self) -> impl Iterator<Item = &TimedDrop> {
-        self.campaigns.iter().flat_map(|c| &c.drops)
+        self.campaigns
+            .iter()
+            .chain(self.claim_only.iter())
+            .flat_map(|c| &c.drops)
     }
 
     fn campaign_name(&self, id: &CampaignId) -> String {
@@ -1233,7 +1248,23 @@ impl<A: TwitchApi> Engine<A> {
         }
         self.current = None;
         self.progress.reset();
-        self.watchdog.reset();
+        // Leaving a channel normally starts a fresh episode — the previous
+        // channel's failures say nothing about the next one. Leaving *because
+        // recovery gave up on it* is the opposite: it is the ladder doing its
+        // job, and resetting there meant the ladder could never climb past the
+        // rung that switches channel. Resyncing campaigns, revalidating the
+        // token and resting the campaign were unreachable, so a campaign whose
+        // every channel was failing would switch channels forever instead of
+        // escalating to the cause.
+        if reason == StopReason::NotEarning {
+            // Carry the episode into the next channel: this stop *is* the
+            // ladder escalating, and the next channel is the attempt, not a
+            // fresh start.
+            self.carry_recovery = true;
+        } else {
+            self.carry_recovery = false;
+            self.watchdog.reset();
+        }
         self.recovery_step = None;
         self.last_health_advance = None;
         self.last_watch = None;
@@ -1445,11 +1476,16 @@ impl<A: TwitchApi> Engine<A> {
                     //   for. Watching can never earn it, which is why it is
                     //   rejected, but if Twitch has granted it then refusing
                     //   to claim it loses the user a badge they paid for.
-                    let claimable_now = campaign.drops.iter().any(|d| d.is_claimable());
+                    // Kept on the strength of an unclaimed drop, not a
+                    // currently-claimable one. A subscription reward needs zero
+                    // minutes, so it becomes claimable only when Twitch pushes
+                    // its claim id — and if the campaign were not being held,
+                    // that push would have nowhere to land.
+                    let anything_unclaimed = campaign.drops.iter().any(|d| !d.is_claimed);
                     let inside_claim_window = reason == RejectReason::Expired
                         && now < campaign.ends_at + CLAIM_GRACE;
                     let earned_by_subscribing = reason == RejectReason::SubscriptionRequired;
-                    if claimable_now && (inside_claim_window || earned_by_subscribing) {
+                    if anything_unclaimed && (inside_claim_window || earned_by_subscribing) {
                         claim_only.push(campaign.clone());
                     }
                     // Worth waking for, if it opens soon enough to matter.
@@ -2142,8 +2178,19 @@ impl<A: TwitchApi> Engine<A> {
     fn begin_watching(&mut self, now: DateTime<Utc>, candidate: Candidate, reason: String) {
         self.progress.reset();
         self.progress.begin(now);
-        self.watchdog.reset();
-        self.recovery_step = None;
+        // Resetting here as well as in `stop_watching` is what actually kept
+        // the ladder pinned: recovery would switch channel, selection would
+        // start a new episode, and the rungs above "switch channel" — resync,
+        // revalidate the token, rest the campaign — were never reached.
+        if std::mem::take(&mut self.carry_recovery) {
+            tracing::debug!(
+                rung = self.watchdog.rungs_attempted(),
+                "continuing the recovery episode on a new channel"
+            );
+        } else {
+            self.watchdog.reset();
+            self.recovery_step = None;
+        }
         self.last_health_advance = Some(now);
         self.last_watch = None;
         self.last_poll = None;
@@ -2319,8 +2366,17 @@ impl<A: TwitchApi> Engine<A> {
     }
 
     /// Marks a drop as claimable, as reported over the websocket.
+    /// Records the claim id Twitch pushed for an earned drop.
+    ///
+    /// Both lists, because a drop can be earned in a campaign the miner will
+    /// never *mine*: one that expired within the claim window, or a
+    /// subscription reward the user subscribed for. Walking only the mineable
+    /// campaigns dropped the claim id on the floor, and since a sub reward
+    /// needs zero minutes its `is_claimable()` depends on that id alone — so
+    /// the badge was never claimed at all unless a later sync happened to find
+    /// `dropInstanceID` populated, which Twitch often omits.
     pub fn on_drop_claimable(&mut self, drop_id: &DropId, claim_id: &str) {
-        for campaign in &mut self.campaigns {
+        for campaign in self.campaigns.iter_mut().chain(self.claim_only.iter_mut()) {
             if let Some(d) = campaign.drops.iter_mut().find(|d| &d.id == drop_id) {
                 d.claim_id = Some(claim_id.to_owned());
             }
