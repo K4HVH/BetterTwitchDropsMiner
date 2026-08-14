@@ -69,7 +69,8 @@ finished binary, dashboard included.
 | Command | Purpose |
 |---|---|
 | `btdm login [--force]` | Link an account via the device-code flow (also possible from the dashboard) |
-| `btdm status` | Whether the stored token still works |
+| `btdm status [--json]` | What the running miner is doing |
+| `btdm accounts` | Which accounts are linked, and whether their tokens still work |
 | `btdm logout` | Remove a stored token |
 | `btdm mine [--headless]` | Mine every linked account |
 | `btdm probe` | One diagnostic pass, then exit |
@@ -81,8 +82,11 @@ finished binary, dashboard included.
 Every control on the dashboard is on the CLI, over the same API, taking effect
 immediately:
 
+`btdm control` is a *client* of a running `btdm mine`, not a second way of
+mining: each command reaches the daemon over the same HTTP API the dashboard
+uses, and the reply is the miner's own confirmation once it has applied it.
+
 ```sh
-btdm control status [--json]           # what every account is doing
 btdm control pause | resume
 btdm control strategy coverage
 btdm control watch somestreamer        # switch to a channel now
@@ -90,10 +94,17 @@ btdm control switch                    # leave the current one and re-choose
 btdm control sync                      # re-fetch campaigns now
 btdm control favourite somestreamer [--remove]
 btdm control pin somestreamer [--clear]
+btdm control priority "Escape from Tarkov" "Rust"   # set the whole list
+btdm control priority --add "Rust" | --remove "Rust"
+btdm control priority --up "Rust" | --down "Rust"   # reorder one place
+btdm control priority --clear
 btdm control exclude-game "Some Game" [--undo]
 btdm control exclude-campaign <id> [--undo]
 btdm control clear-penalties           # forget every channel and campaign penalty
 ```
+
+Priority entries match a game name *or* a campaign name, so two campaigns for
+the same game can be ranked against each other.
 
 Add `--account <name>` to any command to manage a second account, and
 `--only-this-account` to `mine` to run just that one.
