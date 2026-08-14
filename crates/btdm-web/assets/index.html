@@ -281,7 +281,8 @@
     snapshots: new Map(),   // account -> snapshot
     current: null,          // selected account
     tab: "campaigns",
-    filter: "",
+    /// Exactly what the user typed. Normalised at match time, never here.
+    search: "",
     log: [],
     connected: false,
     // What the user has typed but not yet submitted. Held here rather than in
@@ -290,6 +291,8 @@
     // wiped mid-sentence.
     drafts: {},
     logScroll: 0,
+    renderError: null,
+    adding: false,
     // Loaded from the miner's own stored log, so the page is not blank about
     // everything that happened before it was opened.
     history: [],
@@ -299,7 +302,12 @@
     rewards: [],
     rewardsFor: null,
     rewardsLoaded: false,
+    rewardsFetching: null,
+    rewardsAttempted: null,
+    rewardsError: null,
     historyLoaded: false,
+    historyFetching: null,
+    historyAttempted: null,
   };
 
   const el = (tag, cls, text) => {
@@ -350,17 +358,30 @@
     }
   }
 
+  /// Fetches an account's stored history once.
+  ///
+  /// `historyFor` is only moved once the rows have actually arrived. Claiming
+  /// the new account before the fetch landed meant the previous account's rows
+  /// were shown — and attributed — to the new one for as long as the request
+  /// took.
   async function loadHistory(account) {
-    if (state.historyFor === account) return;
-    state.historyFor = account;
-    state.historyLoaded = false;
+    if (state.historyFetching === account) return;
+    if (state.historyFor === account && state.historyLoaded) return;
+    if (state.historyAttempted === account) return;
+    state.historyAttempted = account;
+    state.historyFetching = account;
     try {
       const res = await fetch(api(`/api/history?account=${encodeURIComponent(account)}&limit=300`));
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       state.history = await res.json();
+      state.historyFor = account;
       state.historyLoaded = true;
+    } catch (e) {
+      // Left un-loaded, so re-entering the tab tries again.
+    } finally {
+      state.historyFetching = null;
       if (state.tab === "log") render();
-    } catch (e) { /* the live stream still works without it */ }
+    }
   }
 
   /// A dead token used to need shell access to fix, which is no answer at all
@@ -389,17 +410,33 @@
     } catch (e) { toast("The miner is unreachable", true); }
   }
 
+  /// Fetches an account's claimed rewards once.
+  ///
+  /// The in-flight marker is separate from the loaded marker. Using one for
+  /// both meant a failed request left the tab claiming "Loading…" with nothing
+  /// loading and nothing that would ever retry — leaving and returning did
+  /// not, because the guard had already recorded this account as done.
   async function loadRewards(account) {
-    if (state.rewardsFor === account) return;
-    state.rewardsFor = account;
-    state.rewardsLoaded = false;
+    if (state.rewardsFetching === account) return;
+    if (state.rewardsFor === account && state.rewardsLoaded) return;
+    // One attempt per visit. Retrying on every render would be a loop: the
+    // failure re-renders, the render asks again, and the page spins.
+    if (state.rewardsAttempted === account) return;
+    state.rewardsAttempted = account;
+    state.rewardsFetching = account;
     try {
       const res = await fetch(api(`/api/rewards?account=${encodeURIComponent(account)}&limit=500`));
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       state.rewards = await res.json();
+      state.rewardsFor = account;
       state.rewardsLoaded = true;
+    } catch (e) {
+      // Left un-loaded on purpose, so the next visit tries again.
+      state.rewardsError = String(e);
+    } finally {
+      state.rewardsFetching = null;
       if (state.tab === "rewards") render();
-    } catch (e) { /* nothing to show is better than a broken page */ }
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -412,23 +449,59 @@
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
   /// A text box whose contents survive the page rebuilding underneath it.
+  /// Drafts are per *account*.
+  ///
+  /// They were keyed on the element id alone, and every account's page uses
+  /// the same ids. So typing a channel into the pin box under one account and
+  /// switching to another pre-filled that account's box with the first one's
+  /// text — and one click then posted it to the wrong account. Half-typed
+  /// input surviving a rebuild is the point of drafts; surviving a change of
+  /// *subject* is not.
+  const draftKey = (id) => `${state.current || "?"}::${id}`;
+
   function draftInput(id, placeholder, fallback, onEnter) {
+    const key = draftKey(id);
     const input = el("input");
     input.type = "text";
     input.id = id;
     input.placeholder = placeholder;
-    input.value = state.drafts[id] !== undefined ? state.drafts[id] : (fallback || "");
-    input.oninput = () => { state.drafts[id] = input.value; };
+    input.value = state.drafts[key] !== undefined ? state.drafts[key] : (fallback || "");
+    input.oninput = () => { state.drafts[key] = input.value; };
     if (onEnter) {
       input.onkeydown = (e) => { if (e.key === "Enter") onEnter(input.value.trim()); };
     }
     return input;
   }
 
-  const clearDraft = (id) => { delete state.drafts[id]; };
+  const clearDraft = (id) => { delete state.drafts[draftKey(id)]; };
+
+  /// A finite number, or null. Everything on this page comes from a JSON
+  /// payload, and a field that is absent, null, a string, or NaN must not
+  /// become part of a figure — printing "NaN" or "undefined" at the user is
+  /// exactly the invented-number problem this project exists to avoid, just
+  /// with a different shape.
+  function num(v) {
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+
+  /// A valid date, or null.
+  function when(v) {
+    if (v === null || v === undefined) return null;
+    const t = new Date(v).getTime();
+    return Number.isFinite(t) ? new Date(t) : null;
+  }
+
+  /// An array, whatever arrived.
+  function list0(v) {
+    return Array.isArray(v) ? v : [];
+  }
 
   function ago(seconds) {
-    if (seconds === null || seconds === undefined) return "never";
+    seconds = num(seconds);
+    if (seconds === null) return "never";
+    // A clock skew between a headless miner and this browser can put a
+    // timestamp in the future. "-3600s ago" is not a time.
+    if (seconds < 0) return "just now";
     if (seconds < 60) return `${seconds}s ago`;
     const m = Math.floor(seconds / 60);
     if (m < 60) return `${m}m ago`;
@@ -437,7 +510,9 @@
   }
 
   function until(iso) {
-    const ms = new Date(iso).getTime() - Date.now();
+    const at = when(iso);
+    if (!at) return "no end date";
+    const ms = at.getTime() - Date.now();
     if (ms <= 0) return "ended";
     const mins = Math.floor(ms / 60000);
     if (mins < 60) return `${mins}m left`;
@@ -447,7 +522,8 @@
   }
 
   function hours(mins) {
-    if (mins === null || mins === undefined) return "—";
+    mins = num(mins);
+    if (mins === null) return "—";
     const neg = mins < 0;
     const m = Math.abs(mins);
     const text = m < 60 ? `${m}m` : m < 1440 ? `${Math.floor(m / 60)}h ${m % 60}m`
@@ -458,7 +534,7 @@
   function bar(percent, done) {
     const b = el("div", "bar" + (done ? " done" : ""));
     const fill = el("i");
-    fill.style.width = Math.max(0, Math.min(100, percent || 0)) + "%";
+    fill.style.width = Math.max(0, Math.min(100, num(percent) || 0)) + "%";
     b.append(fill);
     return b;
   }
@@ -540,12 +616,28 @@
     return state.snapshots.values().next().value || null;
   }
 
+  /// Keeps the existing picker when its options have not changed.
+  ///
+  /// Rebuilding it every heartbeat closed it under anyone who had it open —
+  /// a dropdown that shuts itself once a minute cannot be used.
   function renderAccountPicker() {
     const host = $("#account-picker");
-    host.textContent = "";
     const names = [...state.snapshots.keys()];
-    if (names.length <= 1) return;
+    if (names.length <= 1) {
+      host.textContent = "";
+      return;
+    }
 
+    const existing = host.querySelector("select");
+    const same = existing
+      && [...existing.options].map((o) => o.value).join("\u0000") === names.join("\u0000");
+    if (same) {
+      const want = state.current || names[0];
+      if (existing.value !== want) existing.value = want;
+      return;
+    }
+
+    host.textContent = "";
     const sel = el("select");
     names.forEach((n) => {
       const o = el("option", null, n);
@@ -606,7 +698,12 @@
     // listing game campaigns per channel the answer is nearly always the
     // latter, and saying so is better than implying a confirmation there is
     // no evidence for.
-    if (w.confirmed_by_twitch) {
+    // Only once something actually has been confirmed. Printed beside "No
+    // progress confirmed by Twitch yet" it reads as the page arguing with
+    // itself — these are two different facts (Twitch named the drops for this
+    // channel; Twitch has credited minutes) and the badge is not worth the
+    // confusion until the second one is also true.
+    if (w.confirmed_by_twitch && num(w.current_minutes) !== null) {
       const p = el("span", "pill ok", "confirmed by Twitch");
       p.title = "Twitch named these drops as progressable on this channel.";
       head.append(p);
@@ -626,17 +723,18 @@
     panel.append(el("div", "sub", watchedCampaigns.join(" · ")));
 
     const line = el("div", "confirm");
-    if (w.current_minutes === null || w.current_minutes === undefined) {
+    const current = num(w.current_minutes);
+    const required = num(w.required_minutes);
+    if (current === null || required === null) {
       line.append(el("span", "sub", "No progress confirmed by Twitch yet"));
     } else {
       line.append(document.createTextNode(
-        `${w.drop_name ? w.drop_name + " — " : ""}${w.current_minutes}/${w.required_minutes} min confirmed`));
+        `${w.drop_name ? w.drop_name + " — " : ""}${current}/${required} min confirmed`));
     }
     panel.append(line);
 
-    if (w.required_minutes) {
-      panel.append(bar((w.current_minutes / w.required_minutes) * 100,
-                       w.current_minutes >= w.required_minutes));
+    if (current !== null && required) {
+      panel.append(bar((current / required) * 100, current >= required));
     }
 
     // Only meaningful once something *has* been confirmed. Printed
@@ -652,6 +750,14 @@
       since.style.marginTop = "8px";
       since.append(document.createTextNode("Last confirmed by Twitch: "));
       since.append(el("span", w.stalled ? "stale" : "", ago(w.seconds_since_confirmation)));
+      // Once the stream is down these figures stop advancing while continuing
+      // to read as current. A page whose whole promise is that its numbers are
+      // real has to say when they have stopped being fresh.
+      if (!state.connected) {
+        const stale = el("span", "stale", " — frozen: no connection to the miner");
+        stale.title = "The connection to the miner is down, so this figure has stopped advancing.";
+        since.append(stale);
+      }
       panel.append(since);
     } else if (!confirmed) {
       const waiting = el("div", "sub");
@@ -669,26 +775,44 @@
 
   /// Whether the selected strategy actually reads the priority list. Showing
   /// its editor under any other strategy would imply it has an effect.
+  /// The strategy actually in force.
+  ///
+  /// Two sources existed: the `selected` flag on the strategy list, and
+  /// `settings.strategy`. When they disagreed the picker showed one and every
+  /// warning named the other — and with nothing flagged `selected` the picker
+  /// silently presented its first option as current. `settings.strategy` is
+  /// the miner's own answer, so it wins; the flag is only a fallback for a
+  /// payload that omits it.
+  function currentStrategy(s) {
+    if (s.settings && s.settings.strategy) return s.settings.strategy;
+    const flagged = list0(s.strategies).find((x) => x.selected);
+    return flagged ? flagged.name : "";
+  }
+
   function usesPriority(s) {
-    const chosen = (s.strategies.find((x) => x.selected) || {}).name || "";
-    return chosen.startsWith("priority");
+    return currentStrategy(s).startsWith("priority");
   }
 
   /// The ordered game/campaign list the priority strategies rank by. Rendered
   /// wherever the strategy is chosen, so the setting and its input stay
   /// together.
-  function priorityEditor(s, chosen) {
+  function priorityEditor(s, inForce) {
     const acct = s.account;
     const wrap = el("div", "field");
     wrap.style.marginTop = "14px";
     wrap.append(el("label", null, "Priority order"));
 
-    const list = s.settings.priority_games || [];
+    // Defensive: every control below addresses an entry by its text, because
+    // that is what the miner's commands take. A repeated entry would make two
+    // chips whose buttons send byte-identical commands — clicking the second
+    // acts on the first. The miner deduplicates, so this only guards against a
+    // payload that somehow carries one.
+    const list = [...new Set(list0(s.settings.priority_games))];
     const chips = el("div", "chips");
     if (!list.length) {
       const warn = el("div", "hint");
       warn.style.color = "var(--warn)";
-      warn.textContent = (chosen && chosen.name === "priority-only")
+      warn.textContent = (inForce === "priority-only")
         ? "Empty — this strategy mines nothing until you add something."
         : "Empty — nothing is being prioritised yet.";
       wrap.append(warn);
@@ -726,9 +850,18 @@
 
     const row = el("div", "row");
     const add = async (v) => {
-      if (!v) return;
-      if (await send(acct, { command: "add_priority_entry", entry: v })) {
-        clearDraft("priority-input");
+      if (!v || state.adding) return;
+      // Without this guard the box still reads what was typed — `clearDraft`
+      // only touches the store, and nothing redrew — so it looks unsent and a
+      // second click posts it again.
+      state.adding = true;
+      try {
+        if (await send(acct, { command: "add_priority_entry", entry: v })) {
+          clearDraft("priority-input");
+          render();
+        }
+      } finally {
+        state.adding = false;
       }
     };
     const input = draftInput("priority-input", "Game or campaign name", "", add);
@@ -751,15 +884,24 @@
     const f1 = el("div", "field");
     f1.append(el("label", null, "Strategy"));
     const sel = el("select");
-    s.strategies.forEach((st) => {
-      const o = el("option", null, st.name);
-      o.value = st.name;
-      if (st.selected) o.selected = true;
+    // Identified so focus survives the rebuild. `captureFocus` restores by id,
+    // and a control without one is dropped to <body> on every heartbeat —
+    // which for a keyboard user means this picker cannot be reached at all.
+    sel.id = "strategy";
+    const inForce = currentStrategy(s);
+    // A strategy the miner reports but does not list must still be shown as
+    // current, or the picker quietly claims a different one is.
+    const names = list0(s.strategies).map((st) => st.name);
+    if (inForce && !names.includes(inForce)) names.unshift(inForce);
+    names.forEach((name) => {
+      const o = el("option", null, name);
+      o.value = name;
+      if (name === inForce) o.selected = true;
       sel.append(o);
     });
     sel.onchange = () => send(acct, { command: "set_strategy", name: sel.value });
     f1.append(sel);
-    const chosen = s.strategies.find((x) => x.selected);
+    const chosen = list0(s.strategies).find((x) => x.name === inForce);
     f1.append(el("div", "hint", chosen ? chosen.description : ""));
     panel.append(f1);
 
@@ -768,7 +910,7 @@
     // that mines *nothing* until it has a list — gave you a miner that had
     // visibly stopped, and no indication that the thing to fix was two tabs
     // away. Shown here, and only when it is actually consulted.
-    if (usesPriority(s)) panel.append(priorityEditor(s, chosen));
+    if (usesPriority(s)) panel.append(priorityEditor(s, inForce));
 
     // Buttons
     const acts = el("div", "row");
@@ -811,18 +953,22 @@
       d.append(el("span", null, label));
       box.append(d);
     };
-    add(`${t.campaigns_eligible}/${t.campaigns_known}`, "campaigns mineable");
-    add(t.drops_claimed, "drops claimed");
-    add(t.drops_remaining, "drops remaining");
+    // A total that did not arrive as a number is not a total. "—" says that;
+    // "null/null" says the miner reported something it did not.
+    const count = (v) => { const n = num(v); return n === null ? "—" : String(n); };
+    add(`${count(t.campaigns_eligible)}/${count(t.campaigns_known)}`, "campaigns mineable");
+    add(count(t.drops_claimed), "drops claimed");
+    add(count(t.drops_remaining), "drops remaining");
     add(hours(t.minutes_remaining), "watching left");
-    add(t.campaigns_at_risk, "at risk");
+    add(count(t.campaigns_at_risk), "at risk");
     add(s.live.length, "channels live now");
     return box;
   }
 
   function matches(text) {
-    if (!state.filter) return true;
-    return (text || "").toLowerCase().includes(state.filter);
+    const needle = state.search.trim().toLowerCase();
+    if (!needle) return true;
+    return (text || "").toLowerCase().includes(needle);
   }
 
   function campaignCard(s, c) {
@@ -901,10 +1047,16 @@
     const rewards = benefits.map((b) => b.name).filter((n) => n && n !== d.name);
     if (rewards.length) body.append(el("div", "benefits", rewards.join(", ")));
 
-    const needsSub = (d.required_subs || 0) > 0;
-    // A progress bar that can never move is worse than no bar: it says the
-    // miner is working on something it will never finish.
-    if (!d.is_claimed && !needsSub) body.append(bar(d.percent, d.percent >= 100));
+    const needsSub = (num(d.required_subs) || 0) > 0;
+    // Drawn from the same two numbers printed beside it. `percent` is a third
+    // figure that can disagree with them, and a full green bar next to "5/60m"
+    // is the page contradicting itself about the one thing it exists to
+    // report. `percent` is only used when the minutes are missing.
+    if (!d.is_claimed && !needsSub) {
+      const cur = num(d.current_minutes), req = num(d.required_minutes);
+      const pct = cur !== null && req ? (cur / req) * 100 : num(d.percent) || 0;
+      body.append(bar(pct, pct >= 100));
+    }
     row.append(body);
 
     const mins = el("div", "mins");
@@ -918,7 +1070,11 @@
     }
     else if (d.claimable) mins.append(el("span", "pill ok", "claiming"));
     else if (d.locked) mins.append(el("span", "pill", "locked"));
-    else mins.textContent = `${d.current_minutes}/${d.required_minutes}m`;
+    else {
+      // Both halves or neither. Half a figure is not a figure.
+      const cur = num(d.current_minutes), req = num(d.required_minutes);
+      mins.textContent = cur !== null && req !== null ? `${cur}/${req}m` : "not reported";
+    }
     row.append(mins);
 
     return row;
@@ -931,7 +1087,7 @@
       const p = el("div", "panel pad");
       p.style.marginTop = "16px";
       p.append(el("div", "empty",
-        state.filter ? "Nothing matches that search." : "No mineable campaigns."));
+        state.search.trim() ? "Nothing matches that search." : "No mineable campaigns."));
       box.append(p);
       return box;
     }
@@ -955,9 +1111,26 @@
     if (!list.length) {
       const p = el("div", "panel pad");
       p.append(el("div", "empty",
-        "No live channel is currently confirmed to progress your drops."));
+        s.live.length
+          ? "No live channel matches that search."
+          : "No live channel can progress any of your drops right now."));
       box.append(p);
       return box;
+    }
+
+    // Said once rather than badged on every row: since Twitch stopped listing
+    // game campaigns per channel, almost nothing is confirmed, and repeating
+    // "inferred" ninety times tells the reader nothing.
+    const confirmed = list.filter((c) => c.confirmed_by_twitch).length;
+    if (confirmed < list.length) {
+      const note = el("div", "sub");
+      note.style.margin = "14px 0 0";
+      note.textContent = confirmed === 0
+        ? "Twitch is not naming drops per channel at the moment, so these are "
+          + "channels streaming a campaign's game with drops enabled."
+        : `${confirmed} of ${list.length} are confirmed by Twitch; the rest are `
+          + "channels streaming a campaign's game with drops enabled.";
+      box.append(note);
     }
 
     const panel = el("div", "panel scroll");
@@ -996,12 +1169,27 @@
       }
       tr.append(nameCell);
 
-      tr.append(el("td", "num", c.viewers.toLocaleString()));
+      const viewers = num(c.viewers);
+      tr.append(el("td", "num", viewers === null ? "—" : viewers.toLocaleString()));
 
       const what = el("td");
-      const chanCampaigns = Array.isArray(c.campaigns) ? c.campaigns : [];
+      const chanCampaigns = list0(c.campaigns);
       what.append(document.createTextNode(
-        `${plural(chanCampaigns.length, "campaign")}, ${plural(c.drops || 0, "drop")}`));
+        `${plural(chanCampaigns.length, "campaign")}, ${plural(num(c.drops) || 0, "drop")}`));
+      // Whether Twitch named these drops for this channel, or the miner
+      // inferred them from the directory's drops-enabled tag. The table used
+      // to say nothing, presenting inference as fact on every row.
+      //
+      // Only the confirmed case is badged. Since Twitch stopped listing game
+      // campaigns per channel, "inferred" is true of nearly every row, and a
+      // badge on all of them is noise that says nothing — the note above the
+      // table carries that instead.
+      if (c.confirmed_by_twitch) {
+        const how = el("span", "pill ok", "confirmed");
+        how.title = "Twitch named these drops as progressable on this channel.";
+        how.style.marginLeft = "7px";
+        what.append(how);
+      }
       const names = el("div", "sub", chanCampaigns.join(", "));
       names.style.fontSize = ".78rem";
       what.append(names);
@@ -1021,7 +1209,7 @@
       watch.disabled = c.is_current;
       watch.onclick = async () => {
         if (await send(s.account, { command: "watch_channel", login: c.login })) {
-          toast("Switching to " + c.display_name);
+          /* the miner's own reply is already shown by `send` */
         }
       };
       actCell.append(watch);
@@ -1047,7 +1235,12 @@
 
     const groups = new Map();
     list.forEach((r) => {
-      if (!groups.has(r.reason)) groups.set(r.reason, { explanation: r.explanation, items: [] });
+      // The explanation belongs to the campaign, not to the group: two
+      // campaigns rejected for the same reason can have different detail, and
+      // taking whichever arrived first described the rest with someone else's
+      // words.
+      if (!groups.has(r.reason)) groups.set(r.reason, { explanations: new Set(), items: [] });
+      if (r.explanation) groups.get(r.reason).explanations.add(r.explanation);
       groups.get(r.reason).items.push(r);
     });
 
@@ -1058,7 +1251,11 @@
         h.append(document.createTextNode(reason));
         h.append(el("span", "count", `${group.items.length}`));
         box.append(h);
-        box.append(el("div", "sub", group.explanation));
+        // One line when they agree, which is the normal case; otherwise each
+        // campaign's own, so none is described by another's.
+        if (group.explanations.size === 1) {
+          box.append(el("div", "sub", [...group.explanations][0]));
+        }
 
         const panel = el("div", "panel scroll");
         panel.style.marginTop = "10px";
@@ -1067,18 +1264,22 @@
           .sort((a, b) => (a.game || "").localeCompare(b.game || ""))
           .forEach((r) => {
             const tr = el("tr");
+            // Its own explanation, always, whether or not the group shares one.
+            if (r.explanation) tr.title = r.explanation;
 
             const nameCell = el("td");
             nameCell.append(document.createTextNode(r.name || "(unnamed)"));
             // "Not started" is only useful if it says when.
-            if (reason === "not started" && r.starts_at) {
-                const when = new Date(r.starts_at);
-                const days = Math.round((when - Date.now()) / 86400000);
+            // Shadowing the `when` helper here is what let an unparseable
+            // date through as "in NaN days".
+            const startsAt = when(r.starts_at);
+            if (reason === "not started" && startsAt) {
+                const days = Math.round((startsAt.getTime() - Date.now()) / 86400000);
                 const soon = el("span", "pill", days <= 0
                     ? "starts today"
                     : days === 1 ? "starts tomorrow" : `in ${days} days`);
                 soon.style.marginLeft = "7px";
-                soon.title = when.toLocaleString();
+                soon.title = startsAt.toLocaleString();
                 nameCell.append(soon);
             }
             tr.append(nameCell);
@@ -1202,8 +1403,10 @@
     // nowhere. An exclusion you cannot see is one you cannot undo.
     const excluded = s.settings.excluded_campaigns || [];
     const nameFor = (id) => {
-      const hit = (s.eligible || []).concat(s.rejected || []).find((c) => c.id === id);
-      return hit ? hit.name : id;
+      const hit = list0(s.eligible).concat(list0(s.rejected)).find((c) => c.id === id);
+      // A campaign with no name still has an id, and the id is what the user
+      // needs in order to un-exclude it. "null" is neither.
+      return (hit && hit.name) || String(id);
     };
     box.append(listPanel({
       title: "Excluded campaigns",
@@ -1259,7 +1462,9 @@
       `Watchdog: ${s.health.verdict}`,
       s.health.last_sync
         ? `Campaigns refreshed ${ago(Math.round((Date.now() - new Date(s.health.last_sync)) / 1000))}` +
-          (s.health.next_sync_in_seconds != null ? `, next in ${Math.round(s.health.next_sync_in_seconds / 60)}m` : "")
+          (num(s.health.next_sync_in_seconds) !== null
+            ? `, next in ${Math.max(0, Math.round(s.health.next_sync_in_seconds / 60))}m`
+            : "")
         : "Campaigns have not been refreshed yet",
     ];
     lines.forEach((t) => dl.append(el("div", null, t)));
@@ -1283,16 +1488,23 @@
     loadRewards(s.account);
     const box = el("div");
 
-    const list = state.rewards.filter((r) => matches(r.name));
+    // Only this account's. `state.rewards` is replaced when the fetch for the
+    // new account lands, so between switching and that arrival the previous
+    // account's rewards were listed — and totalled — as if they were this
+    // one's.
+    const list = (state.rewardsFor === s.account ? state.rewards : [])
+      .filter((r) => matches(r.name));
     if (!list.length) {
       const p = el("div", "panel pad");
       p.style.marginTop = "16px";
       // Saying "nothing claimed" before the answer has arrived would be
       // telling the user something untrue, which is the one thing this
       // project is built not to do.
-      p.append(el("div", "empty", !state.rewardsLoaded
-        ? "Loading…"
-        : state.rewards.length
+      const loadedThis = state.rewardsFor === s.account && state.rewardsLoaded;
+      p.append(el("div", "empty",
+        state.rewardsFetching === s.account ? "Loading…"
+        : !loadedThis ? "Could not load the claim history. It will be retried."
+        : list.length === 0 && state.rewards.length
           ? "Nothing matches that search."
           : "Nothing claimed yet. Rewards appear here as they are earned."));
       box.append(p);
@@ -1302,7 +1514,8 @@
     // Grouped by day, because "what did I get overnight" is the question.
     const byDay = new Map();
     list.forEach((r) => {
-      const day = new Date(r.at).toDateString();
+      const at = when(r.at);
+      const day = at ? at.toDateString() : "date not recorded";
       if (!byDay.has(day)) byDay.set(day, []);
       byDay.get(day).push(r);
     });
@@ -1326,7 +1539,8 @@
         name.append(el("span", "pill ok", "claimed"));
         name.append(document.createTextNode(" " + r.name));
         tr.append(name);
-        tr.append(el("td", "sub num", new Date(r.at).toLocaleTimeString()));
+        const at = when(r.at);
+        tr.append(el("td", "sub num", at ? at.toLocaleTimeString() : "—"));
         tbody.append(tr);
       });
       table.append(tbody);
@@ -1344,23 +1558,37 @@
     // Live lines first, then whatever the miner recorded before this page was
     // opened. Without the stored half, a restart looked like amnesia.
     const seen = new Set(state.log.map((l) => l.at + l.summary));
+    // Stamping each stored line with the account currently on screen did not
+    // merely show one account's history under another — it *asserted* the
+    // lines belonged to it. The history is only used while it is the history
+    // of the account being shown.
+    const history = state.historyFor === s.account ? state.history : [];
     const merged = state.log.concat(
-      state.history
+      history
         .filter((h) => !seen.has(h.at + h.summary))
         .filter((h) => h.severity !== "debug")
-        .map((h) => ({ at: h.at, account: s.account, summary: h.summary, severity: h.severity })),
+        .map((h) => ({
+          at: h.at,
+          account: state.historyFor,
+          summary: h.summary,
+          severity: h.severity,
+        })),
     );
 
     if (!merged.length) {
       const e = el("div", "empty");
       e.style.padding = "14px";
-      e.textContent = state.historyLoaded ? "Nothing has happened yet." : "Loading…";
+      e.textContent = state.historyFetching === s.account ? "Loading…"
+        : state.historyFor === s.account && state.historyLoaded
+          ? "Nothing has happened yet."
+          : "Could not load the stored history. It will be retried.";
       panel.append(e);
       return panel;
     }
     merged.forEach((item) => {
       const line = el("div", "line");
-      line.append(el("time", null, new Date(item.at).toLocaleTimeString()));
+      const at = when(item.at);
+      line.append(el("time", null, at ? at.toLocaleTimeString() : "—"));
       if (state.snapshots.size > 1) line.append(el("span", "who", item.account));
       line.append(el("span", "sev-" + (item.severity || "info"), item.summary));
       panel.append(line);
@@ -1441,14 +1669,73 @@
     return box;
   }
 
+  /// Renders, or leaves what is on screen alone.
+  ///
+  /// The page used to build straight into `#app`, having emptied it first, and
+  /// `render()` is called from inside the stream handler's try/catch — so one
+  /// unexpected field threw, the throw was swallowed, and the user was left
+  /// with a blank page: no hero, no stats, no tab strip, no way back. It
+  /// stayed blank, because the next heartbeat carried the same field. That is
+  /// the worst possible failure for a page whose job is to tell you what is
+  /// happening.
+  ///
+  /// Building into a detached node first means a throw costs the *update*
+  /// rather than the page. The last good render stays up and says so.
   function render() {
     connection();
     renderAccountPicker();
 
-    const s = snap();
     const app = $("#app");
+    const staging = document.createElement("div");
+    try {
+      build(staging, snap());
+    } catch (e) {
+      renderFailed(e);
+      return;
+    }
+    const focus = captureFocus();
+    app.replaceChildren(...staging.childNodes);
+    restoreFocus(focus);
+  }
+
+  /// Reports a render that threw, without destroying the page that is up.
+  function renderFailed(e) {
+    if (state.renderError === String(e)) return; // do not nag every heartbeat
+    state.renderError = String(e);
+    console.error("dashboard render failed", e);
+    toast("The dashboard could not draw this update — showing the last good one", true);
+  }
+
+  function captureFocus() {
+    // Preserve focus and caret across the rebuild for whichever control the
+    // user is in. Their *contents* are already safe in `state.drafts`; this is
+    // so the cursor does not jump out mid-word.
+    const active = document.activeElement;
+    const id = active && active.id ? active.id : null;
+    const caret = active && typeof active.selectionStart === "number"
+      ? active.selectionStart : null;
+    const log = $("#log");
+    if (log) state.logScroll = log.scrollTop;
+    return { id, caret, scrolled: window.scrollY };
+  }
+
+  function restoreFocus(f) {
+    if (f.id) {
+      const restored = document.getElementById(f.id);
+      if (restored) {
+        restored.focus();
+        if (f.caret !== null && restored.setSelectionRange) {
+          try { restored.setSelectionRange(f.caret, f.caret); } catch (e) { /* not a text box */ }
+        }
+      }
+    }
+    const newLog = $("#log");
+    if (newLog) newLog.scrollTop = state.logScroll;
+    window.scrollTo(0, f.scrolled);
+  }
+
+  function build(app, s) {
     if (!s) {
-      app.textContent = "";
       app.append(attentionPanel());
       const p = el("div", "panel pad");
       p.style.marginTop = "20px";
@@ -1461,18 +1748,8 @@
       return;
     }
     state.current = s.account;
+    state.renderError = null;
 
-    // Preserve focus and caret across the rebuild for whichever box the user
-    // is in — not just the search field. Their *contents* are already safe in
-    // `state.drafts`; this is so the cursor does not jump out mid-word.
-    const active = document.activeElement;
-    const focusedId = active && active.id && active.tagName === "INPUT" ? active.id : null;
-    const caret = focusedId ? active.selectionStart : null;
-    const scrolled = window.scrollY;
-    const oldLog = $("#log");
-    if (oldLog) state.logScroll = oldLog.scrollTop;
-
-    app.textContent = "";
     app.append(attentionPanel());
     app.append(banners(s));
 
@@ -1501,7 +1778,16 @@
       if (count !== null && count !== undefined) {
         b.append(el("span", "badge", String(count)));
       }
-      b.onclick = () => { state.tab = id; render(); };
+      b.onclick = () => {
+        // Re-entering a tab is the user asking again, so a failed fetch is
+        // allowed another go.
+        if (id !== state.tab) {
+          state.rewardsAttempted = null;
+          state.historyAttempted = null;
+        }
+        state.tab = id;
+        render();
+      };
       tabs.append(b);
     });
     app.append(tabs);
@@ -1513,9 +1799,14 @@
       search.id = "search";
       search.type = "search";
       search.placeholder = "Filter by campaign, game or channel…";
-      search.value = state.filter;
+      search.value = state.search;
       search.style.flex = "1 1 260px";
-      search.oninput = () => { state.filter = search.value.trim().toLowerCase(); render(); };
+      // Store what was typed, and normalise only when *matching*. Storing the
+      // trimmed lowercase form and writing it back on the next render rewrote
+      // the box under the cursor: a trailing space never survived, so a
+      // two-word search could not be entered at all, and capitals vanished as
+      // they were typed.
+      search.oninput = () => { state.search = search.value; render(); };
       searchRow.append(search);
       app.append(searchRow);
     }
@@ -1526,19 +1817,6 @@
     else if (state.tab === "rewards") app.append(rewardsTab(s));
     else if (state.tab === "settings") app.append(settingsTab(s));
     else app.append(logTab(s));
-
-    if (focusedId) {
-      const restored = document.getElementById(focusedId);
-      if (restored) {
-        restored.focus();
-        if (caret !== null && restored.setSelectionRange) {
-          try { restored.setSelectionRange(caret, caret); } catch (e) { /* not a text box */ }
-        }
-      }
-    }
-    const newLog = $("#log");
-    if (newLog) newLog.scrollTop = state.logScroll;
-    window.scrollTo(0, scrolled);
   }
 
   // ---------------------------------------------------------------------
@@ -1576,8 +1854,11 @@
       } catch (e) { /* ignore */ }
     });
 
-    source.onopen = () => { state.connected = true; connection(); };
-    source.onerror = () => { state.connected = false; connection(); };
+    // A full redraw, not just the header: the hero's figures stop being
+    // current the moment the link drops, and they have to say so then rather
+    // than at the next heartbeat — which by definition is not coming.
+    source.onopen = () => { state.connected = true; connection(); render(); };
+    source.onerror = () => { state.connected = false; connection(); render(); };
   }
 
   // A slow backstop only, in case the stream dies without firing onerror.

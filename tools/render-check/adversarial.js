@@ -595,6 +595,12 @@ const tab = (label) => {
       { name: "priority", description: "Your order first.", selected: true },
     ],
     ...over,
+    // The miner reports the strategy in both places; the page believes this
+    // one, so a fixture that sets only the flag is not a real payload.
+    // `strategy` last: callers routinely pass `settings: {...snapshot().settings,
+    // priority_games: [...]}`, which carries the default strategy with it and
+    // would otherwise put "deadline" back.
+    settings: { ...snapshot().settings, ...(over.settings || {}), strategy: "priority" },
   });
 
   check("typing survives a burst of twenty snapshots", () => {
@@ -1017,8 +1023,13 @@ const tab = (label) => {
         current_minutes: null, required_minutes: null, drop_name: null,
       },
     }));
-    const hero = doc.querySelector("#app .hero .panel").textContent;
-    if (/confirmed by Twitch/.test(hero) && /No progress confirmed by Twitch yet/.test(hero)) {
+    // Look for the badge itself: the sentence "No progress confirmed by
+    // Twitch yet" contains the badge's own words, so a text-wide regex for
+    // them matches whether or not the badge is there.
+    const hero = doc.querySelector("#app .hero .panel");
+    const badge = [...hero.querySelectorAll(".pill")]
+      .some((p) => p.textContent.trim() === "confirmed by Twitch");
+    if (badge && /No progress confirmed by Twitch yet/.test(hero.textContent)) {
       throw new Error("the hero says both 'confirmed by Twitch' and 'No progress confirmed by Twitch yet'");
     }
   });
@@ -1210,6 +1221,12 @@ const tab = (label) => {
     strategy: "priority",
     strategies: [{ name: "priority", description: "Your order first.", selected: true }],
     ...over,
+    // The page believes `settings.strategy` — the miner's own answer — rather
+    // than the `selected` flag, so a fixture must set it to be a real payload.
+    // `strategy` last: callers routinely pass `settings: {...snapshot().settings,
+    // priority_games: [...]}`, which carries the default strategy with it and
+    // would otherwise put "deadline" back.
+    settings: { ...snapshot().settings, ...(over.settings || {}), strategy: "priority" },
   });
 
   dcheck("each chip's buttons act on that chip and not on its namesake", () => {

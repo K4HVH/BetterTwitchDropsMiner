@@ -242,11 +242,22 @@ impl<A: TwitchApi> Engine<A> {
             Box::new(strategy::Deadline)
         });
         let favourites = config.favourites.iter().map(|f| f.to_lowercase()).collect();
-        let priority_games = config
-            .priority_games
-            .iter()
-            .map(|g| g.to_lowercase())
-            .collect();
+        // Deduplicated on the way in as well as on the way through a command:
+        // a hand-edited config.toml is the one remaining way a repeat could
+        // reach the list, and the miner ranks by first match, so a second copy
+        // is invisible to it while being visible — and individually
+        // clickable — on the dashboard. Every control there addresses an entry
+        // by its text, so two identical entries make those controls ambiguous.
+        let priority_games = {
+            let mut seen = HashSet::new();
+            config
+                .priority_games
+                .iter()
+                .map(|g| g.trim().to_lowercase())
+                .filter(|g| !g.is_empty())
+                .filter(|g| seen.insert(g.clone()))
+                .collect()
+        };
         let excluded_campaigns = config.excluded_campaigns.iter().cloned().collect();
         let excluded_games = config
             .excluded_games
