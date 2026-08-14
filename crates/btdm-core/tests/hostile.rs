@@ -442,3 +442,85 @@ fn happy_path_with(drops: Vec<TimedDrop>) -> FakeTwitch {
     fake.available.lock().unwrap().insert("ch1".into(), ids);
     fake
 }
+
+// ---------------------------------------------------------------------------
+// Unbounded user input
+//
+// Everything in these lists is written to config.toml and repeated in every
+// snapshot the dashboard pushes over SSE. A single 200 KB priority entry was
+// accepted, persisted, and then carried in every frame for the life of the
+// process — a paste accident, not even an attack, and permanent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_absurdly_long_entry_is_refused_rather_than_persisted() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(FakeTwitch::default());
+    let huge = "a".repeat(200_000);
+
+    for (label, cmd) in [
+        ("priority", C::AddPriorityEntry { entry: huge.clone() }),
+        ("priority list", C::SetPriorityGames { games: vec![huge.clone()] }),
+        ("favourite", C::SetFavourite { login: huge.clone(), on: true }),
+        ("excluded game", C::SetGameExcluded { game: huge.clone(), excluded: true }),
+        ("pin", C::Pin { channel: Some(huge.clone()) }),
+        ("excluded campaign", C::SetCampaignExcluded {
+            campaign: CampaignId::from(&huge[..]), excluded: true,
+        }),
+    ] {
+        let effect = e.apply_command(cmd, now());
+        assert!(
+            !effect.persist,
+            "{label} accepted a 200 KB entry and would write it to config.toml"
+        );
+    }
+
+    let settings = e.snapshot("default", Some("me"), now()).settings;
+    assert!(settings.priority_games.is_empty(), "{:?}", settings.priority_games.len());
+    assert!(settings.favourites.is_empty());
+    assert!(settings.excluded_games.is_empty());
+    assert!(settings.excluded_campaigns.is_empty());
+    assert_eq!(settings.pinned, None);
+}
+
+/// A name of a plausible length must still work — the bound is on abuse, not
+/// on long campaign names.
+#[tokio::test]
+async fn a_long_but_realistic_name_is_still_accepted() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(FakeTwitch::default());
+    let realistic = "Tom Clancy's The Division: Resurgence — Broken Rain Incursion Week 3";
+
+    let effect = e.apply_command(C::AddPriorityEntry { entry: realistic.into() }, now());
+    assert!(effect.persist, "a real campaign name must be accepted: {}", effect.message);
+}
+
+/// Enough entries to bloat the config just as effectively as one long one.
+#[tokio::test]
+async fn a_list_cannot_grow_without_limit() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(FakeTwitch::default());
+
+    for i in 0..500 {
+        e.apply_command(C::AddPriorityEntry { entry: format!("game {i}") }, now());
+    }
+    let n = e.snapshot("default", Some("me"), now()).settings.priority_games.len();
+    assert!(n <= 200, "the priority list grew to {n} entries");
+}
+
+/// `dedup` only collapses *adjacent* repeats, so an alternating list kept
+/// every copy.
+#[tokio::test]
+async fn a_wholesale_list_is_deduplicated_properly() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(FakeTwitch::default());
+    let alternating: Vec<String> = (0..50)
+        .map(|i| if i % 2 == 0 { "alpha".to_string() } else { "beta".to_string() })
+        .collect();
+
+    e.apply_command(C::SetPriorityGames { games: alternating }, now());
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["alpha", "beta"]
+    );
+}

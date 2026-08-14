@@ -30,6 +30,14 @@ use chrono::{DateTime, Duration, Utc};
 /// categorised as the event, not as the game the drops belong to, so matching
 /// on the campaign's own game finds nobody and the campaign looks dead.
 const ANY_CHANNEL_GAME_IDS: [&str; 2] = ["509663", "509672"];
+
+/// The longest a user-supplied name may be: a channel login, a game name, a
+/// campaign name or id. Twitch's longest are far shorter; this is a bound on
+/// abuse and accidents, not a validation rule.
+const MAX_ENTRY_CHARS: usize = 200;
+/// How many entries any one user list may hold. Everything in these lists is
+/// written to `config.toml` and repeated in every pushed snapshot.
+const MAX_LIST_ENTRIES: usize = 200;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
@@ -298,6 +306,28 @@ impl<A: TwitchApi> Engine<A> {
         effect
     }
 
+    /// Normalises a name the user supplied, or explains why it is unusable.
+    ///
+    /// Everything these lists hold is persisted to `config.toml` and repeated
+    /// in every snapshot the dashboard pushes. Unbounded, one paste accident
+    /// is permanent: a 200 KB entry was accepted, written to the config file,
+    /// and then carried in every SSE frame for the life of the process. The
+    /// longest thing that legitimately goes in here is a campaign name, and
+    /// Twitch's are nowhere near this limit.
+    fn clean_entry(value: &str, what: &str) -> Result<String, CommandEffect> {
+        let cleaned = value.trim().to_lowercase();
+        if cleaned.is_empty() {
+            return Err(CommandEffect::message(format!("A {what} is required")));
+        }
+        if cleaned.chars().count() > MAX_ENTRY_CHARS {
+            return Err(CommandEffect::message(format!(
+                "That {what} is {} characters; the limit is {MAX_ENTRY_CHARS}",
+                cleaned.chars().count()
+            )));
+        }
+        Ok(cleaned)
+    }
+
     fn apply_command_inner(&mut self, cmd: Command, now: DateTime<Utc>) -> CommandEffect {
         match cmd {
             Command::Pause => {
@@ -337,7 +367,13 @@ impl<A: TwitchApi> Engine<A> {
                 None => CommandEffect::message(format!("No such strategy: {name}")),
             },
             Command::Pin { channel } => {
-                let login = channel.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty());
+                let login = match channel.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                    Some(c) => match Self::clean_entry(c, "channel name") {
+                        Ok(c) => Some(c),
+                        Err(e) => return e,
+                    },
+                    None => None,
+                };
                 let msg = match &login {
                     Some(c) => format!("Pinned {c}"),
                     None => "Pin cleared".to_string(),
@@ -347,9 +383,14 @@ impl<A: TwitchApi> Engine<A> {
                 CommandEffect::message(msg).with_persist().with_reselect()
             }
             Command::SetFavourite { login, on } => {
-                let key = login.trim().to_lowercase();
-                if key.is_empty() {
-                    return CommandEffect::message("A channel name is required");
+                let key = match Self::clean_entry(&login, "channel name") {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                if on && self.favourites.len() >= MAX_LIST_ENTRIES {
+                    return CommandEffect::message(format!(
+                        "The favourites list is full at {MAX_LIST_ENTRIES} channels"
+                    ));
                 }
                 if on {
                     self.favourites.insert(key.clone());
@@ -364,12 +405,27 @@ impl<A: TwitchApi> Engine<A> {
                 .with_persist()
             }
             Command::SetPriorityGames { games } => {
-                self.priority_games = games
-                    .iter()
-                    .map(|g| g.trim().to_lowercase())
-                    .filter(|g| !g.is_empty())
-                    .collect();
-                self.priority_games.dedup();
+                if games.len() > MAX_LIST_ENTRIES {
+                    return CommandEffect::message(format!(
+                        "That is {} entries; the limit is {MAX_LIST_ENTRIES}",
+                        games.len()
+                    ));
+                }
+                let mut cleaned = Vec::with_capacity(games.len());
+                for g in &games {
+                    if g.trim().is_empty() {
+                        continue;
+                    }
+                    match Self::clean_entry(g, "priority entry") {
+                        Ok(g) => cleaned.push(g),
+                        Err(e) => return e,
+                    }
+                }
+                // Not `dedup`, which only collapses *adjacent* repeats: an
+                // alternating list would keep every one of them.
+                let mut seen = HashSet::new();
+                cleaned.retain(|g| seen.insert(g.clone()));
+                self.priority_games = cleaned;
                 let n = self.priority_games.len();
                 self.reselect_forced = true;
                 CommandEffect::message(format!("Priority list set to {n} entries"))
@@ -377,9 +433,14 @@ impl<A: TwitchApi> Engine<A> {
                     .with_reselect()
             }
             Command::AddPriorityEntry { entry } => {
-                let entry = entry.trim().to_lowercase();
-                if entry.is_empty() {
-                    return CommandEffect::message("Nothing to add");
+                let entry = match Self::clean_entry(&entry, "priority entry") {
+                    Ok(e) => e,
+                    Err(e) => return e,
+                };
+                if self.priority_games.len() >= MAX_LIST_ENTRIES {
+                    return CommandEffect::message(format!(
+                        "The priority list is full at {MAX_LIST_ENTRIES} entries"
+                    ));
                 }
                 if self.priority_games.contains(&entry) {
                     return CommandEffect::message(format!("'{entry}' is already prioritised"));
@@ -425,6 +486,16 @@ impl<A: TwitchApi> Engine<A> {
                     .with_reselect()
             }
             Command::SetCampaignExcluded { campaign, excluded } => {
+                // Campaign ids are Twitch UUIDs. Anything longer is not one,
+                // and would be persisted and republished forever.
+                if campaign.0.trim().is_empty() || campaign.0.chars().count() > MAX_ENTRY_CHARS {
+                    return CommandEffect::message("That is not a campaign id");
+                }
+                if excluded && self.excluded_campaigns.len() >= MAX_LIST_ENTRIES {
+                    return CommandEffect::message(format!(
+                        "The excluded-campaigns list is full at {MAX_LIST_ENTRIES}"
+                    ));
+                }
                 let name = self
                     .campaigns
                     .iter()
@@ -458,9 +529,14 @@ impl<A: TwitchApi> Engine<A> {
                 .with_reselect()
             }
             Command::SetGameExcluded { game, excluded } => {
-                let key = game.trim().to_lowercase();
-                if key.is_empty() {
-                    return CommandEffect::message("A game name is required");
+                let key = match Self::clean_entry(&game, "game name") {
+                    Ok(k) => k,
+                    Err(e) => return e,
+                };
+                if excluded && self.excluded_games.len() >= MAX_LIST_ENTRIES {
+                    return CommandEffect::message(format!(
+                        "The excluded-games list is full at {MAX_LIST_ENTRIES}"
+                    ));
                 }
                 if excluded {
                     self.excluded_games.insert(key.clone());
@@ -472,9 +548,9 @@ impl<A: TwitchApi> Engine<A> {
                 }
                 self.reselect_forced = true;
                 CommandEffect::message(if excluded {
-                    format!("Excluded every campaign for {game}")
+                    format!("Excluded every campaign for {key}")
                 } else {
-                    format!("Re-included {game}")
+                    format!("Re-included {key}")
                 })
                 .with_persist()
                 .with_reselect()
