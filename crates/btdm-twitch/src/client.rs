@@ -29,6 +29,14 @@ pub fn generate_device_id() -> String {
     random_hex_128()
 }
 
+/// How long any one Twitch request may take before it is abandoned.
+///
+/// Generous: a batched campaign-details call against a large account is a real
+/// request doing real work. The point is only that it *ends*.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long to wait for the connection itself. A dead proxy fails here.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     build_http_client_with_proxy(None)
 }
@@ -43,7 +51,17 @@ pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
 /// fallback to a direct connection — quietly ignoring it would send traffic
 /// from the address the user was trying to avoid.
 pub fn build_http_client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder().user_agent(USER_AGENT).gzip(true);
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .gzip(true)
+        // reqwest has no default timeout, and the miner polls the command
+        // channel only while it is waiting between heartbeats — never during a
+        // sync or a selection pass. So one connection that opens and then
+        // never answers, which is what a DNS blackhole or a dead proxy looks
+        // like, parked the whole miner for good: no mining, no commands, no
+        // Ctrl-C, and a dashboard whose every click sat until it timed out.
+        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT);
     if let Some(url) = proxy.map(str::trim).filter(|u| !u.is_empty()) {
         builder = builder.proxy(reqwest::Proxy::all(url)?);
     }

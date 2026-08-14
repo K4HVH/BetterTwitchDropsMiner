@@ -162,6 +162,10 @@ pub struct CurrentWatch {
     pub since: DateTime<Utc>,
     /// Why the strategy chose this channel.
     pub reason: String,
+    /// How the choice was established. Kept so the dashboard can say whether
+    /// Twitch named these drops or the miner inferred them from the
+    /// directory — a distinction the user cannot otherwise see.
+    pub confidence: Confidence,
 }
 
 impl CurrentWatch {
@@ -192,7 +196,10 @@ pub struct Engine<A: TwitchApi> {
     /// Campaigns that have ended but whose earned drops can still be claimed.
     /// Twitch allows claiming for 24 hours after a campaign closes; dropping
     /// them at the moment they expired threw away rewards already worked for.
-    recently_ended: Vec<DropCampaign>,
+    /// Campaigns that will never be mined again but may still hold drops that
+    /// are earned and unclaimed: expired inside Twitch's 24-hour claim window,
+    /// or subscription rewards the user genuinely subscribed for.
+    claim_only: Vec<DropCampaign>,
     /// Why each unavailable campaign was rejected, for the dashboard.
     rejected: Vec<RejectedView>,
     current: Option<CurrentWatch>,
@@ -261,7 +268,7 @@ impl<A: TwitchApi> Engine<A> {
             config,
             campaigns: Vec::new(),
             upcoming: Vec::new(),
-            recently_ended: Vec::new(),
+            claim_only: Vec::new(),
             rejected: Vec::new(),
             current: None,
             live: Vec::new(),
@@ -293,8 +300,22 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Applies a user command. Everything here takes effect immediately; none
     /// of it waits for the next sync or a restart.
+    ///
+    /// `CommandEffect::reselect` and `self.reselect_forced` say the same
+    /// thing to two different readers — the caller, and the next
+    /// `needs_selection`. Every arm used to have to remember to set both, and
+    /// the three priority-list commands set only the first: they reported
+    /// "reselect" to `run.rs`, which broke out of its wait loop, asked
+    /// `needs_selection`, was told no, and went back to sleep for ten minutes.
+    /// Reordering the priority list did nothing until the timer expired.
+    ///
+    /// Deriving one from the other here means an arm can only say it wants a
+    /// reselection by actually getting one.
     pub fn apply_command(&mut self, cmd: Command, now: DateTime<Utc>) -> CommandEffect {
         let effect = self.apply_command_inner(cmd, now);
+        if effect.reselect {
+            self.reselect_forced = true;
+        }
         if !effect.message.is_empty() {
             self.emit(
                 now,
@@ -660,6 +681,7 @@ impl<A: TwitchApi> Engine<A> {
                 required_minutes: active.map(|(_, p)| p.required_minutes),
                 seconds_since_confirmation: since.map(|d| d.num_seconds()),
                 stalled: since.is_some_and(|d| d >= self.config.watchdog.stalled_after),
+                confirmed_by_twitch: w.confidence == Confidence::Confirmed,
             }
         });
 
@@ -701,6 +723,7 @@ impl<A: TwitchApi> Engine<A> {
                 drops: c.drop_count(),
                 is_current: current_channel == Some(&c.channel.id),
                 is_favourite: self.favourites.contains(&c.channel.login.to_lowercase()),
+                confirmed_by_twitch: c.confidence == Confidence::Confirmed,
             })
             .collect();
 
@@ -709,7 +732,14 @@ impl<A: TwitchApi> Engine<A> {
             campaigns_eligible: self.campaigns.len(),
             campaigns_at_risk: eligible.iter().filter(|c| c.at_risk && !c.excluded).count(),
             drops_claimed: self.all_drops().filter(|d| d.is_claimed).count(),
-            drops_remaining: self.all_drops().filter(|d| !d.is_claimed).count(),
+            // Only what watching can actually finish. A subscription tier
+            // sitting in a mixed campaign is not remaining *work*; counting it
+            // inflates the very total the sub-reward handling exists to keep
+            // honest.
+            drops_remaining: self
+                .all_drops()
+                .filter(|d| !d.is_claimed && d.is_earnable_by_watching())
+                .count(),
             drops_claimable: self.all_drops().filter(|d| d.is_claimable()).count(),
             minutes_remaining: self
                 .campaigns
@@ -936,8 +966,18 @@ impl<A: TwitchApi> Engine<A> {
         }
 
         match self.api.available_drops(&watch.channel.id).await {
+            // Confirmation is still worth having: if Twitch names one of our
+            // drops, the channel is definitely fine and the stall is
+            // elsewhere. The absence of one proves nothing, though — this
+            // endpoint stopped listing game campaigns altogether, so an empty
+            // intersection is the *normal* answer for a channel that is
+            // earning perfectly well. See [`strategy::Confidence`].
+            //
+            // Treating it as proof made this rung quarantine whatever it was
+            // watching roughly eight minutes into any stall, move to the next
+            // channel, stall again, and work through the entire directory
+            // until every channel for the game was rested for two hours.
             Ok(available) => Ok(available.iter().any(|d| wanted.contains(d))),
-            // An inconclusive check is not proof of failure.
             Err(e) => {
                 tracing::warn!(error = %e, "re-verification inconclusive");
                 Ok(true)
@@ -984,13 +1024,18 @@ impl<A: TwitchApi> Engine<A> {
                     tracing::info!("Twitch still says this channel progresses our drops");
                     Ok(RecoveryOutcome::default())
                 }
+                // Not "Twitch says this channel earns nothing" — Twitch no
+                // longer says that about anything. This rung can confirm a
+                // channel and can no longer condemn one, so an unconfirmed
+                // answer moves to the next rung, which switches channel
+                // anyway. Quarantining here punished a channel for a stall it
+                // had not been shown to cause, and did it to every channel in
+                // turn.
                 Ok(false) => {
-                    tracing::warn!("Twitch says this channel progresses nothing; leaving");
-                    self.quarantine_current(now);
-                    Ok(RecoveryOutcome {
-                        resync: true,
-                        ..Default::default()
-                    })
+                    tracing::debug!(
+                        "Twitch did not confirm this channel; escalating rather than resting it"
+                    );
+                    Ok(RecoveryOutcome::default())
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "re-verification failed");
@@ -1326,7 +1371,12 @@ impl<A: TwitchApi> Engine<A> {
                     limit = self.config.max_detail_fetches,
                     "hit the campaign detail fetch cap; some campaigns were not expanded"
                 );
-                break;
+                // `continue`, not `break`: the loop still has to record every
+                // remaining campaign in `listed`, which is the only source of
+                // artwork for campaigns already in the inventory. Breaking
+                // here left everything after the cap with a blank tile,
+                // dependent on Twitch's arbitrary listing order.
+                continue;
             }
             fetched += 1;
             wanted_details.push(campaign.id.clone());
@@ -1379,19 +1429,28 @@ impl<A: TwitchApi> Engine<A> {
 
         let mut eligible = Vec::new();
         let mut rejected = Vec::new();
-        let mut recently_ended = Vec::new();
+        let mut claim_only = Vec::new();
         let mut upcoming = Vec::new();
         for campaign in merged.into_values() {
             match eligibility::assess(&campaign, now) {
                 Ok(()) => eligible.push(campaign),
                 Err(reason) => {
-                    // A campaign that ended in the last day may still hold
-                    // drops we earned and never claimed.
-                    if reason == RejectReason::Expired
-                        && now < campaign.ends_at + CLAIM_GRACE
-                        && campaign.drops.iter().any(|d| d.is_claimable())
-                    {
-                        recently_ended.push(campaign.clone());
+                    // Not mineable is not the same as not *claimable*. Two
+                    // rejection reasons leave drops that are already earned
+                    // and still ours to take:
+                    //
+                    // - a campaign that ended within the last day, inside
+                    //   Twitch's claim window;
+                    // - a subscription reward the user actually subscribed
+                    //   for. Watching can never earn it, which is why it is
+                    //   rejected, but if Twitch has granted it then refusing
+                    //   to claim it loses the user a badge they paid for.
+                    let claimable_now = campaign.drops.iter().any(|d| d.is_claimable());
+                    let inside_claim_window = reason == RejectReason::Expired
+                        && now < campaign.ends_at + CLAIM_GRACE;
+                    let earned_by_subscribing = reason == RejectReason::SubscriptionRequired;
+                    if claimable_now && (inside_claim_window || earned_by_subscribing) {
+                        claim_only.push(campaign.clone());
                     }
                     // Worth waking for, if it opens soon enough to matter.
                     if reason == RejectReason::NotStarted
@@ -1442,7 +1501,7 @@ impl<A: TwitchApi> Engine<A> {
         if dashboard_ok && !self.excluded_campaigns.is_empty() {
             let known: HashSet<&str> = eligible
                 .iter()
-                .chain(recently_ended.iter())
+                .chain(claim_only.iter())
                 .map(|c| c.id.0.as_str())
                 .chain(self.rejected.iter().map(|r| r.id.as_str()))
                 .collect();
@@ -1459,7 +1518,7 @@ impl<A: TwitchApi> Engine<A> {
             tracing::debug!(at = %next, "next campaign opens");
         }
         self.upcoming = upcoming;
-        self.recently_ended = recently_ended;
+        self.claim_only = claim_only;
         self.campaigns = eligible;
         self.last_sync = Some(now);
         self.sync_forced = false;
@@ -1484,17 +1543,17 @@ impl<A: TwitchApi> Engine<A> {
     // Selection
     // -----------------------------------------------------------------------
 
-    /// Picks a channel that Twitch confirms can progress one of our drops.
+    /// Picks the channel the strategy scores highest.
     ///
-    /// The `available_drops` check is the load-bearing part: without it we
-    /// would happily watch a channel that earns nothing, which is the failure
-    /// users experience as a progress bar that never moves.
+    /// Candidacy rests on the directory: a channel is offered for a campaign
+    /// when it is streaming that campaign's game, passes any allow-list, and
+    /// Twitch's drops-enabled filter returned it.
     ///
-    /// It is not an absolute veto, though. If *every* candidate is rejected by
-    /// it, we fall back to channels the directory tagged as drops-enabled and
-    /// say so loudly. Trusting the check absolutely would turn one bad Twitch
-    /// response into a miner that mines nothing at all — worse than the bug
-    /// it exists to prevent.
+    /// It is not a veto at all any more. Twitch stopped listing a channel's
+    /// game campaigns there, so an answer naming none of our drops is the
+    /// normal case for a channel that is earning perfectly well — see
+    /// [`Confidence`]. The check can raise confidence and can rescue a channel
+    /// carrying no drops-enabled tag; it can never remove one.
     pub async fn select_channel(
         &mut self,
         now: DateTime<Utc>,
@@ -1580,6 +1639,7 @@ impl<A: TwitchApi> Engine<A> {
                         w.drops = c.drops().cloned().collect();
                         w.stream = c.stream.clone();
                         w.reason = reason;
+                        w.confidence = c.confidence;
                     }
                     return Ok(self.current.clone());
                 }
@@ -1589,6 +1649,31 @@ impl<A: TwitchApi> Engine<A> {
             Decision::Idle(reason) => {
                 // Staying put is a decision, not a failure.
                 if self.current.is_some() {
+                    // Re-explain the incumbent under the strategy actually in
+                    // force. The stored reason is whatever was true when the
+                    // channel was picked, so after a strategy change the page
+                    // read "availability: advances Madden Live" while the
+                    // selector said "deadline" — the miner looking like it was
+                    // ignoring the setting it had just been given.
+                    let restated = current_id.as_ref().and_then(|id| {
+                        candidates.iter().find(|c| &c.channel.id == id).map(|c| {
+                            let world = WorldView {
+                                now,
+                                campaigns: &self.campaigns,
+                                candidates: &candidates,
+                                favourites: &self.favourites,
+                                priority_games: &self.priority_games,
+                                pinned: self.pinned.as_deref(),
+                                current: current_id.as_ref(),
+                            };
+                            strategy::explain(c, &world, self.strategy.as_ref())
+                        })
+                    });
+                    if let Some(restated) = restated
+                        && let Some(w) = &mut self.current
+                    {
+                        w.reason = restated;
+                    }
                     tracing::debug!(reason, "keeping the current channel");
                     return Ok(self.current.clone());
                 }
@@ -1660,9 +1745,11 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Builds the candidate set the strategy chooses from.
     ///
-    /// Returns `(verified, fallbacks)`: candidates Twitch confirmed can
-    /// progress our drops, and drops-enabled channels that failed or were
-    /// excluded by that check.
+    /// One list, ranked later by the strategy. Each candidate carries a
+    /// [`Confidence`] recording whether Twitch named its drops outright or the
+    /// miner inferred them from the directory. This used to return two lists
+    /// and prefer the first, which meant that once Twitch stopped confirming
+    /// anything the second was reached by a path that ignored the strategy.
     ///
     /// Requests are deduplicated twice over. The channel directory is queried
     /// once per *game* rather than once per campaign, and the availability
@@ -1775,15 +1862,41 @@ impl<A: TwitchApi> Engine<A> {
                     channel = %channel.login,
                     "allow-listed channel found live outside the directory page"
                 );
-                // Offered under whichever game it is actually streaming, if we
-                // are looking at that game; otherwise under every game whose
-                // allow-list names it. A channel resolved for one campaign
-                // must never be silently offered to an unrelated one.
+                // Only under the game it is actually streaming.
+                //
+                // This used to offer the channel under *every* game whose
+                // allow-list named it, regardless of what was on screen. A
+                // streamer allow-listed for a Rust campaign who is live
+                // playing Just Chatting was therefore offered as a candidate
+                // for the Rust campaign — and since these channels arrive from
+                // `stream_info`, which reports no tags and so is taken as
+                // drops-enabled, nothing downstream could catch it. Under
+                // `Deadline` an urgent campaign would send the miner to watch
+                // entirely the wrong stream for as long as the watchdog took
+                // to notice it was earning nothing.
+                //
+                // The exception is the sitewide "any channel" categories,
+                // which are earned regardless of what is on screen — the
+                // reference implementation carries the same exemption.
+                let streaming = stream.game.as_ref().map(|g| g.id.clone());
                 let games: Vec<GameId> = wants
                     .iter()
-                    .filter(|w| w.allowed.contains(&channel.id))
+                    .filter(|w| {
+                        if !w.allowed.contains(&channel.id) {
+                            return false;
+                        }
+                        ANY_CHANNEL_GAME_IDS.contains(&w.game.id.0.as_str())
+                            || streaming.as_ref() == Some(&w.game.id)
+                    })
                     .map(|w| w.game.id.clone())
                     .collect();
+                if games.is_empty() {
+                    tracing::debug!(
+                        channel = %channel.login,
+                        "allow-listed channel is live but streaming a different game"
+                    );
+                    continue;
+                }
 
                 for game in games {
                     let list = channels_by_game.entry(game).or_default();
@@ -1967,19 +2080,27 @@ impl<A: TwitchApi> Engine<A> {
                 }
             };
 
-            let (advances, confidence) = if !confirmed.is_empty() {
-                (confirmed, Confidence::Confirmed)
+            // The confirmation is a *subset* of what the directory implies —
+            // it can only name drops we already asked about. Taking it in
+            // place of `by_game` therefore deleted campaigns from the
+            // candidate: a channel Twitch confirmed for one of the four
+            // campaigns it serves was recorded as serving one, scored as
+            // serving one, and — worse — had the other three struck from
+            // `CurrentWatch::campaigns`, so their progress events were
+            // discarded as "not what we are mining" and the stall clock never
+            // reset. Confirmation must add confidence, never remove work.
+            let confidence = if !confirmed.is_empty() {
+                Confidence::Confirmed
             } else if item.stream.drops_enabled {
-                (by_game, Confidence::Tagged)
+                Confidence::Tagged
             } else {
                 // No tag and no confirmation is the one case with nothing to
-                // go on. Channels resolved by name for an allow-list arrive
-                // with no tag, so this is where the check earns its keep.
+                // go on at all.
                 unusable += 1;
                 continue;
             };
 
-            candidates.push(make_candidate(&item, advances, &wants, confidence));
+            candidates.push(make_candidate(&item, by_game, &wants, confidence));
         }
 
         if unusable > 0 {
@@ -2038,6 +2159,7 @@ impl<A: TwitchApi> Engine<A> {
             drops,
             since: now,
             reason: reason.clone(),
+            confidence: candidate.confidence,
         });
 
         self.emit(
@@ -2213,7 +2335,7 @@ impl<A: TwitchApi> Engine<A> {
         let ready: Vec<(CampaignId, DropId, Option<String>, String)> = self
             .campaigns
             .iter()
-            .chain(self.recently_ended.iter())
+            .chain(self.claim_only.iter())
             .flat_map(|c| c.drops.iter().map(move |d| (c, d)))
             .filter(|(_, d)| d.is_claimable())
             // A claim Twitch has already refused is rested rather than re-sent
@@ -2268,7 +2390,7 @@ impl<A: TwitchApi> Engine<A> {
             for campaign in self
                 .campaigns
                 .iter_mut()
-                .chain(self.recently_ended.iter_mut())
+                .chain(self.claim_only.iter_mut())
             {
                 if let Some(d) = campaign.drops.iter_mut().find(|d| d.id == drop_id) {
                     d.is_claimed = true;

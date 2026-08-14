@@ -237,18 +237,26 @@ pub async fn mine(
                         tokio::time::sleep(remaining).await;
                         break;
                     };
-                    let effect = engine.apply_command(command, Utc::now());
+                    let mut effect = engine.apply_command(command, Utc::now());
                     tracing::info!(message = %effect.message, "command applied");
-                    // Answer before doing the follow-up work below: the caller
-                    // is holding an HTTP request open, and persisting settings
-                    // or draining events can take a moment. A dropped receiver
-                    // just means the caller gave up, which is not our problem.
-                    let _ = reply.send(effect.clone());
 
+                    // Persist *before* answering. The reply is the user's
+                    // confirmation that a setting changed, and a setting that
+                    // failed to reach config.toml has not changed in any way
+                    // that survives a restart. `save_account` is a local
+                    // atomic write, so this costs the caller nothing worth
+                    // measuring — unlike `drain_events` below, which posts a
+                    // webhook per event and is left until after the reply.
                     if effect.persist && let Some(store) = &opts.config_store
                         && let Err(e) = store.save_account(account, &engine.settings()).await {
                         tracing::error!(error = %e, "could not save settings");
+                        effect.message = format!(
+                            "{} — but saving it failed ({e}), so it will not survive a restart",
+                            effect.message
+                        );
                     }
+                    // A dropped receiver just means the caller gave up.
+                    let _ = reply.send(effect.clone());
 
                     drain_events(
                         &mut engine, storage, account, hub.as_ref(), notifier.as_ref(),

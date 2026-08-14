@@ -99,6 +99,10 @@ pub struct WatchingView {
     pub seconds_since_confirmation: Option<i64>,
     /// True once the stall threshold has passed without a confirmation.
     pub stalled: bool,
+    /// Whether Twitch named these drops for this channel when it was chosen,
+    /// as opposed to the choice resting on the directory's drops-enabled tag.
+    #[serde(default)]
+    pub confirmed_by_twitch: bool,
 }
 
 /// A channel that could be watched right now, so the user can see the actual
@@ -115,6 +119,11 @@ pub struct LiveChannelView {
     pub drops: usize,
     pub is_current: bool,
     pub is_favourite: bool,
+    /// How we know this channel can earn what it is credited with: Twitch
+    /// named the drops outright, or the directory tagged it drops-enabled and
+    /// it is streaming the campaign's game.
+    #[serde(default)]
+    pub confirmed_by_twitch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +535,7 @@ mod tests {
                 required_minutes: Some(60),
                 seconds_since_confirmation: Some(41),
                 stalled: false,
+                confirmed_by_twitch: false,
             }),
             eligible: vec![view(&campaign(Duration::days(1), 60, 0))],
             rejected: vec![],

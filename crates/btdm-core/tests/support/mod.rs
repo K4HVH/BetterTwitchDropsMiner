@@ -38,6 +38,10 @@ pub struct FakeTwitch {
     pub fail_claims: Mutex<bool>,
     pub detail_fetches: Mutex<usize>,
     pub stream_info_calls: Mutex<usize>,
+    /// Logins that are live and playing the game, but do not appear on the
+    /// directory page — the small allow-listed streamers that direct lookup
+    /// by name exists to find.
+    pub below_the_fold: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeTwitch {
@@ -92,12 +96,14 @@ impl TwitchApi for FakeTwitch {
         _limit: u32,
     ) -> Result<Vec<(Channel, Stream)>, ApiError> {
         self.guard()?;
+        let hidden = self.below_the_fold.lock().unwrap().clone();
         Ok(self
             .channels
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, s)| s.game.as_ref().is_some_and(|g| g.id == game.id))
+            .filter(|(c, _)| !hidden.contains(&c.login))
             .cloned()
             .collect())
     }
@@ -165,6 +171,24 @@ pub fn game() -> Game {
     }
 }
 
+/// A second game, for scenarios that need two campaigns a single channel
+/// cannot both advance.
+///
+/// One channel advances every eligible campaign for the game it is streaming —
+/// that is the whole point of the channel-centric candidate model. So a test
+/// that wants two campaigns to be genuinely separate has to put them in
+/// different games. Several tests used to rely on the availability check to
+/// keep same-game campaigns apart, which meant they were testing that check
+/// rather than the thing they named.
+pub fn other_game() -> Game {
+    Game {
+        id: GameId::from("g2"),
+        name: "Rocket League".into(),
+        slug: "rocket-league".into(),
+        box_art_url: None,
+    }
+}
+
 pub fn channel(id: &str, login: &str) -> Channel {
     Channel {
         id: ChannelId::from(id),
@@ -174,9 +198,14 @@ pub fn channel(id: &str, login: &str) -> Channel {
 }
 
 pub fn stream(broadcast: &str, drops_enabled: bool) -> Stream {
+    stream_of(broadcast, drops_enabled, game())
+}
+
+/// A stream of a specific game.
+pub fn stream_of(broadcast: &str, drops_enabled: bool, game: Game) -> Stream {
     Stream {
         broadcast_id: broadcast.into(),
-        game: Some(game()),
+        game: Some(game),
         title: "t".into(),
         viewers: 100,
         drops_enabled,
@@ -184,10 +213,20 @@ pub fn stream(broadcast: &str, drops_enabled: bool) -> Stream {
 }
 
 pub fn campaign(id: &str, linked: bool, drops: Vec<TimedDrop>) -> DropCampaign {
+    campaign_of(id, linked, drops, game())
+}
+
+/// A campaign for a specific game.
+pub fn campaign_of(
+    id: &str,
+    linked: bool,
+    drops: Vec<TimedDrop>,
+    game: Game,
+) -> DropCampaign {
     DropCampaign {
         id: CampaignId::from(id),
         name: format!("Campaign {id}"),
-        game: game(),
+        game,
         starts_at: chrono::Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
         ends_at: chrono::Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
         drops,

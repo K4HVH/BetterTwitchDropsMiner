@@ -138,6 +138,11 @@ pub fn remaining_minutes(campaign: &DropCampaign) -> u32 {
         .drops
         .iter()
         .filter(|d| !d.is_claimed)
+        // Watching cannot finish a subscription tier however long it runs, so
+        // counting one as outstanding work would make a campaign look longer
+        // than it is — and, through `slack`, could declare an achievable
+        // campaign impossible and drop it.
+        .filter(|d| d.is_earnable_by_watching())
         .map(|d| total_remaining_minutes(campaign, d))
         .max()
         .unwrap_or(0)
@@ -151,6 +156,7 @@ pub fn remaining_minutes_at(campaign: &DropCampaign, now: DateTime<Utc>) -> u32 
         .drops
         .iter()
         .filter(|d| !d.is_claimed)
+        .filter(|d| d.is_earnable_by_watching())
         .filter(|d| !d.window_has_closed(now))
         .map(|d| total_remaining_minutes(campaign, d))
         .max()

@@ -431,24 +431,23 @@ async fn an_infeasible_campaign_is_skipped_with_a_reason() {
 #[tokio::test]
 async fn the_deadline_strategy_prefers_the_campaign_closest_to_expiry() {
     let fake = FakeTwitch::default();
+    // Different games, and a channel streaming each. Two campaigns for one
+    // game would both be advanced by either channel, which is correct and
+    // makes the deadline moot — the choice only exists when the campaigns are
+    // genuinely on different channels.
     let mut late = campaign("c-late", true, vec![drop("d-late", 60, 0)]);
     late.ends_at = now() + chrono::Duration::days(20);
-    let mut soon = campaign("c-soon", true, vec![drop("d-soon", 60, 0)]);
+    let mut soon = campaign_of("c-soon", true, vec![drop("d-soon", 60, 0)], other_game());
     soon.ends_at = now() + chrono::Duration::hours(4);
     *fake.inventory.lock().unwrap() = vec![late, soon];
 
     *fake.channels.lock().unwrap() = vec![
         (channel("ch-late", "latestreamer"), stream("bc-1", true)),
-        (channel("ch-soon", "soonstreamer"), stream("bc-2", true)),
+        (
+            channel("ch-soon", "soonstreamer"),
+            stream_of("bc-2", true, other_game()),
+        ),
     ];
-    fake.available
-        .lock()
-        .unwrap()
-        .insert("ch-late".into(), vec![DropId::from("d-late")]);
-    fake.available
-        .lock()
-        .unwrap()
-        .insert("ch-soon".into(), vec![DropId::from("d-soon")]);
 
     let mut e = engine(fake);
     e.sync(now()).await.unwrap();
@@ -593,9 +592,13 @@ async fn the_availability_check_budget_bounds_requests_per_pass() {
 #[tokio::test]
 async fn progress_for_a_drop_we_are_not_mining_is_ignored() {
     let fake = happy_path();
+    // A different *game*, so the watched channel genuinely cannot be advancing
+    // it. Two campaigns for the same game are both advanced by one channel,
+    // which is the point of the candidate model — so a same-game campaign
+    // would not be "elsewhere" at all.
     *fake.inventory.lock().unwrap() = vec![
         campaign("c1", true, vec![drop("d1", 60, 0)]),
-        campaign("c-elsewhere", true, vec![drop("d-elsewhere", 60, 0)]),
+        campaign_of("c-elsewhere", true, vec![drop("d-elsewhere", 60, 0)], other_game()),
     ];
 
     let mut e = engine(fake);
@@ -647,9 +650,10 @@ async fn progress_arriving_while_idle_is_ignored() {
 #[tokio::test]
 async fn an_unrelated_drop_cannot_clear_a_stall() {
     let fake = happy_path();
+    // Another *game*, so the watched channel cannot be advancing it.
     *fake.inventory.lock().unwrap() = vec![
         campaign("c1", true, vec![drop("d1", 60, 0)]),
-        campaign("c-other", true, vec![drop("d-other", 60, 0)]),
+        campaign_of("c-other", true, vec![drop("d-other", 60, 0)], other_game()),
     ];
 
     let mut e = engine(fake);
@@ -785,22 +789,59 @@ async fn refreshing_stream_info_leaves_an_offline_channel() {
     assert!(e.current_channel().is_none());
 }
 
+/// Re-verification can confirm a channel and can no longer condemn one.
+///
+/// This rung used to read an empty `viewerDropCampaigns` intersection as proof
+/// that the channel earned nothing, and quarantine it. That response is now
+/// the *normal* answer for a perfectly healthy channel — Twitch stopped
+/// listing game campaigns there — so the rung quarantined whatever it was
+/// watching about eight minutes into any stall, moved on, stalled again, and
+/// worked through the whole directory until every channel for the game was
+/// rested for two hours. Losing the channel is the next rung's job.
 #[tokio::test]
-async fn reverifying_leaves_a_channel_twitch_says_earns_nothing() {
+async fn reverifying_does_not_condemn_a_channel_twitch_declines_to_confirm() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    let watching = e.current_channel().cloned().expect("something is being watched");
+
+    // What Twitch returns for every channel today.
+    e.api().available.lock().unwrap().clear();
+
+    e.apply_recovery(RecoveryStep::ReverifyEligibility, now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        e.current_channel().map(|c| c.login.clone()),
+        Some(watching.login.clone()),
+        "an unconfirmed channel must not be abandoned on this rung"
+    );
+    assert!(
+        !e.snapshot("default", Some("me"), now())
+            .health
+            .quarantined_channels
+            .iter()
+            .any(|q| q.name == watching.login || q.name == watching.id.0),
+        "and must not be rested for a stall it was never shown to cause"
+    );
+}
+
+/// The next rung is what actually leaves, so a genuine stall still escapes.
+#[tokio::test]
+async fn the_rung_after_reverification_still_leaves_the_channel() {
     let mut e = engine(happy_path());
     e.sync(now()).await.unwrap();
     e.select_channel(now()).await.unwrap();
     assert!(e.current_channel().is_some());
 
-    // Twitch changes its mind about this channel.
-    e.api().available.lock().unwrap().clear();
-
-    let outcome = e
-        .apply_recovery(RecoveryStep::ReverifyEligibility, now())
+    e.apply_recovery(RecoveryStep::SwitchChannel, now())
         .await
         .unwrap();
-    assert!(e.current_channel().is_none());
-    assert!(outcome.resync, "a fresh look at the world is needed");
+    assert!(
+        e.current_channel().is_none(),
+        "a stall that survives re-verification must still cost the channel"
+    );
 }
 
 #[tokio::test]
@@ -977,11 +1018,13 @@ async fn progress_for_any_advanced_campaign_counts() {
 #[tokio::test]
 async fn progress_for_an_unrelated_campaign_is_still_ignored() {
     let fake = two_campaigns_one_channel();
-    // A third campaign, live but not served by our channel.
+    // A third campaign for a different game, so our channel genuinely does
+    // not serve it. A same-game campaign would be advanced by the very
+    // channel we are watching.
     fake.inventory
         .lock()
         .unwrap()
-        .push(campaign("c3", true, vec![drop("d3", 60, 0)]));
+        .push(campaign_of("c3", true, vec![drop("d3", 60, 0)], other_game()));
 
     let mut e = engine(fake);
     e.sync(now()).await.unwrap();
@@ -1493,25 +1536,22 @@ async fn reselecting_the_same_channel_keeps_the_session_and_its_progress() {
 #[tokio::test]
 async fn an_urgent_campaign_displaces_a_comfortable_one() {
     let fake = FakeTwitch::default();
+    // Separate games, so each campaign has its own channel and displacing one
+    // for the other is a real choice rather than a no-op.
     let mut relaxed = campaign("c-relaxed", true, vec![drop("d1", 60, 0)]);
     relaxed.ends_at = now() + chrono::Duration::days(20);
-    let mut urgent = campaign("c-urgent", true, vec![drop("d2", 60, 0)]);
+    let mut urgent = campaign_of("c-urgent", true, vec![drop("d2", 60, 0)], other_game());
     urgent.ends_at = now() + chrono::Duration::hours(3);
     urgent.starts_at = now() - chrono::Duration::hours(1);
 
     *fake.inventory.lock().unwrap() = vec![relaxed];
     *fake.channels.lock().unwrap() = vec![
         (channel("ch1", "relaxed-streamer"), stream("bc-1", true)),
-        (channel("ch2", "urgent-streamer"), stream("bc-2", true)),
+        (
+            channel("ch2", "urgent-streamer"),
+            stream_of("bc-2", true, other_game()),
+        ),
     ];
-    fake.available
-        .lock()
-        .unwrap()
-        .insert("ch1".into(), vec![DropId::from("d1")]);
-    fake.available
-        .lock()
-        .unwrap()
-        .insert("ch2".into(), vec![DropId::from("d2")]);
 
     let mut e = engine(fake);
     e.sync(now()).await.unwrap();
@@ -2101,17 +2141,14 @@ async fn a_shared_allow_listed_channel_is_resolved_once_and_counted_once() {
     b.allowed_channels = vec![shared.clone()];
     *fake.inventory.lock().unwrap() = vec![a, b];
 
-    // Live, but categorised under a different game, so the directory page for
-    // this campaign's game does not contain them — which is the whole reason
-    // direct lookup exists.
-    let mut elsewhere = stream("bc-1", true);
-    elsewhere.game = Some(Game {
-        id: GameId::from("g-other"),
-        name: "Something Else".into(),
-        slug: "something-else".into(),
-        box_art_url: None,
-    });
-    *fake.channels.lock().unwrap() = vec![(shared, elsewhere)];
+    // Live and playing the campaign's game, but too small to appear on the
+    // directory page for it — which is the reason direct lookup exists. Being
+    // allow-listed does not excuse a channel from the category requirement:
+    // Twitch grants drops for watching the *game*, and the reference
+    // implementation checks `channel.game == campaign.game` for allow-listed
+    // channels exactly as it does for any other.
+    *fake.channels.lock().unwrap() = vec![(shared, stream("bc-1", true))];
+    fake.below_the_fold.lock().unwrap().insert("tinystreamer".into());
     fake.available
         .lock()
         .unwrap()
@@ -2956,4 +2993,225 @@ async fn removing_something_that_is_not_listed_says_so() {
     let effect = e.apply_command(C::RemovePriorityEntry { entry: "nope".into() }, now());
     assert!(effect.message.contains("was not prioritised"), "{}", effect.message);
     assert!(!effect.persist, "nothing changed, so nothing to write back");
+}
+
+/// A command that reports `reselect` must actually cause one.
+///
+/// `CommandEffect::reselect` tells the caller to re-run the loop;
+/// `reselect_forced` tells `needs_selection` to say yes. The three priority
+/// commands set only the first, so `run.rs` woke up, asked whether a selection
+/// was due, was told no, and slept for the rest of the ten-minute interval.
+/// Reordering the priority list appeared to do nothing.
+#[tokio::test]
+async fn every_command_that_claims_a_reselect_gets_one() {
+    use btdm_core::control::Command as C;
+
+    let commands = [
+        C::AddPriorityEntry { entry: "a".into() },
+        C::RemovePriorityEntry { entry: "a".into() },
+        C::MovePriorityEntry { entry: "b".into(), up: true },
+        C::SetPriorityGames { games: vec!["c".into()] },
+        C::SetStrategy { name: "coverage".into() },
+        C::SetGameExcluded { game: "g".into(), excluded: true },
+        C::SetFavourite { login: "f".into(), on: true },
+        C::Pin { channel: Some("p".into()) },
+    ];
+
+    for cmd in commands {
+        let mut e = engine(happy_path());
+        e.sync(now()).await.unwrap();
+        // Give it something to be watching, so `needs_selection` is not
+        // trivially true via `current.is_none()`.
+        e.select_channel(now()).await.unwrap();
+        assert!(!e.needs_selection(now()), "precondition: nothing is due yet");
+
+        let label = format!("{cmd:?}");
+        let effect = e.apply_command(cmd, now());
+        if effect.reselect {
+            assert!(
+                e.needs_selection(now()),
+                "{label} reported a reselect that never happens"
+            );
+        }
+    }
+}
+
+/// Refusing to *mine* a subscription reward must not mean refusing to *claim*
+/// one the user has already earned.
+///
+/// Filtering sub drops out of `mineable_drops` moved these campaigns from the
+/// eligible set to the rejected set — and the claim pass only ever walked the
+/// eligible set. A user who subscribes, and whom Twitch then grants the badge,
+/// would never have it claimed: the miner had decided the campaign was not its
+/// business. "A drop that has already been earned is ours" is the rule.
+#[tokio::test]
+async fn a_subscription_reward_the_user_earned_is_still_claimed() {
+    let fake = FakeTwitch::default();
+    let mut earned = sub_reward_drop("d-sub");
+    // Twitch has granted it: there is a claim id waiting.
+    earned.claim_id = Some("instance-1".into());
+    *fake.inventory.lock().unwrap() = vec![campaign("c-sub", true, vec![earned])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(e.campaigns().is_empty(), "still not something to mine");
+
+    e.claim_ready(now()).await.unwrap();
+    assert_eq!(
+        e.api().claims.lock().unwrap().as_slice(),
+        ["instance-1"],
+        "an earned badge must be claimed even though watching could never earn it"
+    );
+}
+
+/// The same for a campaign that has expired within Twitch's claim window,
+/// which is the case this list originally existed for.
+#[tokio::test]
+async fn an_expired_campaigns_earned_drop_is_still_claimed() {
+    let fake = FakeTwitch::default();
+    let mut d = drop("d1", 60, 60);
+    d.claim_id = Some("instance-2".into());
+    let mut c = campaign("c-old", true, vec![d]);
+    c.ends_at = now() - chrono::Duration::hours(2);
+    *fake.inventory.lock().unwrap() = vec![c];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.claim_ready(now()).await.unwrap();
+    assert_eq!(e.api().claims.lock().unwrap().as_slice(), ["instance-2"]);
+}
+
+/// Being on a campaign's allow-list does not excuse a channel from playing the
+/// campaign's game.
+///
+/// Allow-listed channels are resolved by name, and `stream_info` reports no
+/// tags — so they arrive taken as drops-enabled and nothing downstream can
+/// catch a mismatch. Offering one under every campaign that names it,
+/// whatever is on screen, meant an urgent campaign could send the miner to
+/// watch a streamer playing something else entirely, earning nothing until the
+/// watchdog noticed. Twitch grants drops for watching the game; the reference
+/// implementation checks the category for allow-listed channels exactly as it
+/// does for any other.
+#[tokio::test]
+async fn an_allow_listed_channel_playing_something_else_is_not_offered() {
+    let fake = FakeTwitch::default();
+    let listed = channel("ch-small", "tinystreamer");
+    let mut c = campaign("c-acl", true, vec![drop("d1", 60, 0)]);
+    c.allowed_channels = vec![listed.clone()];
+    *fake.inventory.lock().unwrap() = vec![c];
+
+    // Live, allow-listed — and playing a different game.
+    *fake.channels.lock().unwrap() =
+        vec![(listed, stream_of("bc-1", true, other_game()))];
+    fake.below_the_fold.lock().unwrap().insert("tinystreamer".into());
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "watching them would earn nothing"
+    );
+}
+
+/// The sitewide categories are the documented exception: those campaigns are
+/// earned on any channel, whatever it is playing.
+#[tokio::test]
+async fn a_sitewide_campaign_is_earned_whatever_the_channel_is_playing() {
+    let fake = FakeTwitch::default();
+    let special = Game {
+        id: GameId::from("509663"),
+        name: "Special Events".into(),
+        slug: "special-events".into(),
+        box_art_url: None,
+    };
+    let listed = channel("ch-any", "anystreamer");
+    let mut c = campaign_of("c-sitewide", true, vec![drop("d1", 60, 0)], special);
+    c.allowed_channels = vec![listed.clone()];
+    *fake.inventory.lock().unwrap() = vec![c];
+
+    *fake.channels.lock().unwrap() =
+        vec![(listed, stream_of("bc-1", true, other_game()))];
+    fake.below_the_fold.lock().unwrap().insert("anystreamer".into());
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    assert_eq!(
+        e.select_channel(now()).await.unwrap().map(|w| w.channel.login),
+        Some("anystreamer".to_string()),
+        "a sitewide campaign is earned anywhere"
+    );
+}
+
+/// Artwork must reach campaigns that sit past the detail-fetch cap.
+///
+/// The listing loop `break`s once the cap is hit, and it was also the loop
+/// that recorded each campaign's artwork. So on an account with more linked
+/// campaigns than the cap, everything after it rendered a blank tile —
+/// dependent on nothing but Twitch's listing order.
+#[tokio::test]
+async fn art_reaches_campaigns_past_the_detail_fetch_cap() {
+    let fake = FakeTwitch::default();
+    // One campaign already known, so it needs no detail fetch.
+    *fake.inventory.lock().unwrap() = vec![campaign("c-known", true, vec![drop("d1", 60, 0)])];
+
+    // Ahead of it in Twitch's order: enough new campaigns to exhaust the cap.
+    let mut offered = Vec::new();
+    for i in 0..80 {
+        let mut c = campaign(&format!("c-new-{i}"), true, vec![]);
+        c.game.box_art_url = Some("https://cdn.example/other.jpg".into());
+        offered.push(c);
+    }
+    let mut known = campaign("c-known", true, vec![]);
+    known.game.box_art_url = Some("https://cdn.example/known.jpg".into());
+    offered.push(known);
+    *fake.offered.lock().unwrap() = offered;
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let art = e
+        .campaigns()
+        .iter()
+        .find(|c| c.id == CampaignId::from("c-known"))
+        .and_then(|c| c.game.box_art_url.clone());
+    assert_eq!(
+        art.as_deref(),
+        Some("https://cdn.example/known.jpg"),
+        "a campaign listed after the fetch cap still needs its artwork"
+    );
+}
+
+/// The displayed reason must describe the strategy in force, not the one that
+/// happened to be selected when the channel was chosen.
+///
+/// Hysteresis keeps the incumbent when nothing beats it by enough, and the
+/// stored reason was left untouched — so after changing strategy the page read
+/// "availability: advances Madden Live" while the selector said "deadline",
+/// which looks exactly like a miner ignoring the setting it was just given.
+#[tokio::test]
+async fn the_reason_is_restated_under_the_strategy_now_in_force() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+    e.apply_command(C::SetStrategy { name: "availability".into() }, now());
+    e.sync(now()).await.unwrap();
+    let first = e.select_channel(now()).await.unwrap().unwrap();
+    assert!(
+        first.reason.starts_with("availability"),
+        "precondition: {}",
+        first.reason
+    );
+
+    e.apply_command(C::SetStrategy { name: "coverage".into() }, now());
+    let after = e
+        .select_channel(now())
+        .await
+        .unwrap()
+        .expect("still watching the same channel");
+
+    assert_eq!(after.channel.login, first.channel.login, "it stayed put");
+    assert!(
+        after.reason.starts_with("coverage"),
+        "the reason must name the strategy in force, got: {}",
+        after.reason
+    );
 }

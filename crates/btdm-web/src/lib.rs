@@ -8,7 +8,7 @@ mod hub;
 mod server;
 
 pub use hub::{
-    AccountEvent, CommandError, Enrolment, Envelope, History, HistoryRow, Hub, LoginState,
-    RewardRow, Update,
+    AccountEvent, COMMAND_TIMEOUT, CommandError, Enrolment, Envelope, History, HistoryRow,
+    Hub, LoginState, RewardRow, Update,
 };
 pub use server::{ServeError, serve, serve_announcing};

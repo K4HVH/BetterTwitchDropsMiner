@@ -80,6 +80,18 @@ pub async fn send(config: &Config, account: &str, command: Command) -> anyhow::R
     let status = res.status();
     let body: serde_json::Value = res.json().await.unwrap_or_default();
 
+    // 202 means the miner took the command and had not acted on it before we
+    // stopped waiting. That is not a confirmation, and printing it like one
+    // would tell a script the setting had been applied when it may never be:
+    // a miner that exits before draining its queue drops the command.
+    if status == reqwest::StatusCode::ACCEPTED {
+        anyhow::bail!(
+            "the miner accepted the command but had not applied it after {}s, so \
+             the outcome is unknown. Check `btdm status`; if the miner is wedged \
+             the command may never run.",
+            btdm_web::COMMAND_TIMEOUT.as_secs()
+        );
+    }
     if status.is_success() {
         // The miner's own words. "Sent." was all this could say before the
         // reply carried anything, which meant the CLI could not tell a command
@@ -116,6 +128,8 @@ pub enum PriorityChange {
     Set(Vec<String>),
     Add(String),
     Remove(String),
+    /// Reorder by one place. Relative, so it must never be retried blindly.
+    Move { entry: String, up: bool },
     Clear,
 }
 
@@ -136,6 +150,7 @@ pub async fn set_priority(
         PriorityChange::Clear => Command::SetPriorityGames { games: Vec::new() },
         PriorityChange::Add(entry) => Command::AddPriorityEntry { entry },
         PriorityChange::Remove(entry) => Command::RemovePriorityEntry { entry },
+        PriorityChange::Move { entry, up } => Command::MovePriorityEntry { entry, up },
     };
     // Prints the miner's confirmation, which is synchronous with the change.
     // Reading the list back from `/api/snapshots` instead would race the

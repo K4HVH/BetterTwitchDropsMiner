@@ -115,14 +115,23 @@ enum ControlCommand {
     /// first entry wins.
     Priority {
         /// The full list, best first. Replaces whatever is there.
-        #[arg(required_unless_present_any = ["add", "remove", "clear"])]
+        #[arg(
+            required_unless_present_any = ["add", "remove", "clear", "up", "down"],
+            conflicts_with_all = ["add", "remove", "clear", "up", "down"],
+        )]
         games: Vec<String>,
         /// Append one entry instead of replacing the list.
-        #[arg(long, conflicts_with_all = ["remove", "clear"])]
+        #[arg(long, conflicts_with_all = ["remove", "clear", "up", "down"])]
         add: Option<String>,
         /// Drop one entry, leaving the rest in order.
-        #[arg(long, conflicts_with = "clear")]
+        #[arg(long, conflicts_with_all = ["clear", "up", "down"])]
         remove: Option<String>,
+        /// Move one entry one place towards the front.
+        #[arg(long, conflicts_with_all = ["clear", "down"])]
+        up: Option<String>,
+        /// Move one entry one place towards the back.
+        #[arg(long, conflicts_with = "clear")]
+        down: Option<String>,
         /// Empty the list.
         #[arg(long)]
         clear: bool,
@@ -235,14 +244,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Update { apply } => update::run(apply).await,
         Command::Control(sub) => match sub {
             ControlCommand::Status { json } => control_cli::show(&cfg, json).await,
-            ControlCommand::Priority { games, add, remove, clear } => {
+            ControlCommand::Priority { games, add, remove, up, down, clear } => {
                 use control_cli::PriorityChange as P;
+                // clap enforces that at most one of these is present.
                 let change = if clear {
                     P::Clear
                 } else if let Some(g) = add {
                     P::Add(g)
                 } else if let Some(g) = remove {
                     P::Remove(g)
+                } else if let Some(g) = up {
+                    P::Move { entry: g, up: true }
+                } else if let Some(g) = down {
+                    P::Move { entry: g, up: false }
                 } else {
                     P::Set(games)
                 };

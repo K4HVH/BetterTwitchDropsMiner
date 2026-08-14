@@ -191,18 +191,7 @@ pub fn parse_campaign(v: &Value) -> Result<DropCampaign, TwitchError> {
         .map(|a| a.iter().map(parse_drop).collect::<Result<Vec<_>, _>>())
         .transpose()?
         .unwrap_or_default();
-    // Twitch returns tiers in no particular order — a real campaign came back
-    // as 240, 15, 30, 60, 120, 180 minutes. Since every tier of that campaign
-    // was also named "Madden Twitch Pack", the list read as six identical
-    // rewards at random thresholds. Tier order is the only thing that makes a
-    // tiered campaign legible, so establish it once, here, rather than leaving
-    // every reader to sort it.
-    drops.sort_by(|a, b| {
-        a.required_minutes
-            .cmp(&b.required_minutes)
-            .then_with(|| a.name.cmp(&b.name))
-            .then_with(|| a.id.0.cmp(&b.id.0))
-    });
+    order_tiers(&mut drops);
     let allowed_channels = v
         .get("allow")
         .filter(|a| !a.is_null())
@@ -333,6 +322,72 @@ fn claimed_benefits(data: &Value) -> std::collections::HashMap<String, DateTime<
 
 pub fn parse_campaigns(data: &Value) -> Result<Vec<DropCampaign>, TwitchError> {
     campaign_list(data, &["currentUser", "dropCampaigns"])
+}
+
+/// Puts a campaign's tiers into the order a reader expects.
+///
+/// Twitch returns them in no particular order — a real campaign came back as
+/// 240, 15, 30, 60, 120, 180 minutes, and since every tier of it was also
+/// named "Madden Twitch Pack" the list read as six identical rewards at
+/// random thresholds.
+///
+/// Sorting on required minutes alone is not enough, because Twitch expresses
+/// tiers two different ways. Most campaigns give each tier a *cumulative*
+/// requirement, where minutes ascending is exactly the tier order. Others gate
+/// a tier behind earlier ones and give it its own smaller requirement — a
+/// 5-minute finale behind a 10-minute and a 100-minute tier — and there,
+/// sorting by minutes puts the finale first, above the two tiers it depends
+/// on. So preconditions come first: a tier never appears before something it
+/// is gated behind.
+///
+/// Subscription rewards need zero minutes and would otherwise head every
+/// mixed campaign, putting the one reward the account can never earn by
+/// watching at the top of the card.
+/// Where one tier sorts relative to the others.
+///
+/// Depth first, so nothing appears before something it is gated behind. Then
+/// watch-time tiers ahead of subscription rewards, which need zero minutes and
+/// would otherwise head every mixed campaign. Then minutes, which is the tier
+/// order for the ordinary cumulative shape.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct TierOrder {
+    depth: usize,
+    needs_subscription: bool,
+    required_minutes: u32,
+    name: String,
+    id: String,
+}
+
+fn order_tiers(drops: &mut Vec<TimedDrop>) {
+    // How many tiers deep in a precondition chain this one sits. Bounded by
+    // the number of drops, so a cycle in Twitch's data cannot spin here.
+    fn depth(drops: &[TimedDrop], drop: &TimedDrop, budget: usize) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        drop.precondition_ids
+            .iter()
+            .filter_map(|id| drops.iter().find(|d| &d.id == id))
+            .map(|parent| 1 + depth(drops, parent, budget - 1))
+            .max()
+            .unwrap_or(0)
+    }
+
+    let keys: Vec<TierOrder> = drops
+        .iter()
+        .map(|d| TierOrder {
+            depth: depth(drops, d, drops.len()),
+            needs_subscription: d.required_subs > 0,
+            required_minutes: d.required_minutes,
+            name: d.name.clone(),
+            id: d.id.0.clone(),
+        })
+        .collect();
+
+    let mut paired: Vec<(TierOrder, TimedDrop)> =
+        keys.into_iter().zip(drops.drain(..)).collect();
+    paired.sort_by(|a, b| a.0.cmp(&b.0));
+    drops.extend(paired.into_iter().map(|(_, d)| d));
 }
 
 pub fn parse_campaign_details(data: &Value) -> Result<Option<DropCampaign>, TwitchError> {

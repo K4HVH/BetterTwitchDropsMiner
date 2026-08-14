@@ -209,3 +209,34 @@ async fn requests_are_rate_limited() {
         "twelve requests went out in {elapsed:?}, which is faster than the cap"
     );
 }
+
+/// A server that accepts the connection and then never answers must not park
+/// the caller forever.
+///
+/// The miner polls its command channel only while waiting between heartbeats,
+/// never during a sync or a selection pass. So a request that never returns
+/// stopped everything: no mining, no commands, no Ctrl-C. reqwest has no
+/// default timeout, so this had to be asked for.
+#[tokio::test]
+async fn a_request_that_never_answers_eventually_gives_up() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Accept, then hold the socket open saying nothing at all.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+
+    let client = btdm_twitch::client::build_http_client().unwrap();
+    let started = std::time::Instant::now();
+    let result = client.get(format!("http://{addr}/")).send().await;
+
+    assert!(result.is_err(), "a silent server must not be waited on forever");
+    assert!(
+        started.elapsed() < btdm_twitch::client::REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
+        "it waited {:?}, past its own timeout",
+        started.elapsed()
+    );
+}

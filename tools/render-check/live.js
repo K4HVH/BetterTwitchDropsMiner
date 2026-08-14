@@ -178,8 +178,25 @@ function makeEventSource(window) {
         throw new Error("the watched channel is not on screen");
       }
       if (before.watching.current_minutes != null) {
-        const expected = `${before.watching.current_minutes}/${before.watching.required_minutes}`;
-        if (!t.includes(expected)) throw new Error(`"${expected}" is not on screen`);
+        // The miner is live: Twitch confirms another minute roughly every
+        // minute, and a pushed snapshot can land between fetching the
+        // reference and reading the page. So the requirement is not the exact
+        // number we happened to fetch — it is that the page shows a real
+        // confirmed figure for the same drop, and never one *below* it, since
+        // confirmed minutes within a session only climb.
+        const shown = t.match(/(\d+)\/(\d+) min confirmed/);
+        if (!shown) throw new Error("no confirmed-minutes figure is on screen");
+        const [, current, required] = shown.map(Number);
+        if (required !== before.watching.required_minutes) {
+          throw new Error(
+            `requirement on screen is ${required}, miner says ${before.watching.required_minutes}`,
+          );
+        }
+        if (current < before.watching.current_minutes) {
+          throw new Error(
+            `screen shows ${current} confirmed, behind the miner's ${before.watching.current_minutes}`,
+          );
+        }
       }
     }
     if (!t.includes(String(before.totals.campaigns_eligible))) {

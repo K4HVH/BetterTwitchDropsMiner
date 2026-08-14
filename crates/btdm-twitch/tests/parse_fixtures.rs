@@ -357,3 +357,74 @@ fn an_ordinary_drop_needs_no_subscription() {
     assert_eq!(c.drops[0].required_subs, 0);
     assert!(c.drops[0].is_earnable_by_watching());
 }
+
+/// Sorting by minutes alone is wrong for the tier shape Twitch also uses: a
+/// short finale gated behind two longer tiers. Minutes-ascending puts the
+/// finale first, above the very tiers it depends on, labelled with a
+/// requirement that ignores them.
+#[test]
+fn a_gated_tier_never_appears_before_what_gates_it() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Gated", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "G", "slug": "g", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "final", "name": "Finale", "requiredMinutesWatched": 5,
+                  "preconditionDrops": [{"id": "short"}, {"id": "long"}] },
+                { "id": "long",  "name": "Long",  "requiredMinutesWatched": 100 },
+                { "id": "short", "name": "Short", "requiredMinutesWatched": 10 },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    let order: Vec<&str> = c.drops.iter().map(|d| d.id.0.as_str()).collect();
+    assert_eq!(order, vec!["short", "long", "final"]);
+}
+
+/// A subscription reward needs zero minutes, so it would otherwise head every
+/// mixed campaign — putting the one reward watching can never earn at the top
+/// of the card.
+#[test]
+fn a_subscription_reward_does_not_head_the_list() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Mixed", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "G", "slug": "g", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "sub", "name": "Sub badge",
+                  "requiredMinutesWatched": 0, "requiredSubs": 1 },
+                { "id": "t1", "name": "Tier 1", "requiredMinutesWatched": 60 },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    assert_eq!(
+        c.drops.iter().map(|d| d.id.0.as_str()).collect::<Vec<_>>(),
+        vec!["t1", "sub"]
+    );
+}
+
+/// Twitch data with a precondition cycle must not spin the ordering forever.
+#[test]
+fn a_precondition_cycle_terminates() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Cycle", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "G", "slug": "g", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "a", "name": "A", "requiredMinutesWatched": 10,
+                  "preconditionDrops": [{"id": "b"}] },
+                { "id": "b", "name": "B", "requiredMinutesWatched": 20,
+                  "preconditionDrops": [{"id": "a"}] },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    assert_eq!(c.drops.len(), 2, "both tiers survive a cycle");
+}

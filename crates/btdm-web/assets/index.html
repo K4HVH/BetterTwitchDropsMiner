@@ -331,10 +331,17 @@
         toast(body.error || `Failed (HTTP ${res.status})`, true);
         return false;
       }
-      // The miner answers with what it actually did. Showing that beats an
-      // optimistic message written here, which could not tell "strategy
-      // changed" from "that strategy was already selected" — and said the
-      // former either way.
+      // 202: queued, but the miner had not acted on it before the server gave
+      // up waiting. Reporting that in the success style would say the setting
+      // had been applied when it may never be — and would clear the box the
+      // user typed into, losing what they wrote.
+      if (res.status === 202) {
+        toast(body.message || "The miner is busy; this may not have applied", true);
+        return false;
+      }
+      // Otherwise the miner's own words. Showing those beats an optimistic
+      // message written here, which could not tell "strategy changed" from
+      // "that strategy was already selected" — and said the former either way.
       if (body.message) toast(body.message);
       return true;
     } catch (e) {
@@ -594,6 +601,16 @@
     link.rel = "noreferrer noopener";
     head.append(link);
     head.append(el("span", "pill " + (w.stalled ? "bad" : "ok"), w.stalled ? "STALLED" : "mining"));
+    // Whether Twitch named these drops for this channel, or the miner inferred
+    // them from the directory's drops-enabled tag. Since Twitch stopped
+    // listing game campaigns per channel the answer is nearly always the
+    // latter, and saying so is better than implying a confirmation there is
+    // no evidence for.
+    if (w.confirmed_by_twitch) {
+      const p = el("span", "pill ok", "confirmed by Twitch");
+      p.title = "Twitch named these drops as progressable on this channel.";
+      head.append(p);
+    }
     const watchedCampaigns = Array.isArray(w.campaigns) ? w.campaigns : [];
     if (watchedCampaigns.length > 1) {
       head.append(el("span", "pill accent", `${watchedCampaigns.length} campaigns at once`));

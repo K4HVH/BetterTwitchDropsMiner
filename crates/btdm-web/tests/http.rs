@@ -142,6 +142,7 @@ async fn health_fails_when_a_miner_is_stalled() {
         required_minutes: None,
         seconds_since_confirmation: Some(900),
         stalled: true,
+        confirmed_by_twitch: false,
     });
     hub.publish(s);
     let base = start(hub, None).await;

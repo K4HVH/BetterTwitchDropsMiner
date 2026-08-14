@@ -177,9 +177,11 @@ impl DropCampaign {
     /// just differently complete, so the fuller answer wins field by field
     /// rather than whole-record.
     ///
-    /// Only cosmetic fields are taken. Anything the miner reasons about —
-    /// drops, deadlines, allow-lists, link state — must come from one
-    /// coherent response, never be assembled from two.
+    /// Only presentation fields are taken, plus the game slug — which is a
+    /// stable property of the game rather than of this view of the campaign,
+    /// and is the directory query's key. Anything the miner *reasons* about —
+    /// drops, deadlines, allow-lists, link state — must come from one coherent
+    /// response, never be assembled from two.
     pub fn fill_presentation_from(&mut self, other: &DropCampaign) {
         if self.game.box_art_url.is_none() {
             self.game.box_art_url = other.game.box_art_url.clone();
