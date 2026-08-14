@@ -3317,3 +3317,90 @@ async fn a_claimable_drop_outside_the_mineable_set_is_counted() {
         "but it is not outstanding *work*: watching can never finish it"
     );
 }
+
+/// A streamer who changes category mid-stream stops earning the campaign's
+/// drops immediately, and nothing else notices: the stream is still live so
+/// the offline check passes, and the per-channel availability check no longer
+/// condemns anything.
+///
+/// Observed live — a Madden streamer moved to Just Chatting and the miner sat
+/// on them, stalled, until the ladder reached the rung that switches channel
+/// several minutes later. Unlike the availability check, this is proof: Twitch
+/// grants drops for watching the game.
+#[tokio::test]
+async fn a_channel_that_changes_category_is_left_at_once() {
+    use btdm_core::watchdog::RecoveryStep;
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current_channel().is_some(), "precondition: watching");
+
+    // The streamer switches to something else.
+    *e.api().channels.lock().unwrap() = vec![(
+        channel("ch1", "streamer1"),
+        stream_of("bc-1", true, other_game()),
+    )];
+
+    e.apply_recovery(RecoveryStep::RefreshStreamInfo, now())
+        .await
+        .unwrap();
+    assert!(
+        e.current_channel().is_none(),
+        "a channel no longer streaming the game cannot earn its drops"
+    );
+}
+
+/// The same check must not evict a channel serving a sitewide campaign, which
+/// is earned whatever is on screen.
+#[tokio::test]
+async fn a_sitewide_campaign_survives_a_category_change() {
+    use btdm_core::watchdog::RecoveryStep;
+    let fake = FakeTwitch::default();
+    let special = Game {
+        id: GameId::from("509663"),
+        name: "Special Events".into(),
+        slug: "special-events".into(),
+        box_art_url: None,
+    };
+    *fake.inventory.lock().unwrap() =
+        vec![campaign_of("c-any", true, vec![drop("d1", 60, 0)], special.clone())];
+    *fake.channels.lock().unwrap() =
+        vec![(channel("ch1", "streamer1"), stream_of("bc-1", true, special))];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current_channel().is_some(), "precondition: watching");
+
+    *e.api().channels.lock().unwrap() = vec![(
+        channel("ch1", "streamer1"),
+        stream_of("bc-1", true, other_game()),
+    )];
+    e.apply_recovery(RecoveryStep::RefreshStreamInfo, now())
+        .await
+        .unwrap();
+    assert!(
+        e.current_channel().is_some(),
+        "a sitewide campaign is earned on any channel, whatever it is playing"
+    );
+}
+
+/// Twitch declining to say what a channel is playing is not evidence against
+/// it.
+#[tokio::test]
+async fn an_unreported_category_does_not_evict_a_channel() {
+    use btdm_core::watchdog::RecoveryStep;
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let mut blank = stream("bc-1", true);
+    blank.game = None;
+    *e.api().channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), blank)];
+
+    e.apply_recovery(RecoveryStep::RefreshStreamInfo, now())
+        .await
+        .unwrap();
+    assert!(e.current_channel().is_some(), "absence of an answer is not a wrong answer");
+}

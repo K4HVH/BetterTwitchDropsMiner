@@ -939,6 +939,22 @@ impl<A: TwitchApi> Engine<A> {
     /// The broadcast ID changes when a stream restarts, and heartbeats carrying
     /// a stale one are accepted and earn nothing — a healthy-looking session
     /// that is silently worthless. Returns whether the ID actually changed.
+    /// Whether a stream still serves any of the campaigns it was chosen for.
+    ///
+    /// A campaign in one of the sitewide categories is earned on any channel,
+    /// so those never fail this. Neither does a stream whose category Twitch
+    /// declines to report — absence of an answer is not a wrong answer.
+    fn stream_still_serves(&self, stream: &Stream, campaigns: &[CampaignId]) -> bool {
+        let Some(playing) = stream.game.as_ref().map(|g| &g.id) else {
+            return true;
+        };
+        campaigns.iter().any(|id| {
+            self.campaigns.iter().find(|c| &c.id == id).is_none_or(|c| {
+                ANY_CHANNEL_GAME_IDS.contains(&c.game.id.0.as_str()) || &c.game.id == playing
+            })
+        })
+    }
+
     pub async fn refresh_stream_info(&mut self, now: DateTime<Utc>) -> Result<bool, ApiError> {
         let Some(watch) = self.current.clone() else {
             return Ok(false);
@@ -956,6 +972,26 @@ impl<A: TwitchApi> Engine<A> {
                     );
                     self.progress.begin(now);
                     self.last_health_advance = Some(now);
+                }
+                // A streamer who switches category mid-stream stops earning
+                // the campaign's drops at once, and nothing else notices: the
+                // stream is still live, so the offline check passes, and the
+                // per-channel availability check no longer condemns anything.
+                // Observed live — a Madden streamer moved to Just Chatting and
+                // the miner sat on them, stalled, until the ladder reached the
+                // rung that switches channel four minutes later.
+                //
+                // Unlike that check, this is proof: Twitch grants drops for
+                // watching the game, and this channel is demonstrably not
+                // streaming it.
+                if !self.stream_still_serves(&fresh, &watch.campaigns) {
+                    tracing::info!(
+                        channel = %watch.channel.login,
+                        now_playing = fresh.game.as_ref().map(|g| g.name.as_str()).unwrap_or("nothing"),
+                        "channel changed category away from what we are mining"
+                    );
+                    self.stop_watching(now, StopReason::NotEarning);
+                    return Ok(true);
                 }
                 if let Some(w) = &mut self.current {
                     w.stream = fresh;
