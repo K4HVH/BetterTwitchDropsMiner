@@ -55,6 +55,13 @@ Rust debug string that nothing could read back. The release workflow uploading
 90-day CI artifacts and never publishing a release, so `btdm update` could
 never find anything — a headline feature that had never once worked.
 
+**From attacking the running dashboard.** A 200 KB paste into any settings box
+was accepted, written to `config.toml` and then carried in every SSE frame for
+the life of the process. And one unexpected field in a snapshot blanked the
+page permanently: `render()` emptied `#app` before rebuilding into it, and is
+called inside the stream handler's try/catch, so the throw was swallowed and
+the next heartbeat carried the same field. No hero, no tabs, no way back.
+
 **From running it.** Subscribing to 45 stream-state topics in one LISTEN frame
 made Twitch close the socket with WebSocket code 1009, "message too big",
 about a second later — a reconnect loop that subscribed, died and subscribed
@@ -119,7 +126,7 @@ was written — the API moved.
 
 ## Test coverage, and where it is thin
 
-471 tests, no clippy warnings.
+491 Rust tests and 123 dashboard checks, no clippy warnings.
 
 Well covered: the whole binary end to end against a fake Twitch, the engine
 against a scripted one (100+ scenarios), hostile data at every layer, strategies,
@@ -139,6 +146,14 @@ connection being reported, changing subscriptions on a live socket in
 correctly-sized frames, unsubscribing, and every frame carrying the token.
 Each of those failure modes produces a socket that looks perfectly healthy and
 delivers nothing.
+
+Two adversarial reviews of this work found defects the tests did not: the
+availability veto still living in the recovery ladder, where it quarantined
+every channel it looked at; a confirmation *deleting* campaigns from a
+candidate rather than adding confidence; an earned subscription reward that
+would never be claimed; three commands reporting a reselect that never
+happened; and a recovery ladder that could not climb past the rung that
+switches channel. Each is now covered.
 
 Thin: the supervisor's own reconnect *loop* — the backoff and the decision to
 try again — is still exercised only by running the binary; the protocol
