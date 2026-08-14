@@ -4,7 +4,6 @@ use crate::config::{Config, ConfigStore};
 use crate::notify::Notifier;
 use crate::storage::Storage;
 use btdm_core::api::TwitchApi;
-use btdm_core::control::Command;
 use btdm_core::engine::{Engine, EngineConfig, MiningState};
 use btdm_core::model::ChannelId;
 use btdm_core::watchdog::{RecoveryStep, Verdict};
@@ -12,7 +11,7 @@ use btdm_twitch::api_impl::TwitchClient;
 use btdm_twitch::auth::AuthClient;
 use btdm_twitch::client::{build_http_client, build_http_client_with_proxy};
 use btdm_twitch::pubsub::{self, PubSubMessage, Topic};
-use btdm_web::Hub;
+use btdm_web::{Envelope, Hub};
 use chrono::{Duration, Utc};
 use std::time::Duration as StdDuration;
 use tokio::sync::{mpsc, watch};
@@ -116,7 +115,7 @@ pub async fn mine(
 
     // Commands from the dashboard. Registered before the first tick so a
     // control pressed during startup is queued rather than rejected.
-    let (command_tx, mut command_rx) = mpsc::channel::<Command>(COMMAND_QUEUE);
+    let (command_tx, mut command_rx) = mpsc::channel::<Envelope>(COMMAND_QUEUE);
     if let Some(hub) = &hub {
         hub.register(account, command_tx);
     }
@@ -232,14 +231,19 @@ pub async fn mine(
                     break;
                 }
                 cmd = command_rx.recv() => {
-                    let Some(cmd) = cmd else {
+                    let Some(Envelope { command, reply }) = cmd else {
                         // Only happens if the hub dropped the sender.
                         tracing::debug!("command channel closed");
                         tokio::time::sleep(remaining).await;
                         break;
                     };
-                    let effect = engine.apply_command(cmd, Utc::now());
+                    let effect = engine.apply_command(command, Utc::now());
                     tracing::info!(message = %effect.message, "command applied");
+                    // Answer before doing the follow-up work below: the caller
+                    // is holding an HTTP request open, and persisting settings
+                    // or draining events can take a moment. A dropped receiver
+                    // just means the caller gave up, which is not our problem.
+                    let _ = reply.send(effect.clone());
 
                     if effect.persist && let Some(store) = &opts.config_store
                         && let Err(e) = store.save_account(account, &engine.settings()).await {

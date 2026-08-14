@@ -609,6 +609,7 @@ mod tests {
                 precondition_ids: vec![],
                 starts_at: None,
                 ends_at: None,
+                required_subs: 0,
             }],
         }
     }
@@ -1229,6 +1230,7 @@ mod priority_naming_tests {
                 precondition_ids: vec![],
                 starts_at: None,
                 ends_at: None,
+                required_subs: 0,
             }],
         }
     }

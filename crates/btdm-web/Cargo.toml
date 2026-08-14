@@ -17,4 +17,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset", "http2"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` gives the paused clock, so the command timeout can be tested
+# without a test that actually waits it out.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

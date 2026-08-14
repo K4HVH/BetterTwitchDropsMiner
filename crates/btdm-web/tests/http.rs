@@ -50,6 +50,29 @@ async fn start(hub: Hub, token: Option<&str>) -> String {
     url.split('?').next().unwrap().trim_end_matches('/').to_owned()
 }
 
+/// A stand-in miner: answers every command so the HTTP handler can complete,
+/// and records what it was asked to do.
+///
+/// The handler waits for the miner's own reply now, so a test that took a
+/// command and never answered would hang the request rather than fail.
+fn fake_miner() -> (
+    tokio::sync::mpsc::Sender<btdm_web::Envelope>,
+    std::sync::Arc<tokio::sync::Mutex<Vec<Command>>>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<btdm_web::Envelope>(8);
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Some(envelope) = rx.recv().await {
+            recorder.lock().await.push(envelope.command.clone());
+            let _ = envelope
+                .reply
+                .send(btdm_core::control::CommandEffect::message("done"));
+        }
+    });
+    (tx, seen)
+}
+
 #[tokio::test]
 async fn an_unguarded_dashboard_serves_the_page_and_snapshots() {
     let hub = Hub::new();
@@ -236,7 +259,7 @@ async fn snapshots_are_empty_before_any_miner_reports() {
 #[tokio::test]
 async fn a_command_reaches_the_registered_miner() {
     let hub = Hub::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
 
@@ -251,10 +274,8 @@ async fn a_command_reaches_the_registered_miner() {
 
     assert_eq!(res.status(), 200);
     assert_eq!(
-        rx.recv().await.unwrap(),
-        Command::SetStrategy {
-            name: "coverage".into()
-        }
+        seen.lock().await.as_slice(),
+        [Command::SetStrategy { name: "coverage".into() }]
     );
 }
 
@@ -273,7 +294,7 @@ async fn commanding_an_account_that_is_not_running_is_a_404() {
 #[tokio::test]
 async fn a_malformed_command_is_rejected_rather_than_ignored() {
     let hub = Hub::new();
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (tx, _seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
 
@@ -292,7 +313,7 @@ async fn a_malformed_command_is_rejected_rather_than_ignored() {
 #[tokio::test]
 async fn commands_require_the_token() {
     let hub = Hub::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, Some("secret")).await;
     let http = reqwest::Client::new();
@@ -312,7 +333,7 @@ async fn commands_require_the_token() {
         .await
         .unwrap();
     assert_eq!(accepted.status(), 200);
-    assert_eq!(rx.recv().await.unwrap(), Command::Pause);
+    assert_eq!(seen.lock().await.as_slice(), [Command::Pause]);
 }
 
 /// The page renders from pushed snapshots. If the stream does not open with
@@ -605,7 +626,7 @@ async fn a_miner_that_cannot_enrol_says_so() {
 #[tokio::test]
 async fn a_giant_body_is_rejected_without_taking_the_server_down() {
     let hub = Hub::new();
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (tx, _seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
     let http = reqwest::Client::new();
@@ -627,7 +648,7 @@ async fn a_giant_body_is_rejected_without_taking_the_server_down() {
 #[tokio::test]
 async fn deeply_nested_json_does_not_blow_the_stack() {
     let hub = Hub::new();
-    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (tx, _seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
 
@@ -656,7 +677,7 @@ async fn deeply_nested_json_does_not_blow_the_stack() {
 #[tokio::test]
 async fn an_account_name_cannot_traverse_the_path() {
     let hub = Hub::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
     let http = reqwest::Client::new();
@@ -680,14 +701,14 @@ async fn an_account_name_cannot_traverse_the_path() {
             "'{hostile}' must not resolve to the registered account"
         );
     }
-    assert!(rx.try_recv().is_err(), "nothing should have reached the miner");
+    assert!(seen.lock().await.is_empty(), "nothing should have reached the miner");
 }
 
 /// Names Twitch actually permits must still work.
 #[tokio::test]
 async fn an_unusual_but_legitimate_account_name_works() {
     let hub = Hub::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, seen) = fake_miner();
     hub.register("my account 日本語", tx);
     let base = start(hub, None).await;
 
@@ -701,7 +722,7 @@ async fn an_unusual_but_legitimate_account_name_works() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    assert_eq!(rx.recv().await.unwrap(), Command::Pause);
+    assert_eq!(seen.lock().await.as_slice(), [Command::Pause]);
 }
 
 /// Minimal percent-encoding, so the test does not need a dependency.
@@ -721,7 +742,7 @@ fn urlencoding_lite(s: &str) -> String {
 #[tokio::test]
 async fn commands_with_wrong_types_are_refused() {
     let hub = Hub::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, seen) = fake_miner();
     hub.register("main", tx);
     let base = start(hub, None).await;
     let http = reqwest::Client::new();
@@ -747,7 +768,7 @@ async fn commands_with_wrong_types_are_refused() {
             .unwrap();
         assert_eq!(res.status(), 400, "body {body:?} should be refused");
     }
-    assert!(rx.try_recv().is_err(), "nothing malformed may reach the miner");
+    assert!(seen.lock().await.is_empty(), "nothing malformed may reach the miner");
 }
 
 /// A queue that has filled up must say so rather than silently dropping the
@@ -755,19 +776,28 @@ async fn commands_with_wrong_types_are_refused() {
 #[tokio::test]
 async fn a_full_command_queue_is_reported() {
     let hub = Hub::new();
+    // A miner that never reads its queue: the one command it can hold sits
+    // there, and the next has nowhere to go.
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     hub.register("main", tx);
     let base = start(hub, None).await;
     let http = reqwest::Client::new();
 
-    // The first fills the queue of one; the second cannot be accepted.
-    let first = http
-        .post(format!("{base}/api/accounts/main/command"))
-        .json(&Command::Pause)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(first.status(), 200);
+    // The first fills the queue of one. Its own request stays open waiting for
+    // an answer that is never coming, so it is left in flight rather than
+    // awaited — the assertion here is about the *second*.
+    let filling = tokio::spawn({
+        let base = base.clone();
+        async move {
+            let _ = reqwest::Client::new()
+                .post(format!("{base}/api/accounts/main/command"))
+                .json(&Command::Pause)
+                .send()
+                .await;
+        }
+    });
+    // Give it time to occupy the slot.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let second = http
         .post(format!("{base}/api/accounts/main/command"))
@@ -776,6 +806,23 @@ async fn a_full_command_queue_is_reported() {
         .await
         .unwrap();
     assert_eq!(second.status(), 503, "a dropped command must not look accepted");
+    filling.abort();
+}
+
+/// A miner that takes a command and then wedges must not hold the request open
+/// forever: the page would simply stop responding to clicks. It is reported as
+/// accepted-but-unconfirmed, which is the truth.
+#[tokio::test(start_paused = true)]
+async fn a_miner_that_never_answers_does_not_hang_the_page() {
+    let hub = Hub::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    hub.register("main", tx);
+
+    let result = hub.send_command("main", Command::Pause).await;
+    match result {
+        Err(btdm_web::CommandError::Slow(who)) => assert_eq!(who, "main"),
+        other => panic!("expected a bounded wait, got {other:?}"),
+    }
 }
 
 /// Many dashboards open at once must not starve each other or the miner.

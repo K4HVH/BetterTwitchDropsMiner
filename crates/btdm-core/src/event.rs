@@ -231,6 +231,8 @@ pub enum RejectReason {
     Infeasible,
     /// The user excluded it.
     Excluded,
+    /// Every unclaimed drop needs a subscription, which watching cannot earn.
+    SubscriptionRequired,
 }
 
 impl RejectReason {
@@ -246,6 +248,10 @@ impl RejectReason {
             Self::NotStarted => "it has not started yet",
             Self::AllDropsClaimed => "every drop in it is already claimed",
             Self::NoEligibleChannel => "nobody is streaming it with drops enabled",
+            Self::SubscriptionRequired => {
+                "its rewards are for subscribing, not for watching — no amount \
+                 of watching will earn them"
+            }
             Self::Infeasible => "there is not enough time left to finish it before it ends",
             Self::Excluded => "you excluded it",
         }
@@ -261,6 +267,7 @@ impl RejectReason {
             Self::NoEligibleChannel => "nobody live",
             Self::Infeasible => "not enough time",
             Self::Excluded => "excluded",
+            Self::SubscriptionRequired => "needs a sub",
         }
     }
 }

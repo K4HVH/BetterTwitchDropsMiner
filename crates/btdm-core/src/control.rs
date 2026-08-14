@@ -22,7 +22,19 @@ pub enum Command {
     /// `None` clears the pin.
     Pin { channel: Option<String> },
     SetFavourite { login: String, on: bool },
+    /// Replace the priority list outright.
     SetPriorityGames { games: Vec<String> },
+    /// Append one entry, if it is not already listed.
+    ///
+    /// Editing the list one entry at a time has to happen inside the engine.
+    /// A caller that reads the list, appends to it and sends the result is
+    /// racing the snapshot it read from: the dashboard republishes on its own
+    /// schedule, so two quick edits both start from the same stale list and
+    /// the first is silently undone by the second.
+    AddPriorityEntry { entry: String },
+    RemovePriorityEntry { entry: String },
+    /// Move an entry one place towards the front, or towards the back.
+    MovePriorityEntry { entry: String, up: bool },
     SetCampaignExcluded { campaign: CampaignId, excluded: bool },
     SetGameExcluded { game: String, excluded: bool },
     /// Leave the current channel and choose again immediately.

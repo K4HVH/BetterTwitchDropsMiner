@@ -224,11 +224,22 @@ async fn command(
         }
     };
 
-    match state.hub.send_command(&account, command) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+    match state.hub.send_command(&account, command).await {
+        Ok(effect) => Json(serde_json::json!({
+            "ok": true,
+            "message": effect.message,
+        }))
+        .into_response(),
         Err(e @ CommandError::UnknownAccount(_)) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+        // Accepted, outcome unknown. Not a failure — reporting it as one would
+        // invite the user to send it a second time.
+        Err(e @ CommandError::Slow(_)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "ok": true, "message": e.to_string() })),
         )
             .into_response(),
         Err(e) => (

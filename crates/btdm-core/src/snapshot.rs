@@ -157,6 +157,10 @@ pub struct DropView {
     pub locked: bool,
     /// This is the drop Twitch is currently advancing.
     pub active: bool,
+    /// Subscriptions needed to earn it. Non-zero means watching never will,
+    /// which the page has to say rather than showing a bar that cannot move.
+    #[serde(default)]
+    pub required_subs: u32,
     pub benefits: Vec<BenefitView>,
 }
 
@@ -240,6 +244,7 @@ pub fn drop_view(d: &TimedDrop, claimed: &HashSet<DropId>, active: Option<&DropI
         name: d.name.clone(),
         current_minutes: d.current_minutes,
         required_minutes: d.required_minutes,
+        required_subs: d.required_subs,
         percent: if d.required_minutes == 0 {
             0.0
         } else {
@@ -352,6 +357,7 @@ mod tests {
                 precondition_ids: vec![],
                 starts_at: None,
                 ends_at: None,
+                required_subs: 0,
             }],
         }
     }
@@ -436,6 +442,7 @@ mod tests {
             precondition_ids: vec![first],
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         });
 
         let v = view(&c);

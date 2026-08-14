@@ -81,7 +81,13 @@ pub async fn send(config: &Config, account: &str, command: Command) -> anyhow::R
     let body: serde_json::Value = res.json().await.unwrap_or_default();
 
     if status.is_success() {
-        println!("Sent.");
+        // The miner's own words. "Sent." was all this could say before the
+        // reply carried anything, which meant the CLI could not tell a command
+        // that worked from one the miner declined as a no-op.
+        match body.get("message").and_then(|m| m.as_str()) {
+            Some(m) if !m.is_empty() => println!("{m}"),
+            _ => println!("Sent."),
+        }
         return Ok(());
     }
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -101,6 +107,40 @@ pub async fn send(config: &Config, account: &str, command: Command) -> anyhow::R
         "the miner refused the command ({status}): {}",
         body.get("error").and_then(|e| e.as_str()).unwrap_or("no reason given")
     )
+}
+
+/// How `btdm control priority` is changing the list.
+#[derive(Debug)]
+pub enum PriorityChange {
+    /// Replace it outright.
+    Set(Vec<String>),
+    Add(String),
+    Remove(String),
+    Clear,
+}
+
+/// Applies a change to the priority list, then prints the result.
+///
+/// Single-entry edits go to the miner as single-entry commands rather than as
+/// a rewritten list. Assembling the new list here would mean reading the
+/// published snapshot first, which lags whatever the miner has already
+/// applied — two quick `--add` calls both started from the same stale list and
+/// the second silently discarded the first.
+pub async fn set_priority(
+    config: &Config,
+    account: &str,
+    change: PriorityChange,
+) -> anyhow::Result<()> {
+    let command = match change {
+        PriorityChange::Set(games) => Command::SetPriorityGames { games },
+        PriorityChange::Clear => Command::SetPriorityGames { games: Vec::new() },
+        PriorityChange::Add(entry) => Command::AddPriorityEntry { entry },
+        PriorityChange::Remove(entry) => Command::RemovePriorityEntry { entry },
+    };
+    // Prints the miner's confirmation, which is synchronous with the change.
+    // Reading the list back from `/api/snapshots` instead would race the
+    // miner's publish schedule and print the list as it was *before* the edit.
+    send(config, account, command).await
 }
 
 /// Prints what every running account is doing. The point is that this is the

@@ -9,13 +9,13 @@
 //! where it is safe to abandon the current channel, and nothing outside the
 //! engine can mutate it mid-selection.
 
-use btdm_core::control::Command;
+use btdm_core::control::{Command, CommandEffect};
 use serde::Serialize;
 use btdm_core::event::MinerEvent;
 use btdm_core::snapshot::Snapshot;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// An event tagged with the account that produced it.
 #[derive(Debug, Clone)]
@@ -81,13 +81,33 @@ pub enum CommandError {
     UnknownAccount(String),
     #[error("the miner for '{0}' is not accepting commands")]
     NotAccepting(String),
+    /// Queued, but the miner had not acted on it before we stopped waiting.
+    /// The command is not lost — only its outcome is unknown.
+    #[error("the miner for '{0}' took the command but has not acted on it yet")]
+    Slow(String),
+}
+
+/// How long to wait for a miner to apply a command before answering without
+/// knowing the outcome. Generous enough to cover a selection pass, short
+/// enough that a wedged miner does not freeze the page.
+pub const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A command and somewhere to put the answer.
+///
+/// The reply channel is what lets a caller distinguish "the miner accepted
+/// this" from "the miner did this", which are different things when the queue
+/// is deep or the miner is mid-request.
+#[derive(Debug)]
+pub struct Envelope {
+    pub command: Command,
+    pub reply: oneshot::Sender<CommandEffect>,
 }
 
 #[derive(Clone)]
 pub struct Hub {
     /// Ordered so the dashboard lists accounts consistently between refreshes.
     snapshots: Arc<RwLock<BTreeMap<String, Snapshot>>>,
-    commands: Arc<RwLock<BTreeMap<String, mpsc::Sender<Command>>>>,
+    commands: Arc<RwLock<BTreeMap<String, mpsc::Sender<Envelope>>>>,
     updates: broadcast::Sender<Update>,
     history: Arc<RwLock<Option<Arc<dyn History>>>>,
     enrolment: Arc<RwLock<Option<Arc<dyn Enrolment>>>>,
@@ -238,7 +258,7 @@ impl Hub {
 
     /// Registers an account's command channel. Called by the supervisor as it
     /// starts each miner.
-    pub fn register(&self, account: &str, tx: mpsc::Sender<Command>) {
+    pub fn register(&self, account: &str, tx: mpsc::Sender<Envelope>) {
         self.commands
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -261,13 +281,23 @@ impl Hub {
             .collect()
     }
 
-    /// Sends a command to one account's miner.
+    /// Sends a command to one account's miner and waits for it to be applied.
     ///
     /// `try_send` rather than `send`: an HTTP handler must not block on a
     /// miner that is mid-request, and a full queue means the user is clicking
     /// faster than the miner can act, which is worth reporting rather than
     /// silently absorbing.
-    pub fn send_command(&self, account: &str, command: Command) -> Result<(), CommandError> {
+    ///
+    /// The *reply* is awaited, though, so callers learn what the command
+    /// actually did. Without it the only honest thing a caller could report
+    /// was "sent" — and anything that read the published snapshot back to find
+    /// out was racing the miner's own publish schedule, which is how two quick
+    /// edits to a list used to lose one of them.
+    pub async fn send_command(
+        &self,
+        account: &str,
+        command: Command,
+    ) -> Result<CommandEffect, CommandError> {
         let tx = {
             let guard = self.commands.read().unwrap_or_else(|e| e.into_inner());
             guard
@@ -275,8 +305,25 @@ impl Hub {
                 .cloned()
                 .ok_or_else(|| CommandError::UnknownAccount(account.to_owned()))?
         };
-        tx.try_send(command)
-            .map_err(|_| CommandError::NotAccepting(account.to_owned()))
+        let (reply, answer) = oneshot::channel();
+        tx.try_send(Envelope { command, reply })
+            .map_err(|_| CommandError::NotAccepting(account.to_owned()))?;
+
+        // Bounded. A miner wedged mid-request would otherwise hold every
+        // dashboard click open forever, which is a worse failure than not
+        // knowing the outcome: the page would simply stop responding.
+        //
+        // Normally this resolves in milliseconds — the command arm sits in the
+        // same `select!` as the heartbeat wait, so it is picked up as soon as
+        // it arrives. The budget only matters while a selection pass is in
+        // flight, which is the one thing that can take seconds.
+        match tokio::time::timeout(COMMAND_TIMEOUT, answer).await {
+            Ok(Ok(effect)) => Ok(effect),
+            // The miner took the command and then dropped the reply: it is
+            // gone, and nothing will act on it.
+            Ok(Err(_)) => Err(CommandError::NotAccepting(account.to_owned())),
+            Err(_) => Err(CommandError::Slow(account.to_owned())),
+        }
     }
 }
 
@@ -391,15 +438,46 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         hub.register("main", tx);
 
-        hub.send_command("main", Command::Pause).unwrap();
-        assert_eq!(rx.recv().await.unwrap(), Command::Pause);
+        // The miner half: take the command and answer it.
+        let miner = tokio::spawn(async move {
+            let envelope = rx.recv().await.expect("a command arrives");
+            assert_eq!(envelope.command, Command::Pause);
+            let _ = envelope.reply.send(CommandEffect::message("Paused"));
+        });
+
+        let effect = hub.send_command("main", Command::Pause).await.unwrap();
+        assert_eq!(effect.message, "Paused");
+        miner.await.unwrap();
     }
 
-    #[test]
-    fn commanding_an_unknown_account_says_so() {
+    /// The caller must learn what the command actually did, not merely that it
+    /// was queued — anything that instead read the published snapshot back was
+    /// racing the miner's own publish schedule.
+    #[tokio::test]
+    async fn the_reply_carries_the_miners_own_answer() {
+        let hub = Hub::new();
+        let (tx, mut rx) = mpsc::channel(4);
+        hub.register("main", tx);
+
+        tokio::spawn(async move {
+            let envelope = rx.recv().await.unwrap();
+            let _ = envelope
+                .reply
+                .send(CommandEffect::message("Prioritised 'rust' at position 2"));
+        });
+
+        let effect = hub
+            .send_command("main", Command::AddPriorityEntry { entry: "rust".into() })
+            .await
+            .unwrap();
+        assert_eq!(effect.message, "Prioritised 'rust' at position 2");
+    }
+
+    #[tokio::test]
+    async fn commanding_an_unknown_account_says_so() {
         let hub = Hub::new();
         assert_eq!(
-            hub.send_command("nope", Command::Pause),
+            hub.send_command("nope", Command::Pause).await,
             Err(CommandError::UnknownAccount("nope".into()))
         );
     }
@@ -414,7 +492,7 @@ mod tests {
         drop(rx);
 
         assert_eq!(
-            hub.send_command("main", Command::Pause),
+            hub.send_command("main", Command::Pause).await,
             Err(CommandError::NotAccepting("main".into()))
         );
     }

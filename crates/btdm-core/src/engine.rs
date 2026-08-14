@@ -369,9 +369,58 @@ impl<A: TwitchApi> Engine<A> {
                     .map(|g| g.trim().to_lowercase())
                     .filter(|g| !g.is_empty())
                     .collect();
+                self.priority_games.dedup();
                 let n = self.priority_games.len();
                 self.reselect_forced = true;
-                CommandEffect::message(format!("Priority list set to {n} game(s)"))
+                CommandEffect::message(format!("Priority list set to {n} entries"))
+                    .with_persist()
+                    .with_reselect()
+            }
+            Command::AddPriorityEntry { entry } => {
+                let entry = entry.trim().to_lowercase();
+                if entry.is_empty() {
+                    return CommandEffect::message("Nothing to add");
+                }
+                if self.priority_games.contains(&entry) {
+                    return CommandEffect::message(format!("'{entry}' is already prioritised"));
+                }
+                self.priority_games.push(entry.clone());
+                CommandEffect::message(format!(
+                    "Prioritised '{entry}' at position {}",
+                    self.priority_games.len()
+                ))
+                .with_persist()
+                .with_reselect()
+            }
+            Command::RemovePriorityEntry { entry } => {
+                let entry = entry.trim().to_lowercase();
+                let before = self.priority_games.len();
+                self.priority_games.retain(|g| g != &entry);
+                if self.priority_games.len() == before {
+                    return CommandEffect::message(format!("'{entry}' was not prioritised"));
+                }
+                CommandEffect::message(format!("Removed '{entry}' from the priority list"))
+                    .with_persist()
+                    .with_reselect()
+            }
+            Command::MovePriorityEntry { entry, up } => {
+                let entry = entry.trim().to_lowercase();
+                let Some(i) = self.priority_games.iter().position(|g| g == &entry) else {
+                    return CommandEffect::message(format!("'{entry}' was not prioritised"));
+                };
+                let j = if up {
+                    match i.checked_sub(1) {
+                        Some(j) => j,
+                        // Already first: not an error, just nothing to do.
+                        None => return CommandEffect::message(format!("'{entry}' is already first")),
+                    }
+                } else if i + 1 < self.priority_games.len() {
+                    i + 1
+                } else {
+                    return CommandEffect::message(format!("'{entry}' is already last"));
+                };
+                self.priority_games.swap(i, j);
+                CommandEffect::message(format!("Moved '{entry}' to position {}", j + 1))
                     .with_persist()
                     .with_reselect()
             }

@@ -24,7 +24,20 @@ pub fn assess(campaign: &DropCampaign, now: DateTime<Utc>) -> Result<(), RejectR
         return Err(RejectReason::NotLinked);
     }
     if mineable_drops(campaign).is_empty() {
-        return Err(RejectReason::AllDropsClaimed);
+        // Distinguish "nothing left to win" from "nothing watching can win".
+        // Both leave no mineable drops, but only one of them is an
+        // achievement — reporting a subscription reward as fully claimed would
+        // claim credit for something the account never got.
+        let unclaimed_needs_subs = campaign
+            .drops
+            .iter()
+            .filter(|d| !d.is_claimed)
+            .any(|d| !d.is_earnable_by_watching());
+        return Err(if unclaimed_needs_subs {
+            RejectReason::SubscriptionRequired
+        } else {
+            RejectReason::AllDropsClaimed
+        });
     }
     // Every remaining tier's own window has closed, so nothing here can be
     // earned again however long we watch.
@@ -59,6 +72,11 @@ pub fn mineable_drops(campaign: &DropCampaign) -> Vec<&TimedDrop> {
         .drops
         .iter()
         .filter(|d| !d.is_claimed)
+        // A drop that wants a subscription is not earnable by watching, and
+        // buying one is not something a miner gets to decide. Twitch ships
+        // these through the same structure as watch-time drops, so without
+        // this they are counted as work the miner can do and never does.
+        .filter(|d| d.is_earnable_by_watching())
         .filter(|d| d.precondition_ids.iter().all(|p| claimed.contains(p)))
         .collect()
 }
@@ -179,6 +197,7 @@ mod tests {
                 precondition_ids: vec![],
                 starts_at: None,
                 ends_at: None,
+                required_subs: 0,
             }],
         }
     }
@@ -249,6 +268,7 @@ mod tests {
             precondition_ids: vec![DropId::from("d1")],
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         });
         let ids: Vec<_> = mineable_drops(&c).iter().map(|d| d.id.clone()).collect();
         assert_eq!(
@@ -281,6 +301,7 @@ mod tests {
             precondition_ids: vec![],
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         });
         assert_eq!(remaining_minutes(&c), 160);
     }
@@ -307,6 +328,7 @@ mod remaining_minutes_tests {
             precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         }
     }
 
@@ -432,6 +454,7 @@ mod diamond_tests {
             precondition_ids: after.iter().map(|s| DropId::from(*s)).collect(),
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         }
     }
 
@@ -535,6 +558,7 @@ mod window_tests {
             precondition_ids: vec![],
             starts_at: from.map(at),
             ends_at: until.map(at),
+            required_subs: 0,
         }
     }
 

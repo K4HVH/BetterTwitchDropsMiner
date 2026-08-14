@@ -2786,3 +2786,174 @@ async fn art_reaches_campaigns_that_were_never_detail_fetched() {
         "an inventory campaign must still get the listing's artwork"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subscription rewards
+//
+// Twitch ships "subscribe and get a badge" through the same `TimedDrop`
+// structure as watch-time drops: zero required minutes, one required sub. They
+// are indistinguishable from real drops unless `requiredSubs` is read, so they
+// were counted as mineable work, inflated the campaign totals, and had
+// selection passes spent on them — for a reward no amount of watching earns.
+// ---------------------------------------------------------------------------
+
+fn sub_reward_drop(id: &str) -> TimedDrop {
+    let mut d = drop(id, 0, 0);
+    d.required_subs = 1;
+    d
+}
+
+#[tokio::test]
+async fn a_subscription_reward_is_not_counted_as_mineable() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() =
+        vec![campaign("c-sub", true, vec![sub_reward_drop("d-sub")])];
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    assert!(e.campaigns().is_empty(), "watching can never earn it");
+    assert!(
+        e.select_channel(now()).await.unwrap().is_none(),
+        "and no channel should be watched on its behalf"
+    );
+}
+
+/// Being unable to earn something is not the same as having earned it. Saying
+/// "all claimed" about a sub reward claims credit for a badge the account
+/// never got.
+#[tokio::test]
+async fn a_subscription_reward_says_why_rather_than_claiming_it_is_finished() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() =
+        vec![campaign("c-sub", true, vec![sub_reward_drop("d-sub")])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let snap = e.snapshot("default", Some("me"), now());
+    let rejected = snap
+        .rejected
+        .iter()
+        .find(|r| r.id == "c-sub")
+        .expect("it must still be listed, not silently dropped");
+    assert_eq!(rejected.reason, RejectReason::SubscriptionRequired.label());
+    assert!(
+        rejected.explanation.contains("subscrib"),
+        "the explanation must say so plainly: {}",
+        rejected.explanation
+    );
+}
+
+/// A campaign mixing a sub reward with real watch-time tiers stays mineable
+/// for the tiers that watching can actually finish.
+#[tokio::test]
+async fn watch_time_tiers_survive_alongside_a_subscription_reward() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign(
+        "c1",
+        true,
+        vec![sub_reward_drop("d-sub"), drop("d-watch", 60, 0)],
+    )];
+    *fake.channels.lock().unwrap() = vec![(channel("ch1", "streamer1"), stream("bc-1", true))];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    assert_eq!(e.campaigns().len(), 1);
+    let selected = e.select_channel(now()).await.unwrap().unwrap();
+    assert_eq!(
+        selected.drops,
+        vec![DropId::from("d-watch")],
+        "only the tier watching can earn should be pursued"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Editing the priority list
+//
+// Callers used to read the list, change it, and send the whole thing back.
+// Both callers read a *published* snapshot, which lags what the miner has
+// already applied — so two quick edits both started from the same list and the
+// second silently discarded the first. Two `btdm control priority --add` calls
+// in a row reproduced it every time.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn two_quick_additions_both_survive() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+
+    e.apply_command(C::AddPriorityEntry { entry: "Escape from Tarkov".into() }, now());
+    e.apply_command(C::AddPriorityEntry { entry: "Rocket League".into() }, now());
+
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["escape from tarkov", "rocket league"],
+        "the second addition must not discard the first"
+    );
+}
+
+#[tokio::test]
+async fn an_entry_is_not_added_twice() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+    e.apply_command(C::AddPriorityEntry { entry: "Rust".into() }, now());
+    let effect = e.apply_command(C::AddPriorityEntry { entry: "  RUST  ".into() }, now());
+
+    assert!(effect.message.contains("already"), "{}", effect.message);
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["rust"]
+    );
+}
+
+#[tokio::test]
+async fn entries_can_be_reordered_one_step_at_a_time() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+    for g in ["a", "b", "c"] {
+        e.apply_command(C::AddPriorityEntry { entry: g.into() }, now());
+    }
+
+    e.apply_command(C::MovePriorityEntry { entry: "c".into(), up: true }, now());
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["a", "c", "b"]
+    );
+
+    e.apply_command(C::MovePriorityEntry { entry: "a".into(), up: false }, now());
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["c", "a", "b"]
+    );
+}
+
+/// Moving the first entry up is a no-op, not a crash and not a wrap-around.
+#[tokio::test]
+async fn moving_past_either_end_does_nothing() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+    for g in ["a", "b"] {
+        e.apply_command(C::AddPriorityEntry { entry: g.into() }, now());
+    }
+
+    let first = e.apply_command(C::MovePriorityEntry { entry: "a".into(), up: true }, now());
+    let last = e.apply_command(C::MovePriorityEntry { entry: "b".into(), up: false }, now());
+    assert!(first.message.contains("already first"), "{}", first.message);
+    assert!(last.message.contains("already last"), "{}", last.message);
+    assert_eq!(
+        e.snapshot("default", Some("me"), now()).settings.priority_games,
+        vec!["a", "b"]
+    );
+}
+
+#[tokio::test]
+async fn removing_something_that_is_not_listed_says_so() {
+    use btdm_core::control::Command as C;
+    let mut e = engine(happy_path());
+    let effect = e.apply_command(C::RemovePriorityEntry { entry: "nope".into() }, now());
+    assert!(effect.message.contains("was not prioritised"), "{}", effect.message);
+    assert!(!effect.persist, "nothing changed, so nothing to write back");
+}

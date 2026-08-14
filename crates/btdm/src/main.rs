@@ -33,8 +33,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Show what the running miner is doing.
+    Status {
+        /// Emit the raw snapshot instead, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show which accounts are linked and whether their tokens still work.
-    Status,
+    Accounts,
     /// Remove a stored token.
     Logout,
     /// Mine drops until interrupted, with the dashboard.
@@ -54,17 +60,20 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Drive a running miner. Everything the dashboard can do, from a shell.
+    /// Change what a running miner is doing. Same controls as the dashboard.
     #[command(subcommand)]
     Control(ControlCommand),
 }
 
 /// Every one of these reaches a *running* miner over its HTTP API and takes
-/// effect immediately. None of them require a restart, and none of them need
-/// the config file to be edited by hand.
+/// effect immediately — they are a client of `btdm mine`, not a second way of
+/// mining. Nothing here requires a restart or a hand-edited config file, and
+/// every one of them has a control on the dashboard that does the same thing
+/// through the same endpoint.
 #[derive(Subcommand)]
 enum ControlCommand {
-    /// Show what every running account is doing.
+    /// Show what every running account is doing. Same as `btdm status`.
+    #[command(hide = true)]
     Status {
         /// Emit the raw snapshot instead, for scripts.
         #[arg(long)]
@@ -99,6 +108,25 @@ enum ControlCommand {
         #[arg(long)]
         remove: bool,
     },
+    /// Set the priority order the priority strategies rank by.
+    ///
+    /// Entries match a game name *or* a campaign name, so two campaigns for
+    /// the same game can be ranked against each other. Order matters: the
+    /// first entry wins.
+    Priority {
+        /// The full list, best first. Replaces whatever is there.
+        #[arg(required_unless_present_any = ["add", "remove", "clear"])]
+        games: Vec<String>,
+        /// Append one entry instead of replacing the list.
+        #[arg(long, conflicts_with_all = ["remove", "clear"])]
+        add: Option<String>,
+        /// Drop one entry, leaving the rest in order.
+        #[arg(long, conflicts_with = "clear")]
+        remove: Option<String>,
+        /// Empty the list.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Never mine a game's campaigns.
     ExcludeGame {
         game: String,
@@ -119,7 +147,8 @@ enum ControlCommand {
 fn to_command(c: ControlCommand) -> Option<btdm_core::control::Command> {
     use btdm_core::control::Command as C;
     Some(match c {
-        ControlCommand::Status { .. } => return None,
+        // Handled separately: they read the current state before writing.
+        ControlCommand::Status { .. } | ControlCommand::Priority { .. } => return None,
         ControlCommand::Pause => C::Pause,
         ControlCommand::Resume => C::Resume,
         ControlCommand::Strategy { name } => C::SetStrategy { name },
@@ -178,7 +207,8 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Command::Login { force } => auth_flow::login(&storage, &args.account, force).await,
-        Command::Status => auth_flow::status(&storage, &args.account).await,
+        Command::Accounts => auth_flow::status(&storage, &args.account).await,
+        Command::Status { json } => control_cli::show(&cfg, json).await,
         Command::Logout => {
             if storage.clear_tokens(&args.account)? {
                 println!("Removed the stored token for account '{}'.", args.account);
@@ -203,13 +233,27 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Update { apply } => update::run(apply).await,
-        Command::Control(sub) => {
-            let json = matches!(sub, ControlCommand::Status { json: true });
-            match to_command(sub) {
-                None => control_cli::show(&cfg, json).await,
-                Some(command) => control_cli::send(&cfg, &args.account, command).await,
+        Command::Control(sub) => match sub {
+            ControlCommand::Status { json } => control_cli::show(&cfg, json).await,
+            ControlCommand::Priority { games, add, remove, clear } => {
+                use control_cli::PriorityChange as P;
+                let change = if clear {
+                    P::Clear
+                } else if let Some(g) = add {
+                    P::Add(g)
+                } else if let Some(g) = remove {
+                    P::Remove(g)
+                } else {
+                    P::Set(games)
+                };
+                control_cli::set_priority(&cfg, &args.account, change).await
             }
-        }
+            other => match to_command(other) {
+                // `to_command` returns None only for the two handled above.
+                None => unreachable!("every other control command maps to a command"),
+                Some(command) => control_cli::send(&cfg, &args.account, command).await,
+            },
+        },
         Command::Probe => {
             run::mine(
                 &storage,

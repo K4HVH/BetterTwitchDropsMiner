@@ -160,6 +160,12 @@ fn parse_drop(v: &Value) -> Result<TimedDrop, TwitchError> {
             .and_then(Value::as_str)
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
             .map(|t| t.with_timezone(&Utc)),
+        // Reward campaigns come down the same pipe as watch-time ones, and
+        // are distinguishable only by this field.
+        required_subs: v
+            .get("requiredSubs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
         precondition_ids: v
             .get("preconditionDrops")
             .and_then(Value::as_array)
@@ -179,12 +185,24 @@ pub fn parse_campaign(v: &Value) -> Result<DropCampaign, TwitchError> {
             .filter(|g| !g.is_null())
             .ok_or_else(|| malformed("campaign has no game"))?,
     )?;
-    let drops = v
+    let mut drops = v
         .get("timeBasedDrops")
         .and_then(Value::as_array)
         .map(|a| a.iter().map(parse_drop).collect::<Result<Vec<_>, _>>())
         .transpose()?
         .unwrap_or_default();
+    // Twitch returns tiers in no particular order — a real campaign came back
+    // as 240, 15, 30, 60, 120, 180 minutes. Since every tier of that campaign
+    // was also named "Madden Twitch Pack", the list read as six identical
+    // rewards at random thresholds. Tier order is the only thing that makes a
+    // tiered campaign legible, so establish it once, here, rather than leaving
+    // every reader to sort it.
+    drops.sort_by(|a, b| {
+        a.required_minutes
+            .cmp(&b.required_minutes)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
     let allowed_channels = v
         .get("allow")
         .filter(|a| !a.is_null())

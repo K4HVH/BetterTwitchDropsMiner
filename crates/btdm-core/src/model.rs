@@ -94,11 +94,30 @@ pub struct TimedDrop {
     pub starts_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub ends_at: Option<DateTime<Utc>>,
+    /// Subscriptions the viewer must buy or gift to earn this drop.
+    ///
+    /// Twitch runs reward campaigns through the same drop machinery as
+    /// watch-time campaigns: a badge for subscribing arrives as a `TimedDrop`
+    /// requiring zero minutes and one sub. Watching earns it never, however
+    /// long the miner sits there — so counting it as mineable overstates what
+    /// the account can actually get and spends selection passes on a campaign
+    /// with nothing to win.
+    #[serde(default)]
+    pub required_subs: u32,
 }
 
 impl TimedDrop {
     pub fn remaining_minutes(&self) -> u32 {
         self.required_minutes.saturating_sub(self.current_minutes)
+    }
+
+    /// Whether watching can earn this drop at all.
+    ///
+    /// Buying subscriptions is not something a miner should ever do on
+    /// someone's behalf, so a drop that requires one is reported and skipped
+    /// rather than attempted.
+    pub fn is_earnable_by_watching(&self) -> bool {
+        self.required_subs == 0
     }
 
     /// Whether this tier's own window is open.
@@ -206,6 +225,7 @@ mod tests {
             precondition_ids: vec![],
             starts_at: None,
             ends_at: None,
+            required_subs: 0,
         }
     }
 

@@ -290,3 +290,70 @@ fn null_precondition_drops_parse_as_no_preconditions() {
     });
     assert!(parse_campaign(&v).unwrap().drops[0].precondition_ids.is_empty());
 }
+
+/// Twitch returns a campaign's tiers in whatever order it likes. A real
+/// campaign came back as 240, 15, 30, 60, 120, 180 minutes — and since every
+/// tier was also named "Madden Twitch Pack", the dashboard showed six
+/// identical rewards at apparently random thresholds. Tier order is the only
+/// thing that makes a tiered campaign readable.
+#[test]
+fn drops_are_put_into_tier_order() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Madden Live", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "Madden", "slug": "madden", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "d240", "name": "Madden Twitch Pack", "requiredMinutesWatched": 240 },
+                { "id": "d15",  "name": "Madden Twitch Pack", "requiredMinutesWatched": 15 },
+                { "id": "d30",  "name": "Madden Twitch Pack", "requiredMinutesWatched": 30 },
+                { "id": "d60",  "name": "Madden Twitch Pack", "requiredMinutesWatched": 60 },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    let order: Vec<u32> = c.drops.iter().map(|d| d.required_minutes).collect();
+    assert_eq!(order, vec![15, 30, 60, 240]);
+}
+
+/// A subscription reward arrives as a drop needing zero minutes and one sub.
+/// Read without `requiredSubs` it is indistinguishable from a drop that is
+/// already finished.
+#[test]
+fn a_subscription_reward_is_recognised_as_one() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "LoL Classic Chat Badge", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "LoL", "slug": "lol", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "d1", "name": "LoL Classic Chat Badge",
+                  "requiredMinutesWatched": 0, "requiredSubs": 1 },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    assert_eq!(c.drops[0].required_subs, 1);
+    assert!(!c.drops[0].is_earnable_by_watching());
+}
+
+/// An ordinary drop must not be mistaken for one.
+#[test]
+fn an_ordinary_drop_needs_no_subscription() {
+    let raw = serde_json::json!({
+        "user": { "dropCampaign": {
+            "id": "c1", "name": "Normal", "status": "ACTIVE",
+            "startAt": "2026-08-01T00:00:00Z", "endAt": "2026-09-01T00:00:00Z",
+            "game": { "id": "g1", "name": "G", "slug": "g", "boxArtURL": null },
+            "self": { "isAccountConnected": true },
+            "timeBasedDrops": [
+                { "id": "d1", "name": "Tier 1", "requiredMinutesWatched": 60 },
+            ],
+        }}
+    });
+    let c = parse_campaign_details(&raw).unwrap().unwrap();
+    assert_eq!(c.drops[0].required_subs, 0);
+    assert!(c.drops[0].is_earnable_by_watching());
+}

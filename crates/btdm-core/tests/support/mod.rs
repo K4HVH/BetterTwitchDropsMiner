@@ -209,5 +209,6 @@ pub fn drop(id: &str, required: u32, current: u32) -> TimedDrop {
         precondition_ids: vec![],
         starts_at: None,
         ends_at: None,
+        required_subs: 0,
     }
 }

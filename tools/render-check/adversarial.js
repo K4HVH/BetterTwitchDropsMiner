@@ -586,14 +586,28 @@ const tab = (label) => {
 
   push(snapshot());
 
+  // The priority list is rendered beside the strategy that reads it, so these
+  // push snapshots with a priority strategy selected.
+  const prioritised = (over = {}) => snapshot({
+    strategy: "priority",
+    strategies: [
+      { name: "deadline", description: "Soonest deadline.", selected: false },
+      { name: "priority", description: "Your order first.", selected: true },
+    ],
+    ...over,
+  });
+
   check("typing survives a burst of twenty snapshots", () => {
-    tab("Settings");
+    push(prioritised());
     const box = doc.querySelector("#priority-input");
+    if (!box) throw new Error("no priority input");
     box.focus();
     box.value = "Half typed";
     box.dispatchEvent(new window.Event("input"));
 
-    for (let i = 0; i < 20; i++) push(snapshot({ totals: { ...snapshot().totals, drops_claimed: i } }));
+    for (let i = 0; i < 20; i++) {
+      push(prioritised({ totals: { ...snapshot().totals, drops_claimed: i } }));
+    }
 
     const after = doc.querySelector("#priority-input");
     if (after.value !== "Half typed") throw new Error(`lost the text: "${after.value}"`);
@@ -601,12 +615,13 @@ const tab = (label) => {
   });
 
   check("the caret does not jump to the end mid-word", () => {
+    push(prioritised());
     const box = doc.querySelector("#priority-input");
     box.focus();
     box.value = "Deadlock";
     box.dispatchEvent(new window.Event("input"));
     box.setSelectionRange(4, 4);
-    push(snapshot());
+    push(prioritised());
     const after = doc.querySelector("#priority-input");
     if (after.selectionStart !== 4) {
       throw new Error(`caret moved to ${after.selectionStart}`);

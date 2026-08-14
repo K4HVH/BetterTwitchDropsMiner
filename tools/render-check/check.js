@@ -236,11 +236,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
   });
 
+  const openSettings = () => {
+    const tab = [...doc.querySelectorAll(".tabs button")].find((b) =>
+      b.textContent.startsWith("Settings"));
+    if (!tab) throw new Error("no Settings tab");
+    tab.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  };
+
   // --- regression: a snapshot arriving mid-typing must not wipe the box ---
   check("typing survives a pushed snapshot", () => {
-    const settings = [...doc.querySelectorAll(".tabs button")].find((b) =>
-      b.textContent.startsWith("Settings"));
-    settings.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    // The priority list lives with the strategy that reads it, so it is only
+    // on screen when one of the priority strategies is selected.
+    const withPriority = JSON.parse(JSON.stringify(s));
+    withPriority.strategies = withPriority.strategies.map((st) => ({
+      ...st, selected: st.name === "priority",
+    }));
+    withPriority.settings.strategy = "priority";
+    window.__es.emit("snapshot", withPriority);
 
     const box = doc.querySelector("#priority-input");
     if (!box) throw new Error("no priority-game input");
@@ -249,7 +261,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     box.dispatchEvent(new window.Event("input"));
 
     // The miner confirms a minute of progress, as it does every heartbeat.
-    const pushed = JSON.parse(JSON.stringify(s));
+    const pushed = JSON.parse(JSON.stringify(withPriority));
     pushed.totals.drops_claimed += 1;
     window.__es.emit("snapshot", pushed);
 
@@ -262,6 +274,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
 
   check("the pin box keeps an edit instead of snapping back", () => {
+    // Pin is a setting, not a right-now action, so it lives on Settings.
+    openSettings();
     const pin = doc.querySelector("#pin-input");
     if (!pin) throw new Error("no pin input");
     pin.value = "somestreamer";
@@ -275,6 +289,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("a snapshot for another account does not rebuild the page", () => {
     const other = JSON.parse(JSON.stringify(s));
     other.account = "second-account";
+    openSettings();
     const box = doc.querySelector("#pin-input");
     box.focus();
     window.__es.emit("snapshot", other);

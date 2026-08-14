@@ -149,9 +149,15 @@
                  background: var(--line); color: var(--muted);
                  border-radius: 999px; padding: 1px 7px; font-weight: 600; }
 
-  /* ---- campaign cards ---- */
-  .cards { display: grid; gap: 14px; margin-top: 16px; }
-  @media (min-width: 720px) { .cards { grid-template-columns: 1fr 1fr; } }
+  /* ---- campaign cards ----
+     Columns rather than a grid. Campaigns have wildly different numbers of
+     tiers — one has nine, the next has one — and in a two-column grid every
+     row is as tall as its tallest card, so a nine-tier campaign left an
+     eight-row hole beside it. Columns let each card take only its own height. */
+  .cards { margin-top: 16px; columns: 1; column-gap: 14px; }
+  @media (min-width: 720px) { .cards { columns: 2; } }
+  @media (min-width: 1500px) { .cards { columns: 3; } }
+  .cards > * { break-inside: avoid; margin-bottom: 14px; }
   .camp { overflow: hidden; display: flex; flex-direction: column; }
   .camp.current { border-color: var(--accent);
                   box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
@@ -224,6 +230,14 @@
   .chip button { border: 0; background: none; padding: 0 4px; color: var(--faint);
                  font-size: 1rem; line-height: 1; }
   .chip button:hover { color: var(--bad); background: none; }
+
+  /* ---- settings ----
+     Two columns, because each of these panels is three lines tall and stacking
+     them one per row made a screen and a half of mostly empty space. */
+  .settings-grid { display: grid; gap: 14px; margin-top: 16px; }
+  @media (min-width: 860px) { .settings-grid { grid-template-columns: 1fr 1fr; } }
+  .setting h2 { margin-top: 0; }
+  .setting.wide { grid-column: 1 / -1; }
 
   .field { display: grid; gap: 5px; margin-bottom: 16px; }
   .field label { font-size: .8rem; font-weight: 600; color: var(--muted); }
@@ -317,6 +331,11 @@
         toast(body.error || `Failed (HTTP ${res.status})`, true);
         return false;
       }
+      // The miner answers with what it actually did. Showing that beats an
+      // optimistic message written here, which could not tell "strategy
+      // changed" from "that strategy was already selected" — and said the
+      // former either way.
+      if (body.message) toast(body.message);
       return true;
     } catch (e) {
       toast("The miner is unreachable", true);
@@ -616,6 +635,82 @@
     return panel;
   }
 
+  /// Whether the selected strategy actually reads the priority list. Showing
+  /// its editor under any other strategy would imply it has an effect.
+  function usesPriority(s) {
+    const chosen = (s.strategies.find((x) => x.selected) || {}).name || "";
+    return chosen.startsWith("priority");
+  }
+
+  /// The ordered game/campaign list the priority strategies rank by. Rendered
+  /// wherever the strategy is chosen, so the setting and its input stay
+  /// together.
+  function priorityEditor(s, chosen) {
+    const acct = s.account;
+    const wrap = el("div", "field");
+    wrap.style.marginTop = "14px";
+    wrap.append(el("label", null, "Priority order"));
+
+    const list = s.settings.priority_games || [];
+    const chips = el("div", "chips");
+    if (!list.length) {
+      const warn = el("div", "hint");
+      warn.style.color = "var(--warn)";
+      warn.textContent = (chosen && chosen.name === "priority-only")
+        ? "Empty — this strategy mines nothing until you add something."
+        : "Empty — nothing is being prioritised yet.";
+      wrap.append(warn);
+    }
+    list.forEach((g, i) => {
+      const chip = el("div", "chip");
+      chip.append(document.createTextNode(`${i + 1}. ${g}`));
+      // Reordering matters more than anything else here: the list *is* the
+      // ranking, and being unable to change it meant removing and retyping.
+      //
+      // Each edit names one entry rather than sending a rewritten list. A
+      // rewritten list is computed from the snapshot on screen, which the
+      // miner may already have moved past — clicking ↑ twice quickly then
+      // discards the first move.
+      if (i > 0) {
+        const up = el("button", null, "↑");
+        up.title = "Move up";
+        up.onclick = () => send(acct, { command: "move_priority_entry", entry: g, up: true });
+        chip.append(up);
+      }
+      if (i < list.length - 1) {
+        const down = el("button", null, "↓");
+        down.title = "Move down";
+        down.onclick = () => send(acct, { command: "move_priority_entry", entry: g, up: false });
+        chip.append(down);
+      }
+      const x = el("button", null, "×");
+      x.title = "Remove";
+      x.onclick = () => send(acct, { command: "remove_priority_entry", entry: g });
+      chip.append(x);
+      chips.append(chip);
+    });
+    chips.style.margin = "8px 0";
+    wrap.append(chips);
+
+    const row = el("div", "row");
+    const add = async (v) => {
+      if (!v) return;
+      if (await send(acct, { command: "add_priority_entry", entry: v })) {
+        clearDraft("priority-input");
+      }
+    };
+    const input = draftInput("priority-input", "Game or campaign name", "", add);
+    input.style.flex = "1 1 160px";
+    const btn = el("button", null, "Add");
+    btn.onclick = () => add(input.value.trim());
+    row.append(input, btn);
+    wrap.append(row);
+    wrap.append(el("div", "hint",
+      "Matched against both game and campaign names, so two campaigns for the " +
+      "same game can be ranked against each other."));
+    return wrap;
+  }
+
   function controlsPanel(s) {
     const panel = el("div", "panel pad");
     const acct = s.account;
@@ -630,39 +725,38 @@
       if (st.selected) o.selected = true;
       sel.append(o);
     });
-    sel.onchange = async () => {
-      if (await send(acct, { command: "set_strategy", name: sel.value })) {
-        toast("Strategy set to " + sel.value);
-      }
-    };
+    sel.onchange = () => send(acct, { command: "set_strategy", name: sel.value });
     f1.append(sel);
     const chosen = s.strategies.find((x) => x.selected);
     f1.append(el("div", "hint", chosen ? chosen.description : ""));
     panel.append(f1);
 
+    // The priority list belongs with the strategy that reads it. It used to
+    // live on the Settings tab, which meant selecting "priority" — a strategy
+    // that mines *nothing* until it has a list — gave you a miner that had
+    // visibly stopped, and no indication that the thing to fix was two tabs
+    // away. Shown here, and only when it is actually consulted.
+    if (usesPriority(s)) panel.append(priorityEditor(s, chosen));
+
     // Buttons
     const acts = el("div", "row");
     const pause = el("button", s.paused ? "primary" : "", s.paused ? "Resume mining" : "Pause mining");
-    pause.onclick = async () => {
-      // The miner applies commands between passes, and a pass that is
-      // gathering candidates can take a few seconds. Saying so beats a button
-      // that appears to do nothing.
-      if (await send(acct, { command: s.paused ? "resume" : "pause" })) {
-        toast(s.paused ? "Resuming…" : "Pausing…");
-      }
-    };
+    // The reply is the miner's own confirmation, sent once it has actually
+    // applied the command, so the toast reports the change rather than
+    // predicting it.
+    pause.onclick = () => send(acct, { command: s.paused ? "resume" : "pause" });
     acts.append(pause);
 
     const sw = el("button", null, "Switch channel");
     sw.disabled = !s.watching;
     sw.onclick = async () => {
-      if (await send(acct, { command: "switch_channel" })) toast("Choosing another channel…");
+      await send(acct, { command: "switch_channel" });
     };
     acts.append(sw);
 
     const sync = el("button", null, "Refresh campaigns");
     sync.onclick = async () => {
-      if (await send(acct, { command: "sync_now" })) toast("Refreshing campaigns…");
+      await send(acct, { command: "sync_now" });
     };
     acts.append(sync);
 
@@ -673,34 +767,6 @@
       acts.append(clear);
     }
     panel.append(acts);
-
-    // Pin
-    const f2 = el("div", "field");
-    f2.style.marginTop = "16px";
-    f2.style.marginBottom = "0";
-    f2.append(el("label", null, "Pinned channel"));
-    const pinRow = el("div", "row");
-    // The draft is only forgotten once the miner has accepted the command;
-    // clearing it first meant a failed submit silently lost what was typed.
-    const submitPin = async (value) => {
-      if (await send(acct, { command: "pin", channel: value || null })) {
-        clearDraft("pin-input");
-      }
-    };
-    const pin = draftInput("pin-input", "channel login", s.settings.pinned, submitPin);
-    pin.style.flex = "1 1 140px";
-    const savePin = el("button", null, "Pin");
-    savePin.onclick = () => submitPin(pin.value.trim());
-    pinRow.append(pin, savePin);
-    if (s.settings.pinned) {
-      const clear = el("button", "tiny", "Clear");
-      clear.onclick = () => send(acct, { command: "pin", channel: null });
-      pinRow.append(clear);
-    }
-    f2.append(pinRow);
-    f2.append(el("div", "hint", "Used by the manual strategy; ignored by the others."));
-    panel.append(f2);
-
     return panel;
   }
 
@@ -750,8 +816,16 @@
     tags.append(el("span", "pill", hours(c.remaining_minutes) + " to go"));
     if (c.live_channels) tags.append(el("span", "pill", plural(c.live_channels, "channel") + " live"));
     else tags.append(el("span", "pill", "nobody live"));
-    if ((c.allowed_channels || []).length) {
-      tags.append(el("span", "pill", `only ${plural(c.allowed_channels.length, "channel")}`));
+    const allowed = (c.allowed_channels || []).length;
+    if (allowed) {
+      // "only 463 channels" is not a restriction anyone recognises as one.
+      // A handful is worth calling out; a directory-sized list is not.
+      const pill = el("span", "pill", allowed <= 12
+        ? `only ${plural(allowed, "channel")}`
+        : `${allowed} specific channels`);
+      pill.title = c.allowed_channels.slice(0, 40).join(", ") +
+        (allowed > 40 ? `, and ${allowed - 40} more` : "");
+      tags.append(pill);
     }
     info.append(tags);
     head.append(info);
@@ -790,14 +864,26 @@
     }
     body.append(name);
 
-    if (benefits.length) {
-      body.append(el("div", "benefits", benefits.map((b) => b.name).join(", ")));
-    }
-    if (!d.is_claimed) body.append(bar(d.percent, d.percent >= 100));
+    // Most drops are named after their only reward, and printing both left
+    // rows reading "Madden Twitch Pack / Madden Twitch Pack".
+    const rewards = benefits.map((b) => b.name).filter((n) => n && n !== d.name);
+    if (rewards.length) body.append(el("div", "benefits", rewards.join(", ")));
+
+    const needsSub = (d.required_subs || 0) > 0;
+    // A progress bar that can never move is worse than no bar: it says the
+    // miner is working on something it will never finish.
+    if (!d.is_claimed && !needsSub) body.append(bar(d.percent, d.percent >= 100));
     row.append(body);
 
     const mins = el("div", "mins");
     if (d.is_claimed) mins.append(el("span", "pill ok", "claimed"));
+    else if (needsSub) {
+      const p = el("span", "pill warn", d.required_subs > 1
+        ? `${d.required_subs} subs` : "needs a sub");
+      p.title = "Twitch gives this for subscribing, not for watching. " +
+                "The miner will never earn it.";
+      mins.append(p);
+    }
     else if (d.claimable) mins.append(el("span", "pill ok", "claiming"));
     else if (d.locked) mins.append(el("span", "pill", "locked"));
     else mins.textContent = `${d.current_minutes}/${d.required_minutes}m`;
@@ -1007,107 +1093,132 @@
     return box;
   }
 
-  function settingsTab(s) {
-    const box = el("div");
-    const acct = s.account;
+  /// A titled panel holding one editable list, so every list on this tab is
+  /// built the same way rather than each growing its own layout.
+  function listPanel(opts) {
+    const p = el("div", "panel pad setting");
+    p.append(el("h2", null, opts.title));
+    p.append(el("div", "sub", opts.blurb));
 
-    // Priority games
-    const p1 = el("div", "panel pad");
-    p1.style.marginTop = "16px";
-    p1.append(el("h2", null, "Priority games"));
-    p1.append(el("div", "sub",
-      "Used by the priority strategy, top to bottom. Anything not listed is never mined under it."));
     const chips = el("div", "chips");
     chips.style.margin = "12px 0";
-    if (!s.settings.priority_games.length) chips.append(el("span", "faint", "Nothing listed yet."));
-    s.settings.priority_games.forEach((g, i) => {
+    if (!opts.items.length) chips.append(el("span", "faint", opts.empty));
+    opts.items.forEach((item) => {
       const chip = el("div", "chip");
-      chip.append(document.createTextNode(`${i + 1}. ${g}`));
+      chip.append(document.createTextNode(item.label));
       const x = el("button", null, "×");
-      x.title = "Remove";
-      x.onclick = () => {
-        const next = s.settings.priority_games.filter((v) => v !== g);
-        send(acct, { command: "set_priority_games", games: next });
-      };
+      x.title = opts.removeTitle || "Remove";
+      x.onclick = () => opts.onRemove(item);
       chip.append(x);
       chips.append(chip);
     });
-    p1.append(chips);
+    p.append(chips);
 
-    const addRow = el("div", "row");
-    const doAdd = async (v) => {
-      if (!v) return;
-      const ok = await send(acct, {
-        command: "set_priority_games",
-        games: [...s.settings.priority_games, v],
-      });
-      if (ok) clearDraft("priority-input");
+    if (opts.onAdd) {
+      const row = el("div", "row");
+      const submit = async (v) => {
+        if (!v) return;
+        if (await opts.onAdd(v)) clearDraft(opts.inputId);
+      };
+      const input = draftInput(opts.inputId, opts.placeholder, "", submit);
+      input.style.flex = "1 1 160px";
+      const btn = el("button", null, opts.addLabel || "Add");
+      btn.onclick = () => submit(input.value.trim());
+      row.append(input, btn);
+      p.append(row);
+    }
+    return p;
+  }
+
+  /// Everything that decides *future* behaviour, in one place.
+  ///
+  /// These lists used to be spread across three surfaces: favourites were
+  /// listed here but only settable from the Live now tab, campaign exclusions
+  /// were only settable from a button on a campaign card and appeared nowhere
+  /// as a list, and the pin sat in the hero next to the pause button. So there
+  /// was no single screen that answered "what have I told this thing to do?",
+  /// and undoing a campaign exclusion meant finding that campaign again among
+  /// a hundred others.
+  function settingsTab(s) {
+    const box = el("div", "settings-grid");
+    const acct = s.account;
+
+    box.append(listPanel({
+      title: "Favourite channels",
+      blurb: "Preferred when the choice is otherwise close, under every strategy. Never overrides a real deadline.",
+      items: (s.settings.favourites || []).map((f) => ({ label: f, value: f })),
+      empty: "None yet — star a channel on the Live now tab, or add one here.",
+      inputId: "fav-input",
+      placeholder: "Channel login",
+      onRemove: (i) => send(acct, { command: "set_favourite", login: i.value, on: false }),
+      onAdd: (v) => send(acct, { command: "set_favourite", login: v, on: true }),
+    }));
+
+    box.append(listPanel({
+      title: "Excluded games",
+      blurb: "Every campaign for these games is skipped.",
+      items: (s.settings.excluded_games || []).map((g) => ({ label: g, value: g })),
+      empty: "None.",
+      inputId: "exclude-input",
+      placeholder: "Game name",
+      addLabel: "Exclude",
+      onRemove: (i) => send(acct, { command: "set_game_excluded", game: i.value, excluded: false }),
+      onAdd: (v) => send(acct, { command: "set_game_excluded", game: v, excluded: true }),
+    }));
+
+    // Campaign exclusions were previously invisible: set from a card, listed
+    // nowhere. An exclusion you cannot see is one you cannot undo.
+    const excluded = s.settings.excluded_campaigns || [];
+    const nameFor = (id) => {
+      const hit = (s.eligible || []).concat(s.rejected || []).find((c) => c.id === id);
+      return hit ? hit.name : id;
     };
-    const gameInput = draftInput(
-      "priority-input", "Game name, exactly as Twitch spells it", "", doAdd);
-    gameInput.style.flex = "1 1 220px";
-    const addBtn = el("button", null, "Add");
-    addBtn.onclick = () => doAdd(gameInput.value.trim());
-    addRow.append(gameInput, addBtn);
-    p1.append(addRow);
-    box.append(p1);
+    box.append(listPanel({
+      title: "Excluded campaigns",
+      blurb: "Skipped individually, whatever their game. Set with the Exclude button on a campaign.",
+      items: excluded.map((id) => ({ label: nameFor(id), value: id })),
+      empty: "None.",
+      onRemove: (i) => send(acct, {
+        command: "set_campaign_excluded", campaign: i.value, excluded: false,
+      }),
+    }));
 
-    // Favourites
-    const p2 = el("div", "panel pad");
-    p2.style.marginTop = "16px";
-    p2.append(el("h2", null, "Favourite channels"));
-    p2.append(el("div", "sub",
-      "Preferred when the choice is otherwise close, under every strategy. Never overrides a real deadline."));
-    const favChips = el("div", "chips");
-    favChips.style.marginTop = "12px";
-    if (!s.settings.favourites.length) favChips.append(el("span", "faint", "None yet — star a channel on the Live now tab."));
-    s.settings.favourites.forEach((f) => {
-      const chip = el("div", "chip");
-      chip.append(document.createTextNode(f));
-      const x = el("button", null, "×");
-      x.onclick = () => send(acct, { command: "set_favourite", login: f, on: false });
-      chip.append(x);
-      favChips.append(chip);
-    });
-    p2.append(favChips);
-    box.append(p2);
-
-    // Excluded games
-    const p3 = el("div", "panel pad");
-    p3.style.marginTop = "16px";
-    p3.append(el("h2", null, "Excluded games"));
-    p3.append(el("div", "sub", "Every campaign for these games is skipped."));
-    const exChips = el("div", "chips");
-    exChips.style.margin = "12px 0";
-    if (!s.settings.excluded_games.length) exChips.append(el("span", "faint", "None."));
-    s.settings.excluded_games.forEach((g) => {
-      const chip = el("div", "chip");
-      chip.append(document.createTextNode(g));
-      const x = el("button", null, "×");
-      x.onclick = () => send(acct, { command: "set_game_excluded", game: g, excluded: false });
-      chip.append(x);
-      exChips.append(chip);
-    });
-    p3.append(exChips);
-
-    const exRow = el("div", "row");
-    const doExclude = async (v) => {
-      if (!v) return;
-      if (await send(acct, { command: "set_game_excluded", game: v, excluded: true })) {
-        clearDraft("exclude-input");
-      }
+    // Pin. Moved off the hero: it configures how channels are chosen, which
+    // is what this tab is for, and it sat next to Pause where it read like an
+    // action rather than a setting.
+    const pinPanel = el("div", "panel pad setting");
+    pinPanel.append(el("h2", null, "Pinned channel"));
+    pinPanel.append(el("div", "sub",
+      "Watch only this channel, under the manual strategy. Ignored by the others."));
+    const pinRow = el("div", "row");
+    pinRow.style.marginTop = "12px";
+    const submitPin = async (value) => {
+      if (await send(acct, { command: "pin", channel: value || null })) clearDraft("pin-input");
     };
-    const exInput = draftInput("exclude-input", "Game name", "", doExclude);
-    exInput.style.flex = "1 1 220px";
-    const exBtn = el("button", null, "Exclude");
-    exBtn.onclick = () => doExclude(exInput.value.trim());
-    exRow.append(exInput, exBtn);
-    p3.append(exRow);
-    box.append(p3);
+    const pin = draftInput("pin-input", "channel login", s.settings.pinned, submitPin);
+    pin.style.flex = "1 1 140px";
+    const savePin = el("button", null, "Pin");
+    savePin.onclick = () => submitPin(pin.value.trim());
+    pinRow.append(pin, savePin);
+    if (s.settings.pinned) {
+      const clear = el("button", "tiny", "Clear");
+      clear.onclick = () => send(acct, { command: "pin", channel: null });
+      pinRow.append(clear);
+    }
+    pinPanel.append(pinRow);
+    if (s.settings.pinned && !(s.settings.strategy || "").startsWith("manual")) {
+      const note = el("div", "hint");
+      note.style.color = "var(--warn)";
+      note.style.marginTop = "8px";
+      note.textContent =
+        `Pinned to ${s.settings.pinned}, but the ${s.settings.strategy} strategy ignores pins. ` +
+        `Switch to manual for it to take effect.`;
+      pinPanel.append(note);
+    }
+    box.append(pinPanel);
 
     // Diagnostics
-    const p4 = el("div", "panel pad");
-    p4.style.marginTop = "16px";
+    const p4 = el("div", "panel pad setting wide");
     p4.append(el("h2", null, "Status"));
     const dl = el("div", "sub");
     const lines = [
