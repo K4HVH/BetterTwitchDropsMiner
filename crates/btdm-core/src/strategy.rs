@@ -152,18 +152,41 @@ pub enum Decision {
 }
 
 /// How much spare time a campaign has: time until its deadline minus the
-/// watching still needed. Negative means it is already impossible.
+/// watching still needed for the best tier still within reach.
+///
+/// Measured against the furthest *achievable* tier rather than the furthest
+/// tier outright. Once the top tier of a long campaign slides out of reach,
+/// ranking the campaign by that tier reports a deficit that no amount of
+/// watching can repay, which under `Deadline` pins it permanently at the front
+/// of the queue while it starves campaigns that can still be finished.
 pub fn slack(campaign: &DropCampaign, now: DateTime<Utc>) -> Duration {
-    let needed = Duration::minutes(eligibility::remaining_minutes_at(campaign, now) as i64);
-    (campaign.ends_at - now) - needed
+    let needed = match eligibility::achievable_minutes_at(campaign, now) {
+        Some(minutes) => minutes,
+        // Nothing left to reach: report the true deficit against everything
+        // still outstanding, so the campaign sorts as the lost cause it is.
+        None => eligibility::remaining_minutes_at(campaign, now),
+    };
+    (campaign.ends_at - now) - Duration::minutes(needed as i64)
 }
 
-/// Whether a campaign can still be finished before it expires.
+/// Whether any unclaimed tier of a campaign can still be finished before it
+/// expires.
 ///
-/// The reference implementation has no such notion and will happily consume
-/// its single watch slot grinding at a campaign that cannot possibly complete.
+/// Deliberately "any", not "all". A drops campaign is a ladder of rewards, and
+/// joining one too late to top it out still wins every rung below. Requiring
+/// the whole ladder made the miner walk away from Twitch's daily Escape from
+/// Tarkov campaign — nine tiers, 540 minutes, a 24-hour window — the moment it
+/// could no longer reach the ninth, abandoning the eight it could.
+///
+/// The reference implementation has no notion of feasibility at all, and will
+/// happily consume its single watch slot grinding at a campaign that cannot
+/// possibly complete.
 pub fn is_feasible(campaign: &DropCampaign, now: DateTime<Utc>) -> bool {
-    slack(campaign, now) >= Duration::zero()
+    // A campaign with nothing outstanding is finished, not impossible. Callers
+    // filter those out separately, and reporting them infeasible here would
+    // relabel every completed campaign as a failure.
+    eligibility::remaining_minutes_at(campaign, now) == 0
+        || eligibility::achievable_minutes_at(campaign, now).is_some()
 }
 
 pub trait MiningStrategy: Send + Sync {
@@ -688,6 +711,95 @@ mod tests {
         // Needs 60 minutes, 3 hours left.
         let ok = campaign("c2", "G", Duration::hours(3), 60);
         assert!(is_feasible(&ok, now()));
+    }
+
+    /// A campaign of cumulative tiers, as Twitch's daily campaigns ship them.
+    fn tiered(id: &str, ends_in: Duration, tiers: &[u32]) -> DropCampaign {
+        let mut c = campaign(id, "G", ends_in, 0);
+        c.drops = tiers
+            .iter()
+            .enumerate()
+            .map(|(i, minutes)| TimedDrop {
+                id: DropId::from(&format!("{id}-d{i}")[..]),
+                name: format!("Drop {}", i + 1),
+                benefits: vec![],
+                required_minutes: *minutes,
+                current_minutes: 0,
+                claim_id: None,
+                is_claimed: false,
+                precondition_ids: vec![],
+                starts_at: None,
+                ends_at: None,
+                required_subs: 0,
+            })
+            .collect();
+        c
+    }
+
+    /// Twitch's daily Escape from Tarkov campaign, joined part-way through:
+    /// nine cumulative tiers up to 540 minutes, with 522 minutes left on the
+    /// clock. The ninth tier is gone; the other eight are all still winnable.
+    ///
+    /// This was treated as impossible, so the campaign never reached `wants`,
+    /// no directory query was ever made for it, and the dashboard reported
+    /// nobody live on a game with thirty drops-enabled streamers.
+    #[test]
+    fn a_campaign_is_feasible_while_any_tier_is_still_reachable() {
+        let tiers = [60, 120, 180, 240, 300, 360, 420, 480, 540];
+        let c = tiered("tarkov", Duration::minutes(522), &tiers);
+
+        assert!(
+            is_feasible(&c, now()),
+            "eight of nine tiers are still winnable"
+        );
+        assert_eq!(
+            eligibility::achievable_minutes_at(&c, now()),
+            Some(480),
+            "the furthest tier still inside the window"
+        );
+        assert_eq!(
+            slack(&c, now()),
+            Duration::minutes(42),
+            "spare time is measured against the tier still in reach, not the one already lost"
+        );
+    }
+
+    /// The guard rail: "any tier" must not decay into "no check at all".
+    #[test]
+    fn a_campaign_whose_cheapest_tier_is_out_of_reach_is_still_infeasible() {
+        let c = tiered("late", Duration::minutes(59), &[60, 120, 180]);
+        assert!(!is_feasible(&c, now()));
+        assert!(slack(&c, now()) < Duration::zero());
+    }
+
+    /// Partial progress counts: the same campaign with two tiers already
+    /// claimed needs less watching, so more of it stays in reach.
+    #[test]
+    fn claimed_tiers_do_not_count_against_what_is_still_reachable() {
+        let tiers = [60, 120, 180, 240, 300, 360, 420, 480, 540];
+        let mut c = tiered("tarkov", Duration::minutes(522), &tiers);
+        for drop in c.drops.iter_mut().take(2) {
+            drop.is_claimed = true;
+        }
+        // 173 minutes already banked against every remaining cumulative tier.
+        for drop in &mut c.drops {
+            drop.current_minutes = 173;
+        }
+        assert_eq!(
+            eligibility::achievable_minutes_at(&c, now()),
+            Some(367),
+            "540 total less the 173 already watched now fits inside 522 minutes"
+        );
+        assert!(is_feasible(&c, now()));
+    }
+
+    /// A finished campaign is complete, not impossible. Reporting it
+    /// infeasible would relabel every success as a failure.
+    #[test]
+    fn a_fully_claimed_campaign_is_feasible_rather_than_impossible() {
+        let mut c = campaign("done", "G", Duration::minutes(1), 600);
+        c.drops[0].is_claimed = true;
+        assert!(is_feasible(&c, now()));
     }
 
     #[test]

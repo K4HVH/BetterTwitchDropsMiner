@@ -163,6 +163,39 @@ pub fn remaining_minutes_at(campaign: &DropCampaign, now: DateTime<Utc>) -> u32 
         .unwrap_or(0)
 }
 
+/// The cost of the furthest tier that can *still* be reached before the
+/// campaign closes. `None` when not even the cheapest one can.
+///
+/// A drops campaign is not all-or-nothing, and treating it that way threw
+/// real rewards away. Twitch's daily Escape from Tarkov campaign offers nine
+/// cumulative tiers up to 540 minutes inside a 24-hour window; joining it with
+/// 522 minutes left made [`remaining_minutes_at`] report 540, which is the
+/// cost of the *ninth* tier, so the campaign was declared impossible and
+/// skipped entirely. Eight tiers — everything up to 480 minutes — were sitting
+/// there to be won, and the miner never so much as asked who was streaming it.
+///
+/// Measuring against the best still-reachable tier answers the question that
+/// actually matters, and keeps the deadline pressure honest: once a tier
+/// slides out of reach the campaign stops being ranked by an outcome that is
+/// already lost.
+pub fn achievable_minutes_at(campaign: &DropCampaign, now: DateTime<Utc>) -> Option<u32> {
+    campaign
+        .drops
+        .iter()
+        .filter(|d| !d.is_claimed)
+        .filter(|d| d.is_earnable_by_watching())
+        .filter(|d| !d.window_has_closed(now))
+        .filter_map(|d| {
+            // A tier that closes before the campaign does is bounded by its own
+            // window, not the campaign's.
+            let deadline = d.ends_at.unwrap_or(campaign.ends_at).min(campaign.ends_at);
+            let budget = u32::try_from((deadline - now).num_minutes()).ok()?;
+            let needed = total_remaining_minutes(campaign, d);
+            (needed <= budget).then_some(needed)
+        })
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
