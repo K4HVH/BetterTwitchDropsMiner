@@ -4,6 +4,7 @@
 //! script failure scenarios that are impossible to trigger against the real API.
 
 use crate::model::*;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
@@ -25,6 +26,30 @@ pub struct DropProgress {
     pub required_minutes: u32,
 }
 
+/// One look at the account's inventory.
+///
+/// The claimed-benefit ledger arrives in the same response as the campaigns
+/// and is the only durable record of what the account already owns, so the two
+/// travel together rather than costing a second request.
+#[derive(Debug, Clone, Default)]
+pub struct Inventory {
+    /// Campaigns with in-progress or claimable drops for this account.
+    pub campaigns: Vec<DropCampaign>,
+    /// Benefit id to when Twitch last awarded it. Covers the whole account
+    /// history, not just the campaigns above.
+    pub awarded: std::collections::HashMap<String, DateTime<Utc>>,
+}
+
+impl Inventory {
+    /// The campaigns alone, for callers with no use for the ledger.
+    pub fn just_campaigns(campaigns: Vec<DropCampaign>) -> Self {
+        Self {
+            campaigns,
+            awarded: std::collections::HashMap::new(),
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait TwitchApi: Send + Sync {
     /// Every campaign Twitch offers this account, whether or not it has been
@@ -32,8 +57,9 @@ pub trait TwitchApi: Send + Sync {
     /// had already begun.
     async fn fetch_campaigns(&self) -> Result<Vec<DropCampaign>, ApiError>;
 
-    /// Campaigns with in-progress or claimable drops for this account.
-    async fn fetch_inventory(&self) -> Result<Vec<DropCampaign>, ApiError>;
+    /// Campaigns with in-progress or claimable drops, plus the account's
+    /// claimed-benefit ledger.
+    async fn fetch_inventory(&self) -> Result<Inventory, ApiError>;
 
     /// Full detail for one campaign: drop tiers, allow-list and link status.
     async fn campaign_details(&self, id: &CampaignId) -> Result<Option<DropCampaign>, ApiError>;

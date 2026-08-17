@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use btdm_core::api::{ApiError, DropProgress, TwitchApi};
+use btdm_core::api::{ApiError, DropProgress, Inventory, TwitchApi};
 use btdm_core::model::*;
 use chrono::TimeZone;
 use std::collections::HashMap;
@@ -13,6 +13,10 @@ use std::sync::Mutex;
 pub struct FakeTwitch {
     /// Campaigns already in progress, with full drop detail.
     pub inventory: Mutex<Vec<DropCampaign>>,
+    /// Twitch's claimed-benefit ledger: benefit id to when it was awarded.
+    /// Covers the whole account, including campaigns long gone from the
+    /// in-progress inventory.
+    pub awarded: Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     /// Campaigns the dashboard offers, typically without drop detail.
     pub offered: Mutex<Vec<DropCampaign>>,
     /// Full detail keyed by campaign ID, as returned by the details query.
@@ -65,9 +69,12 @@ impl TwitchApi for FakeTwitch {
         Ok(self.offered.lock().unwrap().clone())
     }
 
-    async fn fetch_inventory(&self) -> Result<Vec<DropCampaign>, ApiError> {
+    async fn fetch_inventory(&self) -> Result<Inventory, ApiError> {
         self.guard()?;
-        Ok(self.inventory.lock().unwrap().clone())
+        Ok(Inventory {
+            campaigns: self.inventory.lock().unwrap().clone(),
+            awarded: self.awarded.lock().unwrap().clone(),
+        })
     }
 
     async fn campaign_details(&self, id: &CampaignId) -> Result<Option<DropCampaign>, ApiError> {

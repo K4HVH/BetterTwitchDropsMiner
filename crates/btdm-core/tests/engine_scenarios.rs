@@ -87,6 +87,94 @@ async fn starts_a_campaign_that_is_not_yet_in_the_inventory() {
     assert!(selected.is_some(), "a brand-new campaign must be minable");
 }
 
+/// Twitch drops a campaign from the in-progress inventory once its tiers are
+/// claimed, and the dashboard and detail queries then report it as untouched:
+/// zero minutes, nothing claimed. Only the `gameEventDrops` ledger remembers.
+///
+/// Taken from life. R6S Year 11 Season 2's "EXPECTED FEAST" MP5SD was awarded
+/// on 2026-08-11; six days later the dashboard still offered the campaign and
+/// `DropCampaignDetails` still swore the tier was unclaimed at 0 of 180
+/// minutes. The ledger was fetched on every sync and only ever applied to
+/// inventory campaigns — which, this one having left the inventory, meant it
+/// was never applied to the campaign that needed it. The miner would have
+/// spent three hours re-earning a skin the account already owned.
+#[tokio::test]
+async fn a_tier_already_awarded_is_not_mined_again() {
+    let fake = FakeTwitch::default();
+    let mut drop_with_benefit = drop("d1", 180, 0);
+    drop_with_benefit.benefits = vec![Benefit {
+        id: "b-expected-feast".into(),
+        name: "\"EXPECTED FEAST\" MP5SD".into(),
+        kind: BenefitKind::Entitlement,
+        image_url: None,
+    }];
+    // Dashboard-and-details only. The inventory does not have it.
+    *fake.offered.lock().unwrap() = vec![campaign("c-r6", true, vec![])];
+    fake.details.lock().unwrap().insert(
+        "c-r6".into(),
+        campaign("c-r6", true, vec![drop_with_benefit]),
+    );
+    fake.awarded.lock().unwrap().insert(
+        "b-expected-feast".into(),
+        Utc.with_ymd_and_hms(2026, 8, 11, 9, 33, 41).unwrap(),
+    );
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    // Recognising the tier as owned leaves the campaign with nothing to mine,
+    // so it drops out of the eligible set rather than sitting there offering
+    // three hours of work for a reward already in the account.
+    assert!(
+        e.campaigns().is_empty(),
+        "the ledger must reach campaigns that arrive from the dashboard, not just the inventory"
+    );
+    let snap = e.snapshot("default", Some("k4hvh"), now());
+    let reason = snap
+        .rejected
+        .iter()
+        .find(|r| r.id == "c-r6")
+        .map(|r| r.reason.clone());
+    assert_eq!(
+        reason.as_deref(),
+        Some(RejectReason::AllDropsClaimed.label()),
+        "and it must say why, rather than the campaign silently vanishing"
+    );
+}
+
+/// The guard rail on the above. Twitch reuses benefit ids across reruns of a
+/// campaign, so a skin won last season must not mark this season's identical
+/// tier claimed — that would skip a campaign that is genuinely available.
+#[tokio::test]
+async fn a_benefit_awarded_before_this_campaign_began_does_not_count() {
+    let fake = FakeTwitch::default();
+    let mut tier = drop("d1", 180, 0);
+    tier.benefits = vec![Benefit {
+        id: "b-reused".into(),
+        name: "Same skin, new season".into(),
+        kind: BenefitKind::Entitlement,
+        image_url: None,
+    }];
+    *fake.offered.lock().unwrap() = vec![campaign("c-rerun", true, vec![])];
+    fake.details
+        .lock()
+        .unwrap()
+        .insert("c-rerun".into(), campaign("c-rerun", true, vec![tier]));
+    // The campaign helper runs 2026-08-01 to 2026-09-01; this is last year.
+    fake.awarded.lock().unwrap().insert(
+        "b-reused".into(),
+        Utc.with_ymd_and_hms(2025, 8, 11, 9, 33, 41).unwrap(),
+    );
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    assert!(
+        !e.campaigns()[0].drops[0].is_claimed,
+        "an award from a previous run of the campaign proves nothing about this one"
+    );
+}
+
 #[tokio::test]
 async fn does_not_refetch_details_for_campaigns_already_in_the_inventory() {
     let fake = happy_path();

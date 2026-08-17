@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 macro_rules! id_type {
     ($($name:ident),* $(,)?) => {$(
@@ -191,6 +192,52 @@ impl DropCampaign {
         }
         if self.game.slug.is_empty() {
             self.game.slug = other.game.slug.clone();
+        }
+    }
+
+    /// Marks tiers already awarded to this account as claimed, using Twitch's
+    /// `gameEventDrops` ledger.
+    ///
+    /// Twitch answers "have I claimed this?" in two places that disagree. A
+    /// campaign's own `self.isClaimed` only tracks claims made while the
+    /// campaign sat in the account's in-progress inventory; once it leaves —
+    /// which happens as soon as every tier is claimed — a fresh look at the
+    /// campaign reports zero minutes and nothing claimed. The ledger is the
+    /// durable record.
+    ///
+    /// Live example: the "EXPECTED FEAST" MP5SD from R6S Year 11 Season 2 was
+    /// awarded on 2026-08-11 and sits in the ledger, while the campaign query
+    /// swore it was unclaimed at 0 of 180 minutes. Believing the campaign meant
+    /// offering to spend three hours re-earning a reward the account already
+    /// owned.
+    ///
+    /// A benefit counts only when it was awarded inside the tier's own window.
+    /// Twitch reuses benefit ids across reruns of a campaign, so without that
+    /// check a skin won last season would mark this season's identical tier
+    /// claimed and the campaign would be skipped outright.
+    pub fn mark_claimed_from_ledger(&mut self, awarded: &HashMap<String, DateTime<Utc>>) {
+        if awarded.is_empty() {
+            return;
+        }
+        let (campaign_start, campaign_end) = (self.starts_at, self.ends_at);
+        for drop in &mut self.drops {
+            // A tier with no benefits has nothing to look up, and one already
+            // known claimed needs no help.
+            if drop.is_claimed || drop.benefits.is_empty() {
+                continue;
+            }
+            let from = drop.starts_at.unwrap_or(campaign_start);
+            let until = drop.ends_at.unwrap_or(campaign_end);
+            // Every benefit, not any: a tier granting three items is earned
+            // only when all three were handed over.
+            let all_awarded = drop.benefits.iter().all(|b| {
+                awarded
+                    .get(&b.id)
+                    .is_some_and(|at| *at >= from && *at < until)
+            });
+            if all_awarded {
+                drop.is_claimed = true;
+            }
         }
     }
 

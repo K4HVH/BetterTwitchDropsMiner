@@ -11,7 +11,14 @@ fn fixture(name: &str) -> serde_json::Value {
 }
 
 fn inventory() -> Vec<DropCampaign> {
-    parse_inventory(&fixture("inventory")).unwrap()
+    let inv = parse_inventory(&fixture("inventory")).unwrap();
+    let mut campaigns = inv.campaigns;
+    // As `Engine::sync` does: the ledger arrives alongside the campaigns and
+    // is applied to them before anything else looks at a claim flag.
+    for c in &mut campaigns {
+        c.mark_claimed_from_ledger(&inv.awarded);
+    }
+    campaigns
 }
 
 #[test]

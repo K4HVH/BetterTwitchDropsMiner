@@ -1393,10 +1393,10 @@ impl<A: TwitchApi> Engine<A> {
     /// Using only the inventory — which is the obvious shortcut — yields a
     /// miner that can continue campaigns but can never begin one.
     pub async fn sync(&mut self, now: DateTime<Utc>) -> Result<(), ApiError> {
-        let mut merged: HashMap<CampaignId, DropCampaign> = self
-            .api
-            .fetch_inventory()
-            .await?
+        let inventory = self.api.fetch_inventory().await?;
+        let awarded = inventory.awarded;
+        let mut merged: HashMap<CampaignId, DropCampaign> = inventory
+            .campaigns
             .into_iter()
             .map(|c| (c.id.clone(), c))
             .collect();
@@ -1494,6 +1494,37 @@ impl<A: TwitchApi> Engine<A> {
             if let Some(from_list) = listed.get(id) {
                 campaign.fill_presentation_from(from_list);
             }
+        }
+
+        // Reconcile every campaign against what the account already owns.
+        //
+        // Applied here rather than at the parse boundary because it has to
+        // reach campaigns from all three sources. Twitch removes a campaign
+        // from the in-progress inventory once its tiers are claimed, so the
+        // fully-claimed ones come back through the dashboard and detail
+        // queries — which report them as untouched, zero minutes watched. Those
+        // are exactly the campaigns the ledger exists to correct, and exactly
+        // the ones it never used to see.
+        let before: usize = merged
+            .values()
+            .flat_map(|c| &c.drops)
+            .filter(|d| d.is_claimed)
+            .count();
+        for campaign in merged.values_mut() {
+            campaign.mark_claimed_from_ledger(&awarded);
+        }
+        let recovered: usize = merged
+            .values()
+            .flat_map(|c| &c.drops)
+            .filter(|d| d.is_claimed)
+            .count()
+            - before;
+        if recovered > 0 {
+            tracing::debug!(
+                recovered,
+                ledger = awarded.len(),
+                "tiers already owned, per the awarded-benefit ledger"
+            );
         }
 
         let total = merged.len();

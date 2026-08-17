@@ -5,7 +5,7 @@
 //! mysterious runtime behaviour.
 
 use crate::TwitchError;
-use btdm_core::api::DropProgress;
+use btdm_core::api::{DropProgress, Inventory};
 use btdm_core::model::*;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -253,43 +253,18 @@ fn campaign_list(data: &Value, path: &[&str]) -> Result<Vec<DropCampaign>, Twitc
     Ok(out)
 }
 
-pub fn parse_inventory(data: &Value) -> Result<Vec<DropCampaign>, TwitchError> {
-    let mut campaigns =
-        campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])?;
-
-    // Cross-reference the claimed-benefit ledger.
-    //
-    // `gameEventDrops` was requested and thrown away. It matters because a
-    // campaign whose detail response carries no `self` edge parses as
-    // "unclaimed, zero minutes", so an already-claimed drop is mined all over
-    // again. If every one of a drop's benefits was awarded inside that drop's
-    // own window, it has been claimed.
-    let awarded = claimed_benefits(data);
-    if !awarded.is_empty() {
-        for campaign in &mut campaigns {
-            let window = (campaign.starts_at, campaign.ends_at);
-            for drop in &mut campaign.drops {
-                if drop.is_claimed || drop.benefits.is_empty() {
-                    continue;
-                }
-                let from = drop.starts_at.unwrap_or(window.0);
-                let until = drop.ends_at.unwrap_or(window.1);
-                let all_awarded = drop.benefits.iter().all(|b| {
-                    awarded
-                        .get(&b.id)
-                        .is_some_and(|at| *at >= from && *at < until)
-                });
-                if all_awarded {
-                    tracing::debug!(
-                        drop = %drop.id,
-                        "inferred claimed from the awarded-benefit ledger"
-                    );
-                    drop.is_claimed = true;
-                }
-            }
-        }
-    }
-    Ok(campaigns)
+/// The in-progress campaigns and the claimed-benefit ledger from one response.
+///
+/// The ledger is returned rather than applied here. It describes the *account*,
+/// not these campaigns, and the campaigns that most need it — the ones already
+/// fully claimed, which Twitch drops from the in-progress list — are precisely
+/// the ones absent from this response. Applying it at the parse boundary meant
+/// it only ever reached campaigns that had least use for it.
+pub fn parse_inventory(data: &Value) -> Result<Inventory, TwitchError> {
+    Ok(Inventory {
+        campaigns: campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])?,
+        awarded: claimed_benefits(data),
+    })
 }
 
 /// Benefit id to when it was last awarded.
@@ -650,6 +625,18 @@ mod ledger_tests {
         })
     }
 
+    /// Parses, then reconciles against the ledger exactly as `Engine::sync`
+    /// does — the two halves live in different crates now, so the seam between
+    /// them is worth exercising rather than each side alone.
+    fn reconciled(data: &Value) -> Vec<DropCampaign> {
+        let inv = parse_inventory(data).unwrap();
+        let mut campaigns = inv.campaigns;
+        for c in &mut campaigns {
+            c.mark_claimed_from_ledger(&inv.awarded);
+        }
+        campaigns
+    }
+
     /// A campaign whose detail response carries no `self` edge parses as
     /// "unclaimed, zero minutes", so an already-claimed drop is mined all over
     /// again. The awarded-benefit ledger is how Twitch's own client knows
@@ -660,7 +647,7 @@ mod ledger_tests {
             json!([tier("d1", "b1")]),
             json!([{ "id": "b1", "lastAwardedAt": "2026-08-05T12:00:00Z" }]),
         );
-        let campaigns = parse_inventory(&data).unwrap();
+        let campaigns = reconciled(&data);
         assert!(campaigns[0].drops[0].is_claimed);
     }
 
@@ -672,7 +659,7 @@ mod ledger_tests {
             json!([tier("d1", "b1")]),
             json!([{ "id": "b1", "lastAwardedAt": "2020-01-01T00:00:00Z" }]),
         );
-        let campaigns = parse_inventory(&data).unwrap();
+        let campaigns = reconciled(&data);
         assert!(!campaigns[0].drops[0].is_claimed);
     }
 
@@ -688,7 +675,7 @@ mod ledger_tests {
             json!([two]),
             json!([{ "id": "b1", "lastAwardedAt": "2026-08-05T12:00:00Z" }]),
         );
-        let campaigns = parse_inventory(&data).unwrap();
+        let campaigns = reconciled(&data);
         assert!(!campaigns[0].drops[0].is_claimed);
     }
 
@@ -697,7 +684,7 @@ mod ledger_tests {
         for ledger in [json!([]), json!(null), json!("nonsense"),
                        json!([{ "id": "b1" }, { "lastAwardedAt": "x" }])] {
             let data = inventory(json!([tier("d1", "b1")]), ledger);
-            let campaigns = parse_inventory(&data).unwrap();
+            let campaigns = reconciled(&data);
             assert!(!campaigns[0].drops[0].is_claimed);
         }
     }
@@ -711,7 +698,7 @@ mod ledger_tests {
             json!([t]),
             json!([{ "id": "b1", "lastAwardedAt": "2020-01-01T00:00:00Z" }]),
         );
-        let campaigns = parse_inventory(&data).unwrap();
+        let campaigns = reconciled(&data);
         assert!(!campaigns[0].drops[0].is_claimed);
         assert_eq!(campaigns[0].drops[0].current_minutes, 10);
     }
@@ -722,7 +709,7 @@ mod ledger_tests {
         t["startAt"] = json!("2026-08-10T00:00:00Z");
         t["endAt"] = json!("2026-08-12T00:00:00Z");
         let data = inventory(json!([t]), json!([]));
-        let campaigns = parse_inventory(&data).unwrap();
+        let campaigns = reconciled(&data);
         assert!(campaigns[0].drops[0].starts_at.is_some());
         assert!(campaigns[0].drops[0].ends_at.is_some());
     }

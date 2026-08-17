@@ -6,7 +6,7 @@ use crate::TwitchError;
 use crate::operations as ops;
 use crate::parse;
 use crate::watch::WatchClient;
-use btdm_core::api::{ApiError, DropProgress, TwitchApi};
+use btdm_core::api::{ApiError, DropProgress, Inventory, TwitchApi};
 use btdm_core::model::*;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -66,7 +66,7 @@ impl TwitchApi for TwitchClient {
         Ok(parse::parse_campaigns(&data)?)
     }
 
-    async fn fetch_inventory(&self) -> Result<Vec<DropCampaign>, ApiError> {
+    async fn fetch_inventory(&self) -> Result<Inventory, ApiError> {
         let data = self.gql.run(&ops::INVENTORY, json!({})).await?;
         Ok(parse::parse_inventory(&data)?)
     }
