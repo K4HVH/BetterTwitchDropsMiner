@@ -17,6 +17,9 @@ Account `k4hvh` (530826710), repeatedly, over the course of the work:
 - Campaign switching, the feasibility filter abandoning an impossible campaign
   unprompted, the recovery ladder firing at exactly 360s on a non-earning
   channel
+- Every claim the dashboard makes checked back against Twitch across 11
+  campaigns and 40 tiers — status, windows, allow-lists, requirements,
+  progress, claims and the totals — with no disagreements
 - The dashboard serving snapshots, pushing them over SSE, and applying commands
   — strategy changed from the CLI took effect in under a second and was written
   back to `config.toml`
@@ -75,6 +78,27 @@ history rewritten, verified absent from every object). The dashboard bearer
 token generated from `RandomState::hash_one`, which is seeded for hash-flooding
 resistance rather than secrecy.
 
+**From auditing the dashboard against Twitch.** Four defects, all of which
+looked like working software from every angle except Twitch's:
+
+- The awarded-benefit ledger applied only to campaigns already in the
+  inventory, which are the ones that least need it — see *What Twitch changed
+  under us*. 24½ hours of watching queued for rewards already owned.
+- Feasibility was all-or-nothing: a campaign whose *last* tier had slipped out
+  of reach was dropped from `wants` entirely, so no directory query was ever
+  made for it. Twitch's daily Tarkov campaign — nine tiers, 540 minutes, a
+  24-hour window — was abandoned with 522 minutes left and eight tiers still
+  winnable. Feasibility now asks whether *any* tier is reachable, and slack is
+  measured against the furthest one that is, so a campaign is never ranked by
+  an outcome already lost.
+- `live_channels` was a bare count in which zero meant both "nobody is
+  streaming this" and "we never looked" — the second being what a paused miner
+  reported for everything it had. It is an `Option` now, and the page says
+  "not checked" rather than asserting something nobody checked.
+- The same count was clamped by `max_channels_per_campaign`, a budget for how
+  many channels are worth *verifying*, so a game with thirty drops-enabled
+  streamers live reported eight.
+
 ## Not built
 
 Honest list of what a serious miner could do that this does not.
@@ -123,10 +147,42 @@ was written — the API moved.
   not currently challenged; nothing implements the integrity handshake, and if
   Twitch starts challenging in earnest campaign discovery stops working. This
   is the most likely thing to break next.
+- **A campaign's own `self.isClaimed` is not a record of what you own.** It
+  tracks claims made while the campaign sits in the in-progress inventory, and
+  a campaign leaves that list as soon as every tier is claimed. Ask about it
+  afterwards through the dashboard or detail query and Twitch reports it
+  untouched: zero minutes watched, nothing claimed. Verified against the live
+  account on five campaigns at once — R6S Year 11 Season 2 reported its MP5SD
+  unclaimed at 0 of 180 minutes six days after awarding it, and the day's
+  Escape from Tarkov campaign reported all nine tiers unclaimed the morning
+  after winning them hourly from 14:07 to 22:21.
+
+  `gameEventDrops` is the durable record. It is the account's whole
+  awarded-benefit history, so it must be matched against each tier's own
+  window: Twitch reuses benefit ids across reruns of a campaign, and without
+  the window check a skin won last season marks this season's identical tier
+  claimed. Daily campaigns like Tarkov's mint fresh benefit ids per day, so the
+  check is belt-and-braces there, but the seasonal ones do not.
+
+  Cost of getting this wrong, measured: 5 of 16 supposedly-mineable campaigns
+  were already finished, and the miner had 24½ hours of watching queued for
+  rewards the account already owned.
 
 ## Test coverage, and where it is thin
 
-491 Rust tests and 123 dashboard checks, no clippy warnings.
+503 Rust tests and 127 dashboard checks, no clippy warnings, plus a live audit
+against Twitch itself (`tools/audit-live/`).
+
+**The check that was missing entirely.** Everything above asks whether the
+miner does what it intends. Nothing asked whether what it believes is *true*,
+and that is where the worst bugs sat: every layer faithfully relaying a wrong
+answer, all tests green. `tools/audit-live/audit.py` puts the dashboard's
+claims back to Twitch — status, windows, allow-lists, per-tier requirements and
+progress, each tier's claimed state cross-checked three ways, and the
+arithmetic each card asserts about itself — and exits non-zero on any
+disagreement. It is verified falsifiable: corrupting a snapshot six different
+ways is caught six times out of six, and the README says how to re-confirm
+that.
 
 Well covered: the whole binary end to end against a fake Twitch, the engine
 against a scripted one (100+ scenarios), hostile data at every layer, strategies,
@@ -172,3 +228,13 @@ The lesson generalises: a fake that only ever returns the useful answer tests
 the happy path twice and the real world never. The same blind spot hid the
 campaign artwork bug (fixtures always carried box art in both responses) and
 the subscription rewards (no fixture had `requiredSubs`).
+
+**And the sharper version of it.** A fake cannot disagree with itself. Both of
+the fixes above turned on Twitch giving two different answers to the same
+question — `isClaimed` against `gameEventDrops`, the campaign list against the
+detail response — and no fixture built from one observed shape can express
+that. The feasibility bug was the mirror image: not a wrong answer from
+Twitch, but a question the miner declined to ask, and the resulting "nobody
+live" was indistinguishable from a true one because a count of zero meant both
+things. Tests that only see what the miner sends cannot catch either. That is
+what `tools/audit-live/` is for.
