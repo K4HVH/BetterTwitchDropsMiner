@@ -37,6 +37,21 @@ For every campaign the dashboard currently calls mineable:
 | each card | slack against its own deadline, at-risk against slack |
 | the totals | against the rows they summarise |
 
+And for every campaign it *refuses* to mine:
+
+| | |
+|---|---|
+| `all claimed` | every tier checked against the awarded-benefit ledger |
+| `not linked` | against Twitch's `isAccountConnected` |
+| `ended` | against the campaign's own window |
+| `needs a sub` | against each tier's `requiredSubs` |
+
+The refusals matter more than the rows. A wrong row is on screen where someone
+might notice it; a campaign wrongly written off is not on screen at all, so
+nothing draws the eye to hours of rewards being skipped. This is also the
+direction an over-eager reading of the ledger would fail in, which is exactly
+the risk the ledger fix introduced.
+
 It is read-only, and changes nothing about the running miner. Exit status is
 non-zero when anything disagrees.
 
@@ -64,4 +79,5 @@ print(A.audit(snap, A.Twitch(A.default_data_dir()))[0])
 
 Flipping a claim flag, inventing an allow-list entry, adding a tier Twitch
 does not list, breaking the slack arithmetic and contradicting the totals are
-all caught the same way.
+all caught the same way — as is moving a perfectly mineable campaign into the
+rejected list under any of the four reasons.

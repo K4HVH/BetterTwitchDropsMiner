@@ -20,6 +20,13 @@ mineable, and compares field by field:
   * the arithmetic each card asserts about itself: slack against the deadline,
     the at-risk flag against slack, and the totals against the rows
 
+Then it audits the refusals, which is the direction that actually costs
+rewards. A wrong row is on the screen where someone might notice it; a campaign
+wrongly written off is not on the screen at all. Every rejection has to justify
+itself to Twitch — "all claimed" against the ledger tier by tier, "not linked"
+against `isAccountConnected`, "ended" against the campaign's own window, and
+"needs a sub" against `requiredSubs`.
+
 Usage:
 
     python3 tools/audit-live/audit.py [dashboard-url] [--data-dir DIR]
@@ -54,7 +61,8 @@ DETAIL = """query DropCampaignDetails($dropID: ID!, $channelLogin: String!) {
   user(login: $channelLogin) { dropCampaign(id: $dropID) {
     id name status startAt endAt game { id name slug }
     allow { channels { id name displayName } }
-    timeBasedDrops { id name requiredMinutesWatched startAt endAt
+    self { isAccountConnected }
+    timeBasedDrops { id name requiredMinutesWatched requiredSubs startAt endAt
       self { currentMinutesWatched isClaimed }
       benefitEdges { benefit { id } } } } } }"""
 
@@ -212,6 +220,56 @@ def audit(snapshot, twitch):
         check(c["at_risk"] == (c["slack_minutes"] < AT_RISK_SLACK_MINUTES),
               f"[{name}] at_risk={c['at_risk']} with {c['slack_minutes']} minutes of slack")
 
+    # Every refusal has to be justified too.
+    #
+    # Checking only what the miner offers audits the safe direction. Work it
+    # silently declines is the dangerous one: nothing on the page draws
+    # attention to a campaign that was wrongly written off, so a bad rejection
+    # is invisible in a way a bad row is not. "All claimed" in particular is
+    # exactly where an over-eager reading of the awarded-benefit ledger would
+    # show up, and it would cost real rewards.
+    for r in snapshot["rejected"]:
+        data = twitch.query(
+            DETAIL, {"dropID": r["id"], "channelLogin": twitch.login}, "DropCampaignDetails"
+        )
+        remote = (data.get("user") or {}).get("dropCampaign")
+        if not remote:
+            continue
+        name = remote["name"].strip()
+        running = when(remote["startAt"]) <= now < when(remote["endAt"])
+        linked = (remote.get("self") or {}).get("isAccountConnected")
+        reason = r["reason"]
+
+        if reason == "all claimed":
+            for tier in remote["timeBasedDrops"]:
+                tiers_seen += 1
+                opens = when(tier["startAt"]) if tier.get("startAt") else when(remote["startAt"])
+                closes = when(tier["endAt"]) if tier.get("endAt") else when(remote["endAt"])
+                benefits = [e["benefit"]["id"] for e in tier["benefitEdges"]]
+                state = tier.get("self") or {}
+                watched, claimed_here = known.get(tier["id"], (0, False))
+                owned = bool(state.get("isClaimed")) or claimed_here or (
+                    bool(benefits)
+                    and all(b in ledger and opens <= ledger[b] < closes for b in benefits)
+                )
+                check(owned,
+                      f"[{name}/{tier['name'].strip()}] skipped as already claimed, but Twitch "
+                      f"has no award for it — {tier['requiredMinutesWatched']} min of rewards "
+                      f"being thrown away")
+        elif reason == "not linked":
+            check(not linked, f"[{name}] skipped as unlinked, but Twitch says the account is linked")
+        elif reason == "ended":
+            check(not running, f"[{name}] skipped as ended, but Twitch says it is still running")
+        elif reason == "needs a sub":
+            watchable = [
+                t for t in remote["timeBasedDrops"]
+                if not (t.get("requiredSubs") or 0)
+                and not (t.get("self") or {}).get("isClaimed")
+            ]
+            check(not watchable,
+                  f"[{name}] skipped as needing a subscription, but {len(watchable)} of its "
+                  f"tiers need none")
+
     # The summary line must equal the rows it summarises.
     totals = snapshot["totals"]
     rows = snapshot["eligible"]
@@ -252,7 +310,8 @@ def main():
     for snapshot in snapshots:
         problems, tiers = audit(snapshot, twitch)
         total += len(problems)
-        print(f"{snapshot['account']}: audited {len(snapshot['eligible'])} campaigns, {tiers} tiers")
+        print(f"{snapshot['account']}: audited {len(snapshot['eligible'])} mineable and "
+              f"{len(snapshot['rejected'])} skipped campaigns, {tiers} tiers")
         for problem in problems:
             print("  -", problem)
     if total:
