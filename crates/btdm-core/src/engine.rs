@@ -2069,17 +2069,23 @@ impl<A: TwitchApi> Engine<A> {
                 // The campaign has options; it exists and is streamable, even
                 // if we stop gathering more of them below.
                 any = true;
-                // Counted before the cap, because this is the answer to "who is
-                // live for this campaign?" — not "how many did we bother to
-                // verify?". Reporting the capped figure told a user watching a
-                // game with thirty drops-enabled streamers that eight were live.
+                // Counted for every eligible channel, not just the ones kept.
+                // This is the answer to "who is live for this campaign?", which
+                // is a question about Twitch, not about how much verifying the
+                // miner chose to do.
                 *seen += 1;
                 // The directory returns the busiest streams first, and the
                 // strategy only ever picks one channel. Verifying every one of
                 // the thirty channels streaming a popular game costs requests
                 // and buys nothing.
+                //
+                // A `continue` rather than a `break`: the rest of this loop is
+                // pure bookkeeping over a list already in memory, and breaking
+                // stopped the count dead at the cap — so the honest figure this
+                // was meant to produce came out as nine for a game with thirty
+                // channels live.
                 if taken >= self.config.max_channels_per_campaign {
-                    break;
+                    continue;
                 }
                 taken += 1;
                 let entry = by_channel

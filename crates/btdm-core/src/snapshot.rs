@@ -278,7 +278,13 @@ pub fn drop_view(d: &TimedDrop, claimed: &HashSet<DropId>, active: Option<&DropI
 }
 
 pub fn campaign_view(c: &DropCampaign, ctx: &ViewContext) -> CampaignView {
-    let remaining = crate::eligibility::remaining_minutes(c);
+    // The work the miner will actually do, which is the work needed for the
+    // furthest tier still reachable. Reporting every outstanding tier put a
+    // figure next to the deadline that contradicted it — "9h to go" beside 8h42
+    // of slack, on a campaign the miner had every intention of mining and would
+    // have finished eight tiers of.
+    let remaining = crate::eligibility::achievable_minutes_at(c, ctx.now)
+        .unwrap_or_else(|| crate::eligibility::remaining_minutes(c));
     let slack = crate::strategy::slack(c, ctx.now).num_minutes();
     let claimed: HashSet<DropId> = c
         .drops
@@ -506,6 +512,33 @@ mod tests {
             campaign_view(&c, &ctx(&excl, &games, &cur, &live)).live_channels,
             Some(7)
         );
+    }
+
+    /// The work shown must be the work the miner intends to do. A campaign
+    /// whose last tier is out of reach still gets mined for the tiers that are
+    /// not, so quoting the full figure printed a number the deadline beside it
+    /// contradicted.
+    #[test]
+    fn the_time_to_go_matches_what_is_still_reachable() {
+        // Two tiers, 60 and 600 minutes, with five hours left on the clock.
+        let mut c = campaign(Duration::hours(5), 60, 0);
+        c.drops.push(TimedDrop {
+            id: DropId::from("d2"),
+            name: "Out of reach".into(),
+            benefits: vec![],
+            required_minutes: 600,
+            current_minutes: 0,
+            claim_id: None,
+            is_claimed: false,
+            precondition_ids: vec![],
+            starts_at: None,
+            ends_at: None,
+            required_subs: 0,
+        });
+        let (excl, games, cur, live) = empty_ctx();
+        let v = campaign_view(&c, &ctx(&excl, &games, &cur, &live));
+        assert_eq!(v.remaining_minutes, 60, "the reachable tier, not the lost one");
+        assert!(v.slack_minutes >= 0, "and it must not read as impossible");
     }
 
     /// "We looked and found nobody" and "we never looked" are different

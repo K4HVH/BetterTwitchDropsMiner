@@ -2746,6 +2746,42 @@ async fn live_channels_are_reported_even_when_twitch_confirms_nothing() {
     );
 }
 
+/// `max_channels_per_campaign` bounds how many channels are worth verifying.
+/// It must not bound the reported figure: "how many people are live for this
+/// campaign" is a fact about Twitch, and clamping it to the miner's own
+/// request budget told a user watching a game with thirty drops-enabled
+/// streamers that nine were live.
+#[tokio::test]
+async fn the_live_channel_count_is_not_clamped_to_the_verification_budget() {
+    let fake = FakeTwitch::default();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 0)])];
+    let cap = EngineConfig::default().max_channels_per_campaign;
+    let crowd = cap * 3;
+    *fake.channels.lock().unwrap() = (0..crowd)
+        .map(|i| {
+            (
+                channel(&format!("ch{i}"), &format!("streamer{i}")),
+                stream(&format!("bc-{i}"), true),
+            )
+        })
+        .collect();
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+
+    let snap = e.snapshot("default", Some("me"), now());
+    assert_eq!(
+        snap.eligible[0].live_channels,
+        Some(crowd),
+        "every live channel must be counted, not just the ones inside the cap"
+    );
+    assert!(
+        snap.live.len() <= cap,
+        "the cap must still bound the work actually done"
+    );
+}
+
 /// Selection must be a decision, not an accident of sort order. `alpha` sorts
 /// first; `zeta` is the favourite, so `zeta` must win.
 #[tokio::test]
