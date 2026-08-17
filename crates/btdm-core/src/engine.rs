@@ -209,6 +209,10 @@ pub struct Engine<A: TwitchApi> {
     /// The candidate set from the last selection pass, so the dashboard can
     /// show what was actually on offer rather than only what won.
     live: Vec<Candidate>,
+    /// How many live channels the last selection pass found per campaign, by
+    /// campaign id. A campaign absent from the map was not looked at, which
+    /// the dashboard reports differently from a campaign nobody is streaming.
+    live_counts: HashMap<String, usize>,
     progress: ProgressTracker,
     watchdog: Watchdog,
     quarantine: Quarantine,
@@ -287,6 +291,7 @@ impl<A: TwitchApi> Engine<A> {
             rejected: Vec::new(),
             current: None,
             live: Vec::new(),
+            live_counts: HashMap::new(),
             progress: ProgressTracker::new(),
             events: Vec::new(),
             last_watch: None,
@@ -372,6 +377,12 @@ impl<A: TwitchApi> Engine<A> {
                 }
                 self.paused = true;
                 self.stop_watching(now, StopReason::UserRequest);
+                // A paused miner runs no selection pass, so these counts stop
+                // being refreshed. Keeping them would age silently into a claim
+                // about who is live now; dropping them makes the dashboard say
+                // it has not looked, which is the truth.
+                self.live.clear();
+                self.live_counts.clear();
                 self.emit(now, EventKind::Paused);
                 CommandEffect::message("Mining paused").with_persist()
             }
@@ -700,14 +711,12 @@ impl<A: TwitchApi> Engine<A> {
             }
         });
 
-        // How many live channels were found per campaign, so a campaign with
-        // nobody streaming it can say so instead of looking merely unlucky.
-        let mut live_by_campaign: HashMap<String, usize> = HashMap::new();
-        for candidate in &self.live {
-            for id in candidate.campaigns() {
-                *live_by_campaign.entry(id.0.clone()).or_default() += 1;
-            }
-        }
+        // Taken from the selection pass rather than counted off `self.live`,
+        // which holds only the channels that survived the per-campaign cap.
+        // Counting those reported "8 channels live" for a game with thirty,
+        // and — because a campaign the pass skipped has no candidates at all —
+        // reported "nobody live" for campaigns nobody had looked at.
+        let live_by_campaign = &self.live_counts;
 
         let ctx = ViewContext {
             now,
@@ -715,7 +724,7 @@ impl<A: TwitchApi> Engine<A> {
             excluded_games: &self.excluded_games,
             current_campaigns,
             active_drop: active.map(|(id, _)| id),
-            live_by_campaign: &live_by_campaign,
+            live_by_campaign,
         };
 
         let eligible: Vec<_> = self
@@ -2025,6 +2034,7 @@ impl<A: TwitchApi> Engine<A> {
         // --- map each channel to every campaign it could serve --------------
         let mut by_channel: BTreeMap<ChannelId, ChannelWork> = BTreeMap::new();
         let mut campaigns_without_channels = Vec::new();
+        let mut live_counts: HashMap<String, usize> = HashMap::new();
 
         // Channels available to a campaign that is not tied to its own game.
         let everyone: Vec<(Channel, Stream)> = channels_by_game
@@ -2042,6 +2052,10 @@ impl<A: TwitchApi> Engine<A> {
                     None => continue,
                 }
             };
+            // Recorded even when it stays zero: "we looked and found nobody" is
+            // a different answer from "we never looked", and the dashboard can
+            // only tell them apart if the campaign appears in this map.
+            let seen = live_counts.entry(want.campaign.0.clone()).or_insert(0usize);
             let mut any = false;
             let mut taken = 0usize;
             for (channel, stream) in channels {
@@ -2055,6 +2069,11 @@ impl<A: TwitchApi> Engine<A> {
                 // The campaign has options; it exists and is streamable, even
                 // if we stop gathering more of them below.
                 any = true;
+                // Counted before the cap, because this is the answer to "who is
+                // live for this campaign?" — not "how many did we bother to
+                // verify?". Reporting the capped figure told a user watching a
+                // game with thirty drops-enabled streamers that eight were live.
+                *seen += 1;
                 // The directory returns the busiest streams first, and the
                 // strategy only ever picks one channel. Verifying every one of
                 // the thirty channels streaming a popular game costs requests
@@ -2078,6 +2097,7 @@ impl<A: TwitchApi> Engine<A> {
                 campaigns_without_channels.push(want.campaign.clone());
             }
         }
+        self.live_counts = live_counts;
 
         for campaign in campaigns_without_channels {
             self.emit(

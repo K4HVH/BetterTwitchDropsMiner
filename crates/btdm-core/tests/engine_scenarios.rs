@@ -2740,7 +2740,8 @@ async fn live_channels_are_reported_even_when_twitch_confirms_nothing() {
     );
     let campaign = &snap.eligible[0];
     assert_eq!(
-        campaign.live_channels, 2,
+        campaign.live_channels,
+        Some(2),
         "a campaign with two live channels must not report zero"
     );
 }

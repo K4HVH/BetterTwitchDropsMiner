@@ -992,8 +992,18 @@
     else if (c.at_risk) tags.append(el("span", "pill warn", "at risk"));
     tags.append(el("span", "pill", until(c.ends_at)));
     tags.append(el("span", "pill", hours(c.remaining_minutes) + " to go"));
-    if (c.live_channels) tags.append(el("span", "pill", plural(c.live_channels, "channel") + " live"));
-    else tags.append(el("span", "pill", "nobody live"));
+    // Three states, not two. `null` means the last pass never looked at this
+    // campaign — paused, or skipped as excluded — and saying "nobody live"
+    // there states as fact something nobody checked.
+    if (c.live_channels === null || c.live_channels === undefined) {
+      const pill = el("span", "pill", "not checked");
+      pill.title = "The last selection pass did not look for channels for this campaign.";
+      tags.append(pill);
+    } else if (c.live_channels > 0) {
+      tags.append(el("span", "pill", plural(c.live_channels, "channel") + " live"));
+    } else {
+      tags.append(el("span", "pill", "nobody live"));
+    }
     const allowed = (c.allowed_channels || []).length;
     if (allowed) {
       // "only 463 channels" is not a restriction anyone recognises as one.

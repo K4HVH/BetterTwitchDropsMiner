@@ -146,8 +146,17 @@ pub struct CampaignView {
     pub excluded: bool,
     /// This campaign is being advanced by the channel being watched.
     pub is_current: bool,
-    /// Channels seen live for it in the last pass.
-    pub live_channels: usize,
+    /// Channels seen live for it in the last pass, or `None` when the last
+    /// pass never looked — because the miner is paused, has not completed a
+    /// pass yet, or skipped the campaign as excluded or quarantined.
+    ///
+    /// The distinction is the whole point. A plain zero was reported for both
+    /// "nobody is streaming this" and "we never asked", so a campaign the
+    /// miner had silently written off looked identical to one genuinely
+    /// nobody was live for — and the dashboard stated as fact that no one was
+    /// streaming games with thirty drops-enabled channels on the first page of
+    /// the directory.
+    pub live_channels: Option<usize>,
     /// Non-empty when Twitch restricts the campaign to specific channels.
     pub allowed_channels: Vec<String>,
     pub drops: Vec<DropView>,
@@ -222,7 +231,8 @@ pub struct ViewContext<'a> {
     pub current_campaigns: &'a [CampaignId],
     /// The one drop Twitch is confirming progress for.
     pub active_drop: Option<&'a DropId>,
-    /// Live channel counts, keyed by campaign id.
+    /// Live channel counts from the last selection pass, keyed by campaign id.
+    /// A campaign absent from the map was not looked at.
     pub live_by_campaign: &'a HashMap<String, usize>,
 }
 
@@ -291,7 +301,7 @@ pub fn campaign_view(c: &DropCampaign, ctx: &ViewContext) -> CampaignView {
         at_risk: slack < AT_RISK_SLACK_MINUTES,
         excluded: ctx.is_excluded(c),
         is_current: ctx.current_campaigns.contains(&c.id),
-        live_channels: ctx.live_by_campaign.get(&c.id.0).copied().unwrap_or(0),
+        live_channels: ctx.live_by_campaign.get(&c.id.0).copied(),
         allowed_channels: c
             .allowed_channels
             .iter()
@@ -494,7 +504,29 @@ mod tests {
         live.insert("c1".to_string(), 7);
         assert_eq!(
             campaign_view(&c, &ctx(&excl, &games, &cur, &live)).live_channels,
-            7
+            Some(7)
+        );
+    }
+
+    /// "We looked and found nobody" and "we never looked" are different
+    /// answers, and a dashboard that renders both as "nobody live" is stating
+    /// as fact something it never checked.
+    #[test]
+    fn a_campaign_nobody_looked_at_is_distinguishable_from_one_nobody_streams() {
+        let c = campaign(Duration::days(10), 60, 0);
+        let (excl, games, cur, mut live) = empty_ctx();
+
+        assert_eq!(
+            campaign_view(&c, &ctx(&excl, &games, &cur, &live)).live_channels,
+            None,
+            "absent from the map means the pass never looked at it"
+        );
+
+        live.insert("c1".to_string(), 0);
+        assert_eq!(
+            campaign_view(&c, &ctx(&excl, &games, &cur, &live)).live_channels,
+            Some(0),
+            "present and zero means the pass looked and found nobody"
         );
     }
 

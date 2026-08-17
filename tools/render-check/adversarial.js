@@ -1416,6 +1416,43 @@ const tab = (label) => {
       }
     }));
 
+  // ------------------------------------------------------- honesty of counts
+  console.log("Live-channel counts:");
+
+  check("a campaign nobody looked at does not claim nobody is live", () => {
+    push(snapshot({ eligible: [campaign({ live_channels: null })] }));
+    tab("Campaigns");
+    const t = text();
+    if (t.includes("nobody live")) {
+      throw new Error("stated as fact that nobody is live, having never checked");
+    }
+    if (!t.includes("not checked")) throw new Error("gave the user no answer at all");
+  });
+
+  check("an absent live_channels field is treated the same as null", () => {
+    const c = campaign();
+    delete c.live_channels;
+    push(snapshot({ eligible: [c] }));
+    tab("Campaigns");
+    if (text().includes("nobody live")) {
+      throw new Error("a missing field was read as a confirmed zero");
+    }
+  });
+
+  check("a checked campaign with no channels still says nobody live", () => {
+    push(snapshot({ eligible: [campaign({ live_channels: 0 })] }));
+    tab("Campaigns");
+    const t = text();
+    if (!t.includes("nobody live")) throw new Error("a real zero must be reported as one");
+    if (t.includes("not checked")) throw new Error("a checked campaign was called unchecked");
+  });
+
+  check("a real count is reported verbatim", () => {
+    push(snapshot({ eligible: [campaign({ live_channels: 30 })] }));
+    tab("Campaigns");
+    if (!text().includes("30 channels live")) throw new Error("the count was not shown");
+  });
+
   console.log("");
   if (failures.length) {
     console.log(`FAILURES (${failures.length} of ${checks}):`);
