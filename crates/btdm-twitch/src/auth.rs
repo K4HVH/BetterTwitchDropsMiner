@@ -142,7 +142,7 @@ impl AuthClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| TwitchError::Network(crate::describe(&e)))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -153,7 +153,7 @@ impl AuthClient {
         let r: Resp = resp
             .json()
             .await
-            .map_err(|e| TwitchError::Malformed(e.to_string()))?;
+            .map_err(|e| TwitchError::Malformed(crate::describe(&e)))?;
         Ok(DeviceCode {
             device_code: r.device_code,
             user_code: r.user_code,
@@ -190,14 +190,14 @@ impl AuthClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| TwitchError::Network(crate::describe(&e)))?;
 
         let status = resp.status().as_u16();
         if status == 200 {
             let r: Resp = resp
                 .json()
                 .await
-                .map_err(|e| TwitchError::Malformed(e.to_string()))?;
+                .map_err(|e| TwitchError::Malformed(crate::describe(&e)))?;
             return Ok(PollOutcome::Granted {
                 access_token: r.access_token,
                 refresh_token: r.refresh_token,
@@ -223,14 +223,14 @@ impl AuthClient {
             .header("Authorization", format!("OAuth {token}"))
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| TwitchError::Network(crate::describe(&e)))?;
 
         match resp.status().as_u16() {
             200 => {
                 let r: Resp = resp
                     .json()
                     .await
-                    .map_err(|e| TwitchError::Malformed(e.to_string()))?;
+                    .map_err(|e| TwitchError::Malformed(crate::describe(&e)))?;
                 Ok(ValidatedToken {
                     user_id: r.user_id,
                     login: r.login,

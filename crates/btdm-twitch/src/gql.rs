@@ -7,8 +7,8 @@
 //! a `PersistedQueryNotFound` triggers an immediate retry rather than a
 //! failure the user only notices as "nothing is happening".
 
-use crate::TwitchError;
 use crate::client::CLIENT_ID;
+use crate::{TwitchError, describe};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -259,10 +259,10 @@ impl GqlClient {
         let resp = req.send().await.map_err(|e| {
             // A connection that never completed is worth another go; anything
             // else is a real problem with the request.
-            if e.is_timeout() || e.is_connect() || e.is_request() {
-                TwitchError::Transient(e.to_string())
+            if e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() {
+                TwitchError::Transient(describe(&e))
             } else {
-                TwitchError::Network(e.to_string())
+                TwitchError::Network(describe(&e))
             }
         })?;
 
@@ -276,9 +276,32 @@ impl GqlClient {
             s => return Err(TwitchError::Network(format!("HTTP {s}"))),
         }
 
-        resp.json()
-            .await
-            .map_err(|e| TwitchError::Malformed(e.to_string()))
+        resp.json().await.map_err(classify_body)
+    }
+}
+
+/// Why reading the response body failed.
+///
+/// reqwest calls both of these "error decoding response body", and they could
+/// hardly be less alike: a body that stopped arriving is a transport failure
+/// and worth asking again about, while a body that arrived and is not JSON
+/// will never become JSON. Treating every one of them as the second dropped
+/// sixteen campaigns from a single sync without one retry between them — the
+/// exact "random connections just completely failing" this miner exists to
+/// answer, reintroduced by a misfiled error.
+///
+/// The source tells them apart. `serde_json` is only ever handed bytes that
+/// all arrived, so a `serde_json::Error` in the chain means the body is
+/// genuinely not what we asked for; a timeout, a `hyper` error or a bare
+/// `io::Error` means it never finished coming.
+fn classify_body(e: reqwest::Error) -> TwitchError {
+    let detail = describe(&e);
+    let unparseable = std::iter::successors(std::error::Error::source(&e), |s| s.source())
+        .any(|s| s.is::<serde_json::Error>());
+    if unparseable {
+        TwitchError::Malformed(detail)
+    } else {
+        TwitchError::Transient(detail)
     }
 }
 

@@ -180,7 +180,7 @@ pub async fn connect(
 
     let (stream, _) = tokio_tungstenite::connect_async(url)
         .await
-        .map_err(|e| TwitchError::Network(e.to_string()))?;
+        .map_err(|e| TwitchError::Network(crate::describe(&e)))?;
     let (mut write, mut read) = stream.split();
 
     let listen = json!({
@@ -191,7 +191,7 @@ pub async fn connect(
     write
         .send(Message::Text(listen.to_string().into()))
         .await
-        .map_err(|e| TwitchError::Network(e.to_string()))?;
+        .map_err(|e| TwitchError::Network(crate::describe(&e)))?;
 
     // Wait for the subscription to be acknowledged. Without this a rejected
     // LISTEN (bad auth, bad topic) leaves a socket that answers PING forever

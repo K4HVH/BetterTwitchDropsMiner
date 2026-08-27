@@ -59,6 +59,74 @@ fn client(endpoint: String) -> TwitchClient {
 const EMPTY_INVENTORY: &str =
     r#"{"data":{"currentUser":{"inventory":{"dropCampaignsInProgress":[]}}}}"#;
 
+/// A server that promises more body than it delivers on its first `broken`
+/// replies, then answers properly. Announcing a `Content-Length` and then
+/// closing the socket early is what a connection dropped mid-download looks
+/// like from the client side.
+async fn truncating_server(broken: usize, body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(headers.as_bytes()).await;
+            let payload = if n < broken {
+                // Well short of the length just promised.
+                &body[..body.len() / 3]
+            } else {
+                body
+            };
+            let _ = socket.write_all(payload.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+    });
+
+    (format!("http://{addr}/gql"), hits)
+}
+
+/// A server that answers 200 with something that is not JSON at all.
+async fn not_json_server(body: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+    });
+
+    (format!("http://{addr}/gql"), hits)
+}
+
 #[tokio::test]
 async fn a_single_server_error_is_retried_rather_than_failing_the_pass() {
     let (url, hits) = server(vec![500], EMPTY_INVENTORY).await;
@@ -238,5 +306,70 @@ async fn a_request_that_never_answers_eventually_gives_up() {
         started.elapsed() < btdm_twitch::client::REQUEST_TIMEOUT + std::time::Duration::from_secs(5),
         "it waited {:?}, past its own timeout",
         started.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Telling a body that never arrived apart from a body that is not JSON
+// ---------------------------------------------------------------------------
+
+/// Observed live on 2026-08-27: sixteen campaigns dropped out of one sync,
+/// every one of them reporting "unexpected response shape: unexpected response
+/// shape: error decoding response body for url (https://gql.twitch.tv/gql)".
+///
+/// Both halves of that line were wrong. The response shape was never in
+/// question — the body simply stopped arriving — and a failure to *receive* is
+/// as transient as the dropped connection that caused it. Filing it as
+/// malformed meant it was never retried, so a single blip mid-download cost a
+/// whole batch of campaigns until the next sync ten minutes later.
+#[tokio::test]
+async fn a_body_that_stops_arriving_is_retried() {
+    let (url, hits) = truncating_server(1, EMPTY_INVENTORY).await;
+    let api = client(url);
+
+    let result = api.fetch_inventory().await;
+
+    assert!(result.is_ok(), "a truncated body must be asked for again: {result:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "it should have asked twice");
+}
+
+/// The other side of the same coin. JSON that is not JSON will not become JSON
+/// by asking again, and three extra requests into a rate limit is the worst
+/// possible response to it.
+#[tokio::test]
+async fn a_body_that_is_not_json_is_not_retried() {
+    let (url, hits) = not_json_server("<html>maintenance</html>").await;
+    let api = client(url);
+
+    assert!(matches!(
+        api.fetch_inventory().await,
+        Err(btdm_core::api::ApiError::Malformed(_))
+    ));
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "asked exactly once");
+}
+
+/// The error a user actually reads. It said "unexpected response shape"
+/// twice — `ApiError::Malformed` adding the prefix that `TwitchError::Malformed`
+/// had already rendered in — and then stopped at reqwest's own frame, which is
+/// the same twelve words for every way a body can fail. Neither half told
+/// anyone anything.
+#[tokio::test]
+async fn a_malformed_body_says_what_was_wrong_with_it_exactly_once() {
+    let (url, _) = not_json_server("<html>maintenance</html>").await;
+    let api = client(url);
+
+    let Err(e) = api.fetch_inventory().await else {
+        panic!("html is not a valid response");
+    };
+    let message = e.to_string();
+
+    assert_eq!(
+        message.matches("unexpected response shape").count(),
+        1,
+        "the prefix belongs to one layer, not two: {message}"
+    );
+    assert!(
+        message.contains("expected value"),
+        "serde knows precisely what was wrong; the chain must carry it: {message}"
     );
 }

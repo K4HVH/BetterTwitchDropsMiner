@@ -5,7 +5,7 @@
 //! the site's JavaScript config and has to be scraped. The mobile page exposes
 //! it inline, so we fetch that first and skip a hop.
 
-use crate::TwitchError;
+use crate::{TwitchError, describe};
 use base64::Engine;
 use btdm_core::model::{Channel, Stream, UserId};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -87,12 +87,21 @@ pub fn classify_spade_transport_error(url: &str, e: &reqwest::Error) -> TwitchEr
     if e.is_connect() || e.is_timeout() {
         TwitchError::SpadeUnreachable {
             url: url.to_owned(),
-            detail: e.to_string(),
+            detail: describe(e),
         }
     } else {
-        TwitchError::Network(e.to_string())
+        TwitchError::Network(describe(e))
     }
 }
+
+/// How many times a failed heartbeat is retried before the tick gives up.
+///
+/// Deliberately fewer than GQL's three. Every other request can be re-asked at
+/// leisure; this one is racing a minute boundary, and a heartbeat that arrives
+/// after the minute it was meant to claim has bought nothing. Two quick tries
+/// cover a blip without pushing the next one late.
+const WATCH_RETRIES: usize = 2;
+const WATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub struct WatchClient {
     http: reqwest::Client,
@@ -111,10 +120,10 @@ impl WatchClient {
             .get(&page_url)
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?
+            .map_err(|e| TwitchError::Network(describe(&e)))?
             .text()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| TwitchError::Network(describe(&e)))?;
 
         if let Some(url) = extract_spade_url(&html) {
             return Ok(url);
@@ -130,17 +139,56 @@ impl WatchClient {
             .get(&settings_url)
             .send()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?
+            .map_err(|e| TwitchError::Network(describe(&e)))?
             .text()
             .await
-            .map_err(|e| TwitchError::Network(e.to_string()))?;
+            .map_err(|e| TwitchError::Network(describe(&e)))?;
 
         extract_spade_url(&js)
             .ok_or_else(|| TwitchError::Malformed("no spade URL in the settings script".into()))
     }
 
-    /// One heartbeat. Twitch answers 204 on success.
+    /// One heartbeat, with a short retry. Twitch answers 204 on success.
+    ///
+    /// This is the only request in the whole miner that advances drop time,
+    /// and it was the only one with no retry at all: GQL rode out three 5xxs,
+    /// while a single 504 here silently cost a watch minute. Twitch was
+    /// observed returning 504s freely on 2026-08-27, so that was not a
+    /// theoretical gap.
+    ///
+    /// A 5xx means Twitch did not accept the event, so the retry replaces a
+    /// heartbeat rather than duplicating one. In the one case where it might
+    /// duplicate — a gateway erroring after the backend took it — the two land
+    /// a third of a second apart inside the same minute, and a minute watched
+    /// is the unit Twitch credits.
     pub async fn send(
+        &self,
+        spade_url: &str,
+        channel: &Channel,
+        stream: &Stream,
+        user_id: &UserId,
+    ) -> Result<(), TwitchError> {
+        let mut attempt = 0usize;
+        loop {
+            let error = match self.send_once(spade_url, channel, stream, user_id).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            // Only a server that might answer differently. A blocked spade
+            // host, a rejected token and a rate limit are all made worse by
+            // asking again, and the first of those is a message the user needs
+            // to see rather than a delay.
+            let worth_retrying = matches!(&error, TwitchError::Network(m) if is_server_error(m));
+            if attempt >= WATCH_RETRIES || !worth_retrying {
+                return Err(error);
+            }
+            attempt += 1;
+            tracing::debug!(error = %error, attempt, "heartbeat failed; retrying");
+            tokio::time::sleep(WATCH_RETRY_DELAY).await;
+        }
+    }
+
+    async fn send_once(
         &self,
         spade_url: &str,
         channel: &Channel,
@@ -163,6 +211,15 @@ impl WatchClient {
             s => Err(TwitchError::Network(format!("spade returned HTTP {s}"))),
         }
     }
+}
+
+/// Whether a spade failure was Twitch's end having a moment, which is the only
+/// kind worth sending again.
+fn is_server_error(message: &str) -> bool {
+    message
+        .strip_prefix("spade returned HTTP ")
+        .and_then(|s| s.parse::<u16>().ok())
+        .is_some_and(|s| (500..=599).contains(&s))
 }
 
 #[cfg(test)]
