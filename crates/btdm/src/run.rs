@@ -140,6 +140,13 @@ pub async fn mine(
                 Err(e) => tracing::error!(error = %e, "campaign sync failed"),
             }
         }
+        // Drained per phase, not once at the end. Held to the end, a tick that
+        // failed printed its error above the sync and selection that had run
+        // before it, so the log read "failed, then synced, then started
+        // watching, then stopped" for a sequence that happened the other way
+        // round. This log is the first thing anyone reads when the miner
+        // misbehaves; it should not have to be read backwards.
+        drain_events(&mut engine, storage, account, hub.as_ref(), notifier.as_ref()).await?;
 
         // --- channel selection ---------------------------------------------
         if engine.needs_selection(now)
@@ -154,6 +161,7 @@ pub async fn mine(
             }
             tracing::error!(error = %e, "channel selection failed");
         }
+        drain_events(&mut engine, storage, account, hub.as_ref(), notifier.as_ref()).await?;
 
         // --- one mining tick -------------------------------------------------
         if let Err(e) = engine.tick(now).await {
@@ -162,8 +170,27 @@ pub async fn mine(
                     "the stored token was rejected. Run: btdm login --force"
                 ));
             }
-            tracing::error!(error = %e, "mining tick failed; leaving this channel");
-            engine.switch_away(now);
+            // Logged, and nothing more. Giving up the channel here was a far
+            // heavier answer than a tick failure can justify: a heartbeat that
+            // did not land or a backstop poll that did not answer is a fact
+            // about the network, and the network is the one thing it is
+            // certainly not a fact about this channel.
+            //
+            // Observed live on 2026-08-27: three HTTP 504s inside ten minutes,
+            // each costing a teardown and a fresh selection pass, so roughly
+            // half that window was spent idle over three failed requests. The
+            // second failure is the one that mattered — `stop_watching` resets
+            // the watchdog, so a Twitch answering 504 put the miner in a
+            // select, fail, tear down, select loop that could never climb the
+            // ladder as far as re-syncing campaigns or re-validating the
+            // token. The eager escape hatch was locking the door on the only
+            // recovery that would have helped.
+            //
+            // Deciding a session has stopped earning belongs to the watchdog,
+            // which is the one mechanism here with the evidence for it: it
+            // measures server-confirmed progress, so a channel that really is
+            // dead still loses its slot, and a blip no longer does.
+            tracing::error!(error = %e, "mining tick failed; leaving it to the watchdog");
         }
 
         // --- watchdog ---------------------------------------------------------
@@ -578,7 +605,16 @@ fn report_status<A: TwitchApi>(engine: &Engine<A>, now: chrono::DateTime<Utc>) {
 
     match engine.state() {
         MiningState::Paused => tracing::info!("paused"),
-        MiningState::Idle => tracing::info!("idle — no eligible channel"),
+        // "No eligible channel" is a finding, and a miner whose last look at
+        // the directory failed has not made it. Saying so anyway is how three
+        // HTTP 504s came to be reported to the user as nobody being live.
+        MiningState::Idle => match engine.selection_failure() {
+            Some(error) => tracing::info!(
+                error,
+                "idle — the last look for a channel failed, so who is live is unknown"
+            ),
+            None => tracing::info!("idle — no eligible channel"),
+        },
         MiningState::Establishing => tracing::info!(
             channel,
             last_confirmed = since,

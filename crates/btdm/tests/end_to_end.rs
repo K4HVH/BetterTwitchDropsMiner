@@ -26,6 +26,12 @@ struct Seen {
     heartbeats: AtomicUsize,
     claims: AtomicUsize,
     operations: std::sync::Mutex<Vec<String>>,
+    /// Answer the progress poll with a gateway error instead of a session.
+    /// Twitch really does this, and what the miner did about it mattered far
+    /// more than the error itself.
+    break_progress_poll: std::sync::atomic::AtomicBool,
+    /// How many heartbeats to answer with a gateway error before behaving.
+    break_heartbeats: AtomicUsize,
 }
 
 /// A minimal Twitch. Returns its base URL.
@@ -101,11 +107,25 @@ fn respond(
 
     // The one endpoint that advances drop time.
     if path.starts_with("/spade") {
+        // Counted only when accepted: the point of the test below is that a
+        // refused heartbeat is not a heartbeat.
+        if seen
+            .break_heartbeats
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return (504, "text/plain", String::new());
+        }
         seen.heartbeats.fetch_add(1, Ordering::SeqCst);
         return (204, "text/plain", String::new());
     }
 
     if path.starts_with("/gql") {
+        if body.contains("DropCurrentSessionContext")
+            && seen.break_progress_poll.load(Ordering::SeqCst)
+        {
+            return (504, "text/plain", String::new());
+        }
         return (200, "application/json", gql(body, seen, drop_minutes));
     }
 
@@ -475,4 +495,103 @@ fn the_miner_mines_a_twitch_that_confirms_nothing() {
         "the miner must watch something even though Twitch confirmed nothing"
     );
     });
+}
+
+/// Observed live on 2026-08-27. Three HTTP 504s in ten minutes, every one of
+/// them on the progress poll, and every one answered by tearing down a
+/// perfectly good watch session: "Stopped watching — an error made the session
+/// untrustworthy", then "idle — no eligible channel", then a fresh selection
+/// pass costing minutes. Roughly half of that ten-minute window was spent idle
+/// over three failed requests, on a channel that was live and earning the
+/// whole time.
+///
+/// The poll is the *backstop* for a websocket that is connected but silent. It
+/// failing says nothing whatever about the channel, and the session it was
+/// checking on is exactly what must survive it.
+#[test]
+fn a_gateway_error_on_the_progress_poll_does_not_cost_the_channel() {
+    serial(async {
+        let seen = Arc::new(Seen::default());
+        seen.break_progress_poll.store(true, Ordering::SeqCst);
+        let base = fake_twitch(Arc::clone(&seen), 5).await;
+        let (storage, config, _dir) = miner(&base);
+        let hub = btdm_web::Hub::new();
+
+        run::mine(
+            &storage,
+            "default",
+            &config,
+            RunOptions { probe: true, config_store: None },
+            Some(hub.clone()),
+        )
+        .await
+        .expect("a failed poll is not a reason to stop mining");
+
+        assert_eq!(
+            seen.heartbeats.load(Ordering::SeqCst),
+            1,
+            "the heartbeat landed; only the poll after it failed"
+        );
+
+        let snapshot = hub.snapshot("default").expect("the miner published its state");
+        assert!(
+            snapshot.watching.is_some(),
+            "the channel was live and being watched; a failed backstop poll must \
+             not throw the session away, state was {:?}",
+            snapshot.state
+        );
+        assert_ne!(
+            snapshot.state, "Idle",
+            "reporting idle here tells the user nobody could be mined, while a \
+             channel that could be was just given up"
+        );
+    })
+}
+
+/// The heartbeat was the one request in the miner with no retry at all.
+///
+/// Everything else rode out three 5xxs; this — the only endpoint that advances
+/// drop time — gave up on the first, and the minute it was posting was simply
+/// lost. Twitch was observed answering 504 freely on 2026-08-27, so the gap
+/// was being exercised, silently, on the request that matters most.
+#[test]
+fn a_flaky_spade_endpoint_does_not_cost_the_watch_minute() {
+    serial(async {
+        let seen = Arc::new(Seen::default());
+        seen.break_heartbeats.store(2, Ordering::SeqCst);
+        let base = fake_twitch(Arc::clone(&seen), 5).await;
+        let (storage, config, _dir) = miner(&base);
+
+        probe(&storage, &config, "default")
+            .await
+            .expect("two gateway errors are not a reason to stop mining");
+
+        assert_eq!(
+            seen.heartbeats.load(Ordering::SeqCst),
+            1,
+            "the third attempt must land; a minute of drop time turns on it"
+        );
+    })
+}
+
+/// And the bound, because retrying a heartbeat forever would push the next one
+/// past the minute it was for.
+#[test]
+fn heartbeat_retries_are_bounded() {
+    serial(async {
+        let seen = Arc::new(Seen::default());
+        seen.break_heartbeats.store(usize::MAX, Ordering::SeqCst);
+        let base = fake_twitch(Arc::clone(&seen), 5).await;
+        let (storage, config, _dir) = miner(&base);
+
+        probe(&storage, &config, "default")
+            .await
+            .expect("a failed heartbeat is logged, not fatal");
+
+        assert_eq!(
+            seen.heartbeats.load(Ordering::SeqCst),
+            0,
+            "none was ever accepted, and the pass still ended"
+        );
+    })
 }
