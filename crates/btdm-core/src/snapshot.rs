@@ -67,6 +67,11 @@ pub struct HealthView {
     pub recovery_step: Option<String>,
     pub last_sync: Option<DateTime<Utc>>,
     pub next_sync_in_seconds: Option<i64>,
+    /// Why the last selection pass could not finish, if it could not. An idle
+    /// miner with something here has not established that nobody is live; it
+    /// has established that it could not find out.
+    #[serde(default)]
+    pub last_selection_error: Option<String>,
     pub quarantined_channels: Vec<QuarantineView>,
     pub quarantined_campaigns: Vec<QuarantineView>,
 }

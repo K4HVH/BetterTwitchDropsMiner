@@ -227,6 +227,7 @@ mod tests {
             EventKind::CampaignsSynced {
                 total: 61,
                 eligible: 7,
+                unchecked: 0,
             },
             EventKind::ProgressConfirmed {
                 drop: DropId::from("d1"),

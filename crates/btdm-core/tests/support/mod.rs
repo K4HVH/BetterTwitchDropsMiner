@@ -38,6 +38,17 @@ pub struct FakeTwitch {
     pub fail_available_drops: Mutex<bool>,
     /// When set, only the campaign dashboard listing fails.
     pub fail_campaign_list: Mutex<bool>,
+    /// When set, only the directory query fails — the one that answers "who is
+    /// live", and so the one whose failure must never be mistaken for "nobody".
+    pub fail_directory: Mutex<bool>,
+    /// When set, every watch heartbeat fails. The one request that actually
+    /// advances drop time, so what the miner does when it fails matters more
+    /// than for any other call here.
+    pub fail_watch: Mutex<bool>,
+    /// Campaign ids whose detail query fails. Per campaign rather than
+    /// wholesale, because the interesting case is a sync where some campaigns
+    /// were described and others were not.
+    pub fail_details: Mutex<std::collections::HashSet<String>>,
     /// When set, Twitch refuses every claim.
     pub fail_claims: Mutex<bool>,
     pub detail_fetches: Mutex<usize>,
@@ -80,6 +91,9 @@ impl TwitchApi for FakeTwitch {
     async fn campaign_details(&self, id: &CampaignId) -> Result<Option<DropCampaign>, ApiError> {
         self.guard()?;
         *self.detail_fetches.lock().unwrap() += 1;
+        if self.fail_details.lock().unwrap().contains(&id.0) {
+            return Err(ApiError::Network("HTTP 504".into()));
+        }
         Ok(self.details.lock().unwrap().get(&id.0).cloned())
     }
 
@@ -103,6 +117,9 @@ impl TwitchApi for FakeTwitch {
         _limit: u32,
     ) -> Result<Vec<(Channel, Stream)>, ApiError> {
         self.guard()?;
+        if *self.fail_directory.lock().unwrap() {
+            return Err(ApiError::Network("HTTP 504".into()));
+        }
         let hidden = self.below_the_fold.lock().unwrap().clone();
         Ok(self
             .channels
@@ -129,6 +146,9 @@ impl TwitchApi for FakeTwitch {
 
     async fn send_watch(&self, channel: &Channel, _stream: &Stream) -> Result<(), ApiError> {
         self.guard()?;
+        if *self.fail_watch.lock().unwrap() {
+            return Err(ApiError::Network("spade returned HTTP 504".into()));
+        }
         self.watches_sent.lock().unwrap().push(channel.id.clone());
         Ok(())
     }

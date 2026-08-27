@@ -3529,3 +3529,180 @@ async fn an_unreported_category_does_not_evict_a_channel() {
         .unwrap();
     assert!(e.current_channel().is_some(), "absence of an answer is not a wrong answer");
 }
+
+// ---------------------------------------------------------------------------
+// Not knowing, and saying so
+// ---------------------------------------------------------------------------
+
+/// Observed live on 2026-08-27: "channel selection failed error=network
+/// failure: HTTP 504" and, on the very next line, "idle — no eligible
+/// channel". The dashboard said the same thing in more words: "No live channel
+/// can progress any of your campaigns right now."
+///
+/// Both are findings about who is streaming, and the miner had just failed to
+/// look. The whole point of this project is that it does not tell you things
+/// it has not established, and "nobody is live" off the back of a failed
+/// request is exactly that.
+#[tokio::test]
+async fn a_failed_selection_pass_is_not_a_finding_that_nobody_is_live() {
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    *e.api().fail_directory.lock().unwrap() = true;
+
+    let result = e.select_channel(now()).await;
+
+    assert!(result.is_err(), "precondition: the directory query failed");
+    assert_eq!(e.state(), MiningState::Idle, "nothing is being watched");
+    assert!(
+        e.selection_failure().is_some(),
+        "idle after a failed look must be distinguishable from idle after a \
+         look that found nothing"
+    );
+}
+
+/// The other direction, and the one that makes the first worth having: a pass
+/// that completes and finds nobody must not leave a stale excuse behind, or
+/// "we could not check" would outlive the failure and become its own lie.
+#[tokio::test]
+async fn a_completed_pass_clears_the_excuse() {
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    *e.api().fail_directory.lock().unwrap() = true;
+    assert!(e.select_channel(now()).await.is_err());
+    assert!(e.selection_failure().is_some());
+
+    *e.api().fail_directory.lock().unwrap() = false;
+    e.select_channel(now()).await.unwrap();
+
+    assert_eq!(
+        e.selection_failure(),
+        None,
+        "the pass finished; whatever it found is now a real answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Campaigns nobody could look at
+// ---------------------------------------------------------------------------
+
+/// Observed live on 2026-08-27: sixteen "campaign details failed" warnings,
+/// and then "Synced 84 campaigns, 3 mineable" — a total that presents itself
+/// as covering everything Twitch offered, computed from a set those sixteen
+/// had silently left. They were not mineable, not rejected, and not in the
+/// count; they had simply stopped existing, and no figure the user could see
+/// said otherwise.
+///
+/// A campaign nobody could describe is not a campaign not worth mining.
+#[tokio::test]
+async fn campaigns_whose_detail_failed_are_counted_rather_than_forgotten() {
+    let fake = FakeTwitch::default();
+    *fake.offered.lock().unwrap() =
+        vec![campaign("c1", true, vec![]), campaign("c2", true, vec![])];
+    fake.details
+        .lock()
+        .unwrap()
+        .insert("c1".into(), campaign("c1", true, vec![drop("d1", 60, 0)]));
+    // Twitch offered c2 and then would not describe it.
+    fake.fail_details.lock().unwrap().insert("c2".into());
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let synced = e
+        .drain_events()
+        .into_iter()
+        .find_map(|ev| match ev.kind {
+            EventKind::CampaignsSynced {
+                total,
+                eligible,
+                unchecked,
+            } => Some((total, eligible, unchecked)),
+            _ => None,
+        })
+        .expect("a sync reports itself");
+
+    assert_eq!(
+        synced,
+        (2, 1, 1),
+        "both campaigns were offered; one is mineable and one is unknown, and \
+         a total of 1 would be a claim that Twitch offered only one"
+    );
+}
+
+/// The summary line is what the user actually reads, and it was the lie.
+#[test]
+fn the_sync_summary_admits_what_it_could_not_check() {
+    let complete = EventKind::CampaignsSynced {
+        total: 84,
+        eligible: 3,
+        unchecked: 0,
+    }
+    .summary();
+    assert_eq!(complete, "Synced 84 campaigns, 3 mineable");
+
+    let partial = EventKind::CampaignsSynced {
+        total: 100,
+        eligible: 3,
+        unchecked: 16,
+    }
+    .summary();
+    assert!(
+        partial.contains("16 could not be checked"),
+        "sixteen campaigns of unknown worth must not read as settled: {partial}"
+    );
+}
+
+/// The other half of not tearing the session down on a tick failure.
+///
+/// Removing that teardown is only defensible if the watchdog can actually
+/// reach a channel that has genuinely stopped earning — and the teardown was
+/// what stood in its way, because `stop_watching` resets the ladder, so a
+/// heartbeat failing every minute restarted recovery every minute and rung one
+/// was as far as it ever got.
+///
+/// Here the heartbeat fails on every single tick. Nothing is ever confirmed,
+/// and the channel must still be given up.
+#[tokio::test]
+async fn a_channel_whose_heartbeat_always_fails_is_still_abandoned() {
+    let fake = happy_path();
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    *e.api().fail_watch.lock().unwrap() = true;
+
+    let mut t = 0i64;
+    let mut rungs = 0;
+    while e.current_channel().is_some() && rungs < RecoveryStep::LADDER.len() {
+        let at = now() + chrono::Duration::seconds(t);
+        // The main loop logs a failed tick and carries on; so does this.
+        let _ = e.tick(at).await;
+        if let Verdict::Escalate(step) = e.assess_health(at) {
+            e.apply_recovery(step, at).await.unwrap();
+            rungs += 1;
+        }
+        t += 61;
+    }
+
+    assert!(
+        e.api().watches_sent.lock().unwrap().is_empty(),
+        "precondition: not one heartbeat landed"
+    );
+    assert!(
+        e.current_channel().is_none(),
+        "a channel that never earns must still lose its slot — the watchdog is \
+         the mechanism, and a per-tick teardown was resetting it before it \
+         could climb"
+    );
+    // Named specifically, so this cannot pass because something else happened
+    // to clear the session: quarantining the channel is what the SwitchChannel
+    // rung does, and reaching that rung is the whole claim.
+    let quarantined = e.snapshot("a", None, now()).health.quarantined_channels;
+    assert!(
+        quarantined.iter().any(|q| q.name == "ch1"),
+        "the ladder must have reached SwitchChannel, not merely ended up idle: \
+         {quarantined:?}"
+    );
+}

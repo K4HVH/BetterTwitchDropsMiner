@@ -213,6 +213,15 @@ pub struct Engine<A: TwitchApi> {
     /// campaign id. A campaign absent from the map was not looked at, which
     /// the dashboard reports differently from a campaign nobody is streaming.
     live_counts: HashMap<String, usize>,
+    /// Why the last selection pass could not finish, if it could not.
+    ///
+    /// "Idle because nothing is worth watching" and "idle because the question
+    /// could not be asked" are different facts, and only one of them is about
+    /// Twitch's streamers. Reporting the first when the second is true is how
+    /// a miner sidelined by three failed requests came to tell its user that
+    /// nobody was live. Cleared by any pass that completes, so it can never
+    /// age into a claim about now.
+    last_selection_error: Option<String>,
     progress: ProgressTracker,
     watchdog: Watchdog,
     quarantine: Quarantine,
@@ -292,6 +301,7 @@ impl<A: TwitchApi> Engine<A> {
             current: None,
             live: Vec::new(),
             live_counts: HashMap::new(),
+            last_selection_error: None,
             progress: ProgressTracker::new(),
             events: Vec::new(),
             last_watch: None,
@@ -383,6 +393,7 @@ impl<A: TwitchApi> Engine<A> {
                 // it has not looked, which is the truth.
                 self.live.clear();
                 self.live_counts.clear();
+                self.last_selection_error = None;
                 self.emit(now, EventKind::Paused);
                 CommandEffect::message("Mining paused").with_persist()
             }
@@ -789,6 +800,7 @@ impl<A: TwitchApi> Engine<A> {
                 .since_last_confirmation(now)
                 .map(|d| d.num_seconds()),
             recovery_step: self.recovery_step.map(|s| s.describe().to_owned()),
+            last_selection_error: self.last_selection_error.clone(),
             last_sync: self.last_sync,
             next_sync_in_seconds: self.last_sync.map(|t| {
                 let scheduled = (t + self.config.sync_interval - now).num_seconds().max(0);
@@ -1284,6 +1296,12 @@ impl<A: TwitchApi> Engine<A> {
         }
     }
 
+    /// Why the last selection pass failed, if it did. `None` means the last
+    /// pass finished, so an idle miner really did look and find nothing.
+    pub fn selection_failure(&self) -> Option<&str> {
+        self.last_selection_error.as_deref()
+    }
+
     /// Confirmed progress for a drop, if Twitch has reported any.
     pub fn confirmed(&self, drop: &DropId) -> Option<&crate::progress::ConfirmedProgress> {
         self.progress.confirmed(drop)
@@ -1471,6 +1489,12 @@ impl<A: TwitchApi> Engine<A> {
 
         // Batched: against a real account this is a couple of dozen campaigns,
         // and asking about them one at a time was most of a sync's wall time.
+        // Campaigns Twitch offered that we could not expand. Without a detail
+        // response there are no drop tiers, so they can be neither assessed
+        // nor rejected: they simply left `merged` and stopped existing, and
+        // the totals reported afterwards were short by however many had
+        // failed. Sixteen went that way in one sync on 2026-08-27.
+        let mut unchecked: Vec<CampaignId> = Vec::new();
         for (id, result) in self.api.campaign_details_many(&wanted_details).await {
             match result {
                 Ok(Some(mut full)) => {
@@ -1490,8 +1514,16 @@ impl<A: TwitchApi> Engine<A> {
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(campaign = %id, error = %e, "campaign details failed");
+                    unchecked.push(id);
                 }
             }
+        }
+        if !unchecked.is_empty() {
+            tracing::warn!(
+                count = unchecked.len(),
+                "campaigns Twitch offered but would not describe; they are not \
+                 mineable, not rejected, and not known either way"
+            );
         }
 
         // Campaigns already in the inventory are never detail-fetched — there
@@ -1607,8 +1639,9 @@ impl<A: TwitchApi> Engine<A> {
         self.emit(
             now,
             EventKind::CampaignsSynced {
-                total: total + skipped_unlinked,
+                total: total + skipped_unlinked + unchecked.len(),
                 eligible: eligible.len(),
+                unchecked: unchecked.len(),
             },
         );
         // Campaign ids churn every relaunch, so an exclusion list keyed on
@@ -1690,7 +1723,20 @@ impl<A: TwitchApi> Engine<A> {
         // user's command: `select_channel` returned Err, the caller logged it,
         // and `needs_selection` then reported nothing was due for another ten
         // minutes — with the dashboard already told the command succeeded.
-        let candidates = self.gather_candidates(now).await?;
+        let candidates = match self.gather_candidates(now).await {
+            Ok(candidates) => candidates,
+            Err(e) => {
+                // Remembered rather than merely returned. The caller logs it
+                // and moves on, and everything downstream then reported plain
+                // "Idle" — which the log renders as "no eligible channel" and
+                // the dashboard as "no live channel can progress any of your
+                // campaigns right now". Both are assertions about Twitch's
+                // streamers made by a miner that had just failed to ask.
+                self.last_selection_error = Some(e.to_string());
+                return Err(e);
+            }
+        };
+        self.last_selection_error = None;
         self.last_selection = Some(now);
         self.reselect_forced = false;
         // Kept for the dashboard, so the user sees the choice we faced. This

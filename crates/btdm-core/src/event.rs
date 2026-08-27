@@ -60,6 +60,13 @@ pub enum EventKind {
     CampaignsSynced {
         total: usize,
         eligible: usize,
+        /// Campaigns Twitch offered whose detail could not be fetched. They
+        /// are neither mineable nor rejected — nobody knows which, and the
+        /// count exists so the two numbers either side of it stop implying
+        /// that they do. Defaulted so events written before it existed still
+        /// load.
+        #[serde(default)]
+        unchecked: usize,
     },
     /// A campaign was rejected, with the reason, so the UI never has to guess.
     CampaignRejected {
@@ -160,8 +167,21 @@ impl EventKind {
             } => format!("Enter code {user_code} at {verification_uri}"),
             Self::AuthSucceeded { login, .. } => format!("Signed in as {login}"),
             Self::AuthExpired => "The Twitch token expired — sign in again".into(),
-            Self::CampaignsSynced { total, eligible } => {
-                format!("Synced {total} campaigns, {eligible} mineable")
+            Self::CampaignsSynced {
+                total,
+                eligible,
+                unchecked,
+            } => {
+                let mut summary = format!("Synced {total} campaigns, {eligible} mineable");
+                // Sixteen campaigns once fell out of a sync between those two
+                // numbers, and the line still read "Synced 84 campaigns, 3
+                // mineable" as though it had covered everything. A campaign
+                // nobody could look at is not a campaign that is not worth
+                // mining, and the summary must not round it to one.
+                if *unchecked > 0 {
+                    summary.push_str(&format!(", {unchecked} could not be checked"));
+                }
+                summary
             }
             Self::CampaignRejected { campaign, reason } => {
                 format!("Skipping campaign {campaign}: {}", reason.explain())
@@ -291,6 +311,7 @@ mod tests {
             EventKind::CampaignsSynced {
                 total: 85,
                 eligible: 17,
+                unchecked: 0,
             },
             EventKind::CampaignRejected {
                 campaign: CampaignId::from("c1"),
@@ -402,6 +423,7 @@ mod tests {
             kind: EventKind::CampaignsSynced {
                 total: 3,
                 eligible: 1,
+                unchecked: 0,
             },
         };
         let json = serde_json::to_string(&e).unwrap();

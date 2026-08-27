@@ -446,6 +446,7 @@ mod history_tests {
             &event(EventKind::CampaignsSynced {
                 total: 86,
                 eligible: 16,
+                unchecked: 0,
             }),
         )
         .unwrap();

@@ -676,7 +676,14 @@
     }
     if (!w) {
       panel.append(el("div", "headline", "Idle"));
-      const why = s.eligible.length
+      // Both of the alternatives below are findings about Twitch's streamers.
+      // A pass that never completed has made neither, and stating one anyway
+      // is how a miner sidelined by failed requests told its user that nobody
+      // was live.
+      const why = s.health.last_selection_error
+        ? "The last look for a channel failed, so who is live is unknown: "
+          + s.health.last_selection_error
+        : s.eligible.length
         ? "No live channel can progress any of your campaigns right now."
         : "No campaign is currently mineable.";
       panel.append(el("div", "sub", why));
