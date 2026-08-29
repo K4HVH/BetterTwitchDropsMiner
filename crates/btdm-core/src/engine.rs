@@ -1285,6 +1285,26 @@ impl<A: TwitchApi> Engine<A> {
         campaign.drops.iter().any(|d| &d.id == drop)
     }
 
+    /// Whether watching the current channel can still advance anything.
+    ///
+    /// A drop that is fully earned but not yet claimed is *not* something more
+    /// watching can help with, so it deliberately does not count here — even
+    /// though [`eligibility::mineable_drops`] still lists it, which it must, or
+    /// the campaign would fall out of `self.campaigns` and the drop would never
+    /// be claimed at all.
+    fn current_can_still_earn(&self) -> bool {
+        let Some(watch) = &self.current else {
+            return false;
+        };
+        watch.campaigns.iter().any(|id| {
+            self.campaigns.iter().find(|c| &c.id == id).is_some_and(|c| {
+                eligibility::mineable_drops(c)
+                    .iter()
+                    .any(|d| d.remaining_minutes() > 0)
+            })
+        })
+    }
+
     pub fn state(&self) -> MiningState {
         if self.paused {
             return MiningState::Paused;
@@ -2538,6 +2558,7 @@ impl<A: TwitchApi> Engine<A> {
     /// still ours — and so is one from a campaign that ended twenty minutes
     /// ago, which Twitch allows for a further twenty-four hours.
     pub async fn claim_ready(&mut self, now: DateTime<Utc>) -> Result<(), ApiError> {
+        let mut claimed_anything = false;
         let ready: Vec<(CampaignId, DropId, Option<String>, String)> = self
             .campaigns
             .iter()
@@ -2604,7 +2625,21 @@ impl<A: TwitchApi> Engine<A> {
                 }
             }
             self.claim_backoff.remove(&drop_id);
+            claimed_anything = true;
             self.emit(now, EventKind::DropClaimed { drop: drop_id, name });
+        }
+
+        // A claim can be the last thing a channel had to give, and nothing else
+        // notices. Observed live on 2026-08-24: the final tier of both campaigns
+        // a channel was chosen for confirmed at 19:57, both were claimed at
+        // 19:58, and the miner then heartbeated that stream for seven more
+        // minutes. The sync that would have dropped the campaigns was ten
+        // minutes away, and the watchdog reads a live, healthy stream as
+        // healthy — correctly, because this is not a stall. It is a finished
+        // job, and the only honest response to it is to go and find another.
+        if claimed_anything && self.current.is_some() && !self.current_can_still_earn() {
+            tracing::info!("everything this channel was chosen for is claimed; reselecting");
+            self.stop_watching(now, StopReason::Finished);
         }
         Ok(())
     }

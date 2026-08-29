@@ -3531,6 +3531,67 @@ async fn an_unreported_category_does_not_evict_a_channel() {
 }
 
 // ---------------------------------------------------------------------------
+// Finishing what a channel was chosen for
+// ---------------------------------------------------------------------------
+
+/// Observed live on 2026-08-24. Twitch confirmed the final 240/240 minute of
+/// both campaigns a channel was being watched for at 19:57:34; the miner
+/// claimed them at 19:58:25 and then sat on that channel for a further seven
+/// minutes, heartbeating a stream that could no longer earn it anything. It
+/// was freed only because the streamer happened to go offline.
+///
+/// Nothing re-examines the session after a claim, so the only ways out were
+/// the ten-minute sync and a watchdog ladder that needs four rungs — around
+/// nine minutes — to reach "switch channel". Neither is a stall: the channel
+/// was healthy and live, it simply had nothing left to give.
+#[tokio::test]
+async fn claiming_the_last_drop_gives_up_the_channel_at_once() {
+    let fake = happy_path();
+    *fake.inventory.lock().unwrap() = vec![campaign("c1", true, vec![drop("d1", 60, 60)])];
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    assert!(e.current().is_some(), "precondition: something is being watched");
+
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(e.api().claims.lock().unwrap().len(), 1, "the drop is claimed");
+    assert_eq!(
+        e.state(),
+        MiningState::Idle,
+        "with nothing left to earn here the channel must be given up at once, \
+         not left to the sync interval or the watchdog"
+    );
+}
+
+/// The other half of the rule: finishing one campaign is no reason to abandon
+/// a channel that is still advancing another.
+#[tokio::test]
+async fn a_claim_that_leaves_another_campaign_running_keeps_the_channel() {
+    let fake = happy_path();
+    *fake.inventory.lock().unwrap() = vec![
+        campaign("c1", true, vec![drop("d1", 60, 60)]),
+        campaign("c2", true, vec![drop("d2", 60, 10)]),
+    ];
+    fake.available
+        .lock()
+        .unwrap()
+        .insert("ch1".into(), vec![DropId::from("d1"), DropId::from("d2")]);
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    assert_eq!(e.api().claims.lock().unwrap().len(), 1, "only d1 was ready");
+    assert!(
+        e.current().is_some(),
+        "c2 still has fifty minutes to earn here; the channel is still worth watching"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Not knowing, and saying so
 // ---------------------------------------------------------------------------
 

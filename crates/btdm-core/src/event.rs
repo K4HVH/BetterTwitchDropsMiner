@@ -139,6 +139,11 @@ pub enum StopReason {
     BetterChannel,
     /// Recovery gave up on this channel.
     NotEarning,
+    /// Everything this channel was chosen for has been earned and claimed.
+    /// Distinct from `NotEarning`: nothing went wrong, the work is simply
+    /// done, so it is neither a warning nor a reason to carry a recovery
+    /// episode onto the next channel.
+    Finished,
     /// The user asked.
     UserRequest,
     /// An API error made the session untrustworthy.
@@ -151,6 +156,7 @@ impl StopReason {
             Self::WentOffline => "the stream ended",
             Self::BetterChannel => "a better channel was available",
             Self::NotEarning => "it was earning nothing",
+            Self::Finished => "everything it could earn there is claimed",
             Self::UserRequest => "you asked",
             Self::Error => "an error made the session untrustworthy",
         }
