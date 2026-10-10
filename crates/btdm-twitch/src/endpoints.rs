@@ -35,6 +35,11 @@ pub fn mobile_base() -> String {
     from_env("BTDM_MOBILE_URL", crate::watch::MOBILE_BASE_URL)
 }
 
+/// Where a stream's playlist index is fetched, with a playback token.
+pub fn usher() -> String {
+    from_env("BTDM_USHER_URL", crate::playback::USHER_URL)
+}
+
 fn from_env(key: &str, default: &str) -> String {
     match std::env::var(key) {
         Ok(v) if !v.trim().is_empty() => {
@@ -59,6 +64,7 @@ mod tests {
         assert!(validate().contains("twitch.tv"));
         assert!(pubsub().starts_with("wss://"));
         assert!(mobile_base().contains("twitch.tv"));
+        assert!(usher().starts_with("https://"));
     }
 
     #[test]

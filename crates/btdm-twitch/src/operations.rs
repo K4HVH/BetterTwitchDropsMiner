@@ -141,6 +141,18 @@ pub const STREAM_INFO: GqlOperation = GqlOperation {
 }"#,
 };
 
+/// Opens a stream for playback. Since 2026-10-08 this is the first step of
+/// the only kind of watching Twitch credits; see [`crate::playback`].
+pub const PLAYBACK_ACCESS_TOKEN: GqlOperation = GqlOperation {
+    name: "PlaybackAccessToken",
+    sha256: "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9",
+    raw_query: r#"query PlaybackAccessToken($login: String!, $platform: String!, $playerType: String!) {
+  streamPlaybackAccessToken(channelName: $login, params: {platform: $platform, playerBackend: "mediaplayer", playerType: $playerType}) {
+    value signature
+  }
+}"#,
+};
+
 pub const CLAIM_DROP: GqlOperation = GqlOperation {
     name: "DropsPage_ClaimDropRewards",
     sha256: "a455deea71bdc9015b78eb49f4acfbce8baa7ccbedd28e549bb025bd0f751930",
@@ -166,6 +178,7 @@ pub const ALL: &[GqlOperation] = &[
     GAME_DIRECTORY,
     SLUG_REDIRECT,
     STREAM_INFO,
+    PLAYBACK_ACCESS_TOKEN,
     CLAIM_DROP,
     CLAIM_POINTS,
 ];

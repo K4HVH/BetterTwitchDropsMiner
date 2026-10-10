@@ -2,14 +2,16 @@
 //!
 //! Everything else tests a layer. This tests the wiring: `run::mine` starting
 //! from a stored token, validating it, syncing campaigns, choosing a channel,
-//! sending a heartbeat to the spade endpoint it had to discover by scraping a
-//! page, polling progress and claiming a finished drop — the sequence that
-//! decides what actually happens on a real account, and which was previously
-//! verified only by running the binary and watching the log.
+//! playing the stream and sending a heartbeat to the spade endpoint it had to
+//! discover by scraping a page, polling progress and claiming a finished drop —
+//! the sequence that decides what actually happens on a real account, and
+//! which was previously verified only by running the binary and watching the
+//! log.
 //!
 //! The fake speaks enough of Twitch's private API to be indistinguishable from
 //! it for one pass: OAuth validation, batched and single GraphQL, the mobile
-//! page that embeds the spade URL, and spade itself.
+//! page that embeds the spade URL, spade itself, and the playlists and video
+//! segments of a live stream.
 
 use btdm::config::Config;
 use btdm::run::{self, RunOptions};
@@ -24,6 +26,9 @@ use tokio::net::TcpListener;
 #[derive(Default)]
 struct Seen {
     heartbeats: AtomicUsize,
+    /// Video segments requested. Since 2026-10-08 these, not heartbeats, are
+    /// what Twitch credits drop time for.
+    segments: AtomicUsize,
     claims: AtomicUsize,
     operations: std::sync::Mutex<Vec<String>>,
     /// Answer the progress poll with a gateway error instead of a session.
@@ -39,7 +44,7 @@ async fn fake_twitch(seen: Arc<Seen>, drop_minutes: u32) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
-    let spade = format!("{base}/spade");
+    let base_for_task = base.clone();
 
     tokio::spawn(async move {
         loop {
@@ -47,7 +52,7 @@ async fn fake_twitch(seen: Arc<Seen>, drop_minutes: u32) -> String {
                 return;
             };
             let seen = Arc::clone(&seen);
-            let spade = spade.clone();
+            let base = base_for_task.clone();
 
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 262_144];
@@ -56,11 +61,13 @@ async fn fake_twitch(seen: Arc<Seen>, drop_minutes: u32) -> String {
                     _ => return,
                 };
                 let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let method = raw.split_whitespace().next().unwrap_or("").to_string();
                 let path = raw.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
                 let (status, content_type, payload) =
-                    respond(&path, &body, &seen, &spade, drop_minutes);
+                    respond(&method, &path, &body, &seen, &base, drop_minutes);
+                let payload = if method == "HEAD" { String::new() } else { payload };
 
                 let response = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\n\
@@ -77,12 +84,14 @@ async fn fake_twitch(seen: Arc<Seen>, drop_minutes: u32) -> String {
 }
 
 fn respond(
+    method: &str,
     path: &str,
     body: &str,
     seen: &Seen,
-    spade: &str,
+    base: &str,
     drop_minutes: u32,
 ) -> (u16, &'static str, String) {
+    let spade = format!("{base}/spade");
     if path.starts_with("/oauth2/rejected") {
         return (401, "application/json", json!({ "message": "invalid" }).to_string());
     }
@@ -105,7 +114,28 @@ fn respond(
         );
     }
 
-    // The one endpoint that advances drop time.
+    // A live stream: its playlist index, its playlist, and its video.
+    if path.starts_with("/api/channel/hls/") {
+        return (
+            200,
+            "application/vnd.apple.mpegurl",
+            format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=200000\n{base}/media/streamer.m3u8\n"),
+        );
+    }
+    if path.starts_with("/media/") {
+        let mut playlist = String::from("#EXTM3U\n");
+        for i in 0..3 {
+            playlist.push_str(&format!("#EXTINF:2.000,live\n{base}/segment/{i}.ts\n"));
+        }
+        return (200, "application/vnd.apple.mpegurl", playlist);
+    }
+    if method == "HEAD" && path.starts_with("/segment/") {
+        seen.segments.fetch_add(1, Ordering::SeqCst);
+        return (200, "video/mp2t", String::new());
+    }
+
+    // The minute-watched event. No longer what earns drop time, but still
+    // sent, as a web player does.
     if path.starts_with("/spade") {
         // Counted only when accepted: the point of the test below is that a
         // refused heartbeat is not a heartbeat.
@@ -243,6 +273,9 @@ fn answer(op: &Value, seen: &Seen, drop_minutes: u32) -> Value {
                 }
             }
         }),
+        "PlaybackAccessToken" => json!({
+            "streamPlaybackAccessToken": { "value": "{\"channel\":\"streamer\"}", "signature": "sig" }
+        }),
         "DropsPage_ClaimDropRewards" => {
             seen.claims.fetch_add(1, Ordering::SeqCst);
             json!({ "claimDropRewards": { "status": "ELIGIBLE_FOR_ALL" } })
@@ -281,6 +314,7 @@ fn point_at(base: &str) {
         std::env::set_var("BTDM_GQL_URL", format!("{base}/gql"));
         std::env::set_var("BTDM_VALIDATE_URL", format!("{base}/oauth2/validate"));
         std::env::set_var("BTDM_MOBILE_URL", base);
+        std::env::set_var("BTDM_USHER_URL", base);
         // Nothing listens for websockets. The supervisor retries in the
         // background and the poll backstop carries progress, which is itself
         // worth proving works.
@@ -348,9 +382,14 @@ fn the_miner_syncs_selects_and_sends_a_heartbeat() {
         "never verified the channel earns anything: {ops:?}"
     );
     assert_eq!(
+        seen.segments.load(Ordering::SeqCst),
+        3,
+        "the stream was not played: since 2026-10-08 nothing else earns drop time"
+    );
+    assert_eq!(
         seen.heartbeats.load(Ordering::SeqCst),
         1,
-        "the one request that advances drop time was not sent"
+        "the minute-watched event was not sent"
     );
     });
 }
@@ -548,14 +587,13 @@ fn a_gateway_error_on_the_progress_poll_does_not_cost_the_channel() {
     })
 }
 
-/// The heartbeat was the one request in the miner with no retry at all.
-///
-/// Everything else rode out three 5xxs; this — the only endpoint that advances
-/// drop time — gave up on the first, and the minute it was posting was simply
-/// lost. Twitch was observed answering 504 freely on 2026-08-27, so the gap
-/// was being exercised, silently, on the request that matters most.
+/// The minute-watched event was once the one request in the miner with no
+/// retry at all, and back then the only one that advanced drop time. Twitch
+/// was observed answering 504 freely on 2026-08-27. It no longer earns
+/// anything (see `btdm_twitch::playback`), but it is still sent, and a blip
+/// should not be what stops it arriving.
 #[test]
-fn a_flaky_spade_endpoint_does_not_cost_the_watch_minute() {
+fn a_flaky_spade_endpoint_still_gets_the_event_through() {
     serial(async {
         let seen = Arc::new(Seen::default());
         seen.break_heartbeats.store(2, Ordering::SeqCst);
@@ -569,13 +607,16 @@ fn a_flaky_spade_endpoint_does_not_cost_the_watch_minute() {
         assert_eq!(
             seen.heartbeats.load(Ordering::SeqCst),
             1,
-            "the third attempt must land; a minute of drop time turns on it"
+            "the third attempt must land"
         );
     })
 }
 
-/// And the bound, because retrying a heartbeat forever would push the next one
-/// past the minute it was for.
+/// And the bound, because retrying forever would hold up the heartbeat.
+///
+/// Since 2026-10-08 spade earns nothing, so it failing outright must not make
+/// a heartbeat that played the stream look failed: that would report a
+/// working session as broken.
 #[test]
 fn heartbeat_retries_are_bounded() {
     serial(async {
@@ -592,6 +633,17 @@ fn heartbeat_retries_are_bounded() {
             seen.heartbeats.load(Ordering::SeqCst),
             0,
             "none was ever accepted, and the pass still ended"
+        );
+        assert!(seen.segments.load(Ordering::SeqCst) > 0, "the stream was not played");
+        let summaries: Vec<String> = storage
+            .recent_events("default", 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.summary.clone())
+            .collect();
+        assert!(
+            summaries.iter().any(|s| s.contains("Heartbeat sent")),
+            "the stream played, yet the heartbeat was recorded as failed: {summaries:?}"
         );
     })
 }

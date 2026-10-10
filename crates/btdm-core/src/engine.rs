@@ -957,9 +957,10 @@ impl<A: TwitchApi> Engine<A> {
 
     /// Rung 2: re-fetch stream info.
     ///
-    /// The broadcast ID changes when a stream restarts, and heartbeats carrying
-    /// a stale one are accepted and earn nothing — a healthy-looking session
-    /// that is silently worthless. Returns whether the ID actually changed.
+    /// The broadcast ID changes when a stream restarts. While spade earned
+    /// drop time, heartbeats carrying a stale one were accepted and earned
+    /// nothing; now a new ID makes the next heartbeat start watching the new
+    /// broadcast afresh. Returns whether the ID actually changed.
     /// Whether a stream still serves any of the campaigns it was chosen for.
     ///
     /// A campaign in one of the sitewide categories is earned on any channel,
@@ -989,7 +990,7 @@ impl<A: TwitchApi> Engine<A> {
                         channel = %watch.channel.login,
                         old = %watch.stream.broadcast_id,
                         new = %fresh.broadcast_id,
-                        "the stream restarted; heartbeats were carrying a stale broadcast id"
+                        "the stream restarted; watching the new broadcast afresh"
                     );
                     self.progress.begin(now);
                     self.last_health_advance = Some(now);
@@ -1090,12 +1091,18 @@ impl<A: TwitchApi> Engine<A> {
 
         match step {
             RecoveryStep::ResendWatch => {
+                // A heartbeat repeated for the same stream is answered from
+                // what the transport has already seen, so on its own this
+                // retried nothing. Stopping first makes the next one start
+                // watching afresh.
+                self.api.stop_watch();
                 self.force_next_watch();
                 Ok(RecoveryOutcome::default())
             }
             RecoveryStep::RefreshStreamInfo => {
                 match self.refresh_stream_info(now).await {
-                    // The broadcast id moved, so heartbeats were earning nothing.
+                    // The broadcast id moved: watch the new one now rather
+                    // than at the next scheduled heartbeat.
                     Ok(true) => self.force_next_watch(),
                     Ok(false) => tracing::debug!("stream info unchanged"),
                     Err(e) => tracing::warn!(error = %e, "could not refresh stream info"),
@@ -1339,6 +1346,7 @@ impl<A: TwitchApi> Engine<A> {
         if let Some(w) = &self.current {
             let channel = w.channel.id.clone();
             self.emit(now, EventKind::StoppedWatching { channel, reason });
+            self.api.stop_watch();
         }
         self.current = None;
         self.progress.reset();
@@ -2346,6 +2354,12 @@ impl<A: TwitchApi> Engine<A> {
     }
 
     fn begin_watching(&mut self, now: DateTime<Utc>, candidate: Candidate, reason: String) {
+        // Moving straight from one channel to another skips `stop_watching`,
+        // and the transport would otherwise go on playing the old one until
+        // the next heartbeat named the new one.
+        if self.current.is_some() {
+            self.api.stop_watch();
+        }
         self.progress.reset();
         self.progress.begin(now);
         // Resetting here as well as in `stop_watching` is what actually kept

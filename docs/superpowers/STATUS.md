@@ -13,7 +13,12 @@ Account `k4hvh` (530826710), repeatedly, over the course of the work:
 - 86 campaigns discovered, 16 mineable, 69 rejected as unlinked with a working
   link to each one's own linking page
 - Spade heartbeat accepted (204), **server-confirmed progress climbing**, a
-  drop reaching 60/60 and the next tier taking over
+  drop reaching 60/60 and the next tier taking over — until 2026-10-08, when
+  spade stopped earning anything (see "What Twitch changed under us")
+- The playback player, on its own with nothing else watching (2026-10-10):
+  CFB Live 7 → 11 of 15 over four minutes, and on the final code 28 → 30 of
+  30, the next tier taking over and continuing 31 → 32 of 60, every heartbeat
+  reporting video served
 - Campaign switching, the feasibility filter abandoning an impossible campaign
   unprompted, the recovery ladder firing at exactly 360s on a non-earning
   channel
@@ -130,6 +135,24 @@ Honest list of what a serious miner could do that this does not.
 Worth recording separately, because these were not mistakes in the code when it
 was written — the API moved.
 
+- **Spade stopped earning drop time (2026-10-08).** A `minute-watched` event
+  is still accepted with a 204 and changes nothing. On this account an R6S drop
+  crept from 3 to 6 of 60 minutes over eight hours of repeated visits on
+  2026-10-09, and the miner spent the day leaving channel after channel as
+  "earning nothing" — correctly, as it turned out. Twitch now credits an
+  account that is actually fetching the stream: on 2026-10-10, HEAD requests
+  for a stream's video segments took EXFIL Brothers Day 2 from no drop session
+  at all to 4 minutes in under five, with nothing else changed. The reference
+  implementation and its forks hit the same wall the same day.
+
+  The miner now plays the stream (`btdm-twitch/src/playback.rs`): a playback
+  token, the stream's playlist, and a HEAD for each new segment every ten
+  seconds, on its own clock because a once-a-minute heartbeat would leave half
+  of each thirty-second playlist unrequested. The video itself is never
+  downloaded. The heartbeat now reports success only if video was actually
+  served since the last one. Spade is still sent, as a web player does, but
+  nothing depends on it.
+
 - **`viewerDropCampaigns` stopped listing game campaigns.** The per-channel
   availability check now returns only sitewide reward campaigns: every
   drops-enabled Escape from Tarkov streamer reports exactly one campaign, an
@@ -170,7 +193,7 @@ was written — the API moved.
 
 ## Test coverage, and where it is thin
 
-503 Rust tests and 127 dashboard checks, no clippy warnings, plus a live audit
+538 Rust tests and 127 dashboard checks, no clippy warnings, plus a live audit
 against Twitch itself (`tools/audit-live/`).
 
 **The check that was missing entirely.** Everything above asks whether the

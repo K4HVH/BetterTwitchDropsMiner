@@ -27,6 +27,8 @@ pub struct FakeTwitch {
     pub available: Mutex<HashMap<String, Vec<DropId>>>,
     pub progress: Mutex<Option<DropProgress>>,
     pub watches_sent: Mutex<Vec<ChannelId>>,
+    /// How many times the engine said it had stopped watching.
+    pub watch_stops: Mutex<usize>,
     /// Successful claims only.
     pub claims: Mutex<Vec<String>>,
     /// Every claim attempt, successful or not.
@@ -66,6 +68,7 @@ impl FakeTwitch {
             Some(ApiError::RateLimited) => Err(ApiError::RateLimited),
             Some(ApiError::Network(m)) => Err(ApiError::Network(m.clone())),
             Some(ApiError::Malformed(m)) => Err(ApiError::Malformed(m.clone())),
+            Some(ApiError::Refused(m)) => Err(ApiError::Refused(m.clone())),
             None => Ok(()),
         }
     }
@@ -151,6 +154,10 @@ impl TwitchApi for FakeTwitch {
         }
         self.watches_sent.lock().unwrap().push(channel.id.clone());
         Ok(())
+    }
+
+    fn stop_watch(&self) {
+        *self.watch_stops.lock().unwrap() += 1;
     }
 
     async fn current_progress(

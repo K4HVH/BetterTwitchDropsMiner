@@ -1676,7 +1676,8 @@
     if (s.watching && s.watching.stalled) {
       box.append(el("div", "banner bad",
         "Twitch has not confirmed progress recently. The miner is working its recovery ladder — " +
-        "if this persists, check that spade.twitch.tv is not blocked by an adblocker or DNS filter."));
+        "if this persists, check that nothing — an adblocker, DNS filter or VPN — is blocking " +
+        "Twitch's video hosts (*.ttvnw.net). Drop time is earned by fetching the stream."));
     }
     const impossible = s.eligible.filter((c) => c.slack_minutes < 0 && !c.excluded).length;
     if (impossible) {

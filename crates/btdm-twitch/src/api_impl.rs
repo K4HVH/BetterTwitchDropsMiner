@@ -5,10 +5,12 @@ use crate::gql::GqlClient;
 use crate::TwitchError;
 use crate::operations as ops;
 use crate::parse;
+use crate::playback::{self, Player};
 use crate::watch::WatchClient;
 use btdm_core::api::{ApiError, DropProgress, Inventory, TwitchApi};
 use btdm_core::model::*;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Operations per batched request. The reference implementation uses the same
@@ -16,8 +18,10 @@ use tokio::sync::Mutex;
 const BATCH_SIZE: usize = 20;
 
 pub struct TwitchClient {
-    gql: GqlClient,
+    gql: Arc<GqlClient>,
     watch: WatchClient,
+    /// Plays the stream being watched, which is what earns drop time.
+    player: Player,
     user_id: UserId,
     /// The account's own login, required as a variable by the campaign-details
     /// query even though the campaign is identified by ID.
@@ -28,13 +32,8 @@ pub struct TwitchClient {
 
 impl TwitchClient {
     pub fn new(http: reqwest::Client, token: String, user_id: UserId, login: String) -> Self {
-        Self {
-            gql: GqlClient::new(http.clone(), Some(token)),
-            watch: WatchClient::new(http),
-            user_id,
-            login,
-            spade_url: Mutex::new(None),
-        }
+        let gql = GqlClient::new(http.clone(), Some(token));
+        Self::with_gql(http, gql, user_id, login)
     }
 
     /// Test seam: point GQL at a mock server.
@@ -45,8 +44,20 @@ impl TwitchClient {
         login: String,
         gql_endpoint: String,
     ) -> Self {
+        let gql = GqlClient::with_endpoint(http.clone(), Some(token), gql_endpoint);
+        Self::with_gql(http, gql, user_id, login)
+    }
+
+    fn with_gql(http: reqwest::Client, gql: GqlClient, user_id: UserId, login: String) -> Self {
+        let gql = Arc::new(gql);
         Self {
-            gql: GqlClient::with_endpoint(http.clone(), Some(token), gql_endpoint),
+            player: Player::new(
+                http.clone(),
+                Arc::clone(&gql),
+                crate::endpoints::usher(),
+                playback::POLL_INTERVAL,
+            ),
+            gql,
             watch: WatchClient::new(http),
             user_id,
             login,
@@ -57,6 +68,39 @@ impl TwitchClient {
     /// Forget the cached spade URL so the next heartbeat rediscovers it.
     pub async fn invalidate_spade_url(&self) {
         *self.spade_url.lock().await = None;
+    }
+
+    /// The minute-watched event, to the spade URL discovered on first use.
+    async fn send_minute_watched(
+        &self,
+        channel: &Channel,
+        stream: &Stream,
+    ) -> Result<(), crate::TwitchError> {
+        let cached = self.spade_url.lock().await.clone();
+        let url = match cached {
+            Some(url) => url,
+            None => {
+                let url = self.watch.discover_spade_url(&channel.login).await?;
+                *self.spade_url.lock().await = Some(url.clone());
+                url
+            }
+        };
+
+        match self.watch.send(&url, channel, stream, &self.user_id).await {
+            Ok(()) => Ok(()),
+            // A rate limit or auth problem says nothing about whether the
+            // cached URL is still correct. Rediscovering would fire two extra
+            // requests while already being throttled.
+            Err(e @ (crate::TwitchError::RateLimited | crate::TwitchError::Unauthorized)) => {
+                Err(e)
+            }
+            Err(e) => {
+                // A rotated deployment invalidates the cached URL. Drop it so
+                // the next attempt rediscovers rather than failing forever.
+                self.invalidate_spade_url().await;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -229,31 +273,18 @@ impl TwitchApi for TwitchClient {
     }
 
     async fn send_watch(&self, channel: &Channel, stream: &Stream) -> Result<(), ApiError> {
-        let cached = self.spade_url.lock().await.clone();
-        let url = match cached {
-            Some(url) => url,
-            None => {
-                let url = self.watch.discover_spade_url(&channel.login).await?;
-                *self.spade_url.lock().await = Some(url.clone());
-                url
-            }
-        };
-
-        match self.watch.send(&url, channel, stream, &self.user_id).await {
-            Ok(()) => Ok(()),
-            // A rate limit or auth problem says nothing about whether the
-            // cached URL is still correct. Rediscovering would fire two extra
-            // requests while already being throttled.
-            Err(e @ (crate::TwitchError::RateLimited | crate::TwitchError::Unauthorized)) => {
-                Err(e.into())
-            }
-            Err(e) => {
-                // A rotated deployment invalidates the cached URL. Drop it so
-                // the next attempt rediscovers rather than failing forever.
-                self.invalidate_spade_url().await;
-                Err(e.into())
-            }
+        let watched = self.player.keep_watching(channel, stream).await;
+        // Earns nothing since 2026-10-08, but it is what a web player reports
+        // every minute, so it is still sent. Whether it lands is not what
+        // decides if this heartbeat worked: the player is.
+        if let Err(e) = self.send_minute_watched(channel, stream).await {
+            tracing::debug!(error = %e, "minute-watched event not delivered");
         }
+        watched.map_err(Into::into)
+    }
+
+    fn stop_watch(&self) {
+        self.player.stop();
     }
 
     async fn current_progress(

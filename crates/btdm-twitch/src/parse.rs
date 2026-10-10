@@ -553,6 +553,27 @@ pub fn claim_granted(response: &Value) -> Result<(), String> {
     }
 }
 
+/// The playback token's value and signature, which together open a stream's
+/// playlist index.
+pub fn parse_playback_token(data: &Value) -> Result<(String, String), TwitchError> {
+    let token = data
+        .get("streamPlaybackAccessToken")
+        .filter(|v| !v.is_null());
+    let field = |name: &str| {
+        token
+            .and_then(|t| t.get(name))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    match (field("value"), field("signature")) {
+        (Some(value), Some(signature)) => Ok((value, signature)),
+        _ => Err(TwitchError::Malformed(
+            "Twitch gave no playback token for this channel".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod claim_tests {
     use super::*;
@@ -712,5 +733,36 @@ mod ledger_tests {
         let campaigns = reconciled(&data);
         assert!(campaigns[0].drops[0].starts_at.is_some());
         assert!(campaigns[0].drops[0].ends_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod playback_token_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_token_is_its_value_and_signature() {
+        let data = json!({
+            "streamPlaybackAccessToken": { "value": "{\"channel\":\"x\"}", "signature": "abc" }
+        });
+        assert_eq!(
+            parse_playback_token(&data).unwrap(),
+            ("{\"channel\":\"x\"}".to_owned(), "abc".to_owned())
+        );
+    }
+
+    /// Twitch answers `null` for a login it does not know. That is a reason
+    /// this channel cannot be watched, not an empty token to send to usher.
+    #[test]
+    fn no_token_is_an_error_rather_than_an_empty_one() {
+        for data in [
+            json!({ "streamPlaybackAccessToken": null }),
+            json!({ "streamPlaybackAccessToken": { "value": "", "signature": "abc" } }),
+            json!({ "streamPlaybackAccessToken": { "value": "v" } }),
+            json!({}),
+        ] {
+            assert!(parse_playback_token(&data).is_err(), "{data}");
+        }
     }
 }

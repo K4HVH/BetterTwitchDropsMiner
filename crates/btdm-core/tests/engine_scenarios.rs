@@ -843,8 +843,25 @@ async fn resend_watch_forces_a_heartbeat_before_the_interval() {
     assert_eq!(e.api().watches_sent.lock().unwrap().len(), 2);
 }
 
-/// A restarted broadcast keeps earning nothing while looking healthy, so the
-/// rung has to notice the id changed and re-send against the new one.
+/// A transport that keeps playing between heartbeats answers a repeat
+/// heartbeat for the same stream from what it has already seen, so merely
+/// sending one again retries nothing. The rung has to make the next one start
+/// watching afresh — a new token, a new playlist — or it spends its minute
+/// and the ladder climbs towards resting a channel that may be fine.
+#[tokio::test]
+async fn resend_watch_starts_watching_afresh() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    e.apply_recovery(RecoveryStep::ResendWatch, now()).await.unwrap();
+    assert_eq!(*e.api().watch_stops.lock().unwrap(), 1);
+    assert!(e.current().is_some(), "restarting is not leaving the channel");
+}
+
+/// A restarted broadcast is a new stream, so the rung has to notice the id
+/// changed and make the next heartbeat watch the new one.
 #[tokio::test]
 async fn refreshing_stream_info_picks_up_a_restarted_broadcast() {
     let fake = happy_path();
@@ -1234,6 +1251,34 @@ async fn pausing_stops_watching_and_stops_selecting() {
     );
 }
 
+/// Watching is no longer only a heartbeat a minute: since 2026-10-08 the
+/// transport plays the stream between heartbeats. Pausing that did not reach
+/// it would leave the account watching after the user said stop.
+#[tokio::test]
+async fn pausing_tells_the_transport_to_stop_watching() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+    assert_eq!(*e.api().watch_stops.lock().unwrap(), 0, "nothing has been left yet");
+
+    e.apply_command(Command::Pause, now());
+    assert_eq!(*e.api().watch_stops.lock().unwrap(), 1);
+}
+
+/// The same for every other way of leaving a channel, or the account goes on
+/// watching one the miner has already given up.
+#[tokio::test]
+async fn leaving_a_channel_tells_the_transport_to_stop_watching() {
+    let mut e = engine(happy_path());
+    e.sync(now()).await.unwrap();
+    e.select_channel(now()).await.unwrap();
+    e.tick(now()).await.unwrap();
+
+    e.stop_watching(now(), btdm_core::event::StopReason::WentOffline);
+    assert_eq!(*e.api().watch_stops.lock().unwrap(), 1);
+}
+
 #[tokio::test]
 async fn resuming_selects_again() {
     let mut e = engine(happy_path());
@@ -1617,6 +1662,11 @@ async fn reselecting_the_same_channel_keeps_the_session_and_its_progress() {
     );
     assert_eq!(e.state(), MiningState::Mining, "progress must survive");
     assert_eq!(e.active_drop().unwrap().1.current_minutes, 30);
+    assert_eq!(
+        *e.api().watch_stops.lock().unwrap(),
+        0,
+        "staying on a channel must not restart watching it"
+    );
 }
 
 /// A campaign that becomes urgent must be able to take over from a comfortable
@@ -1655,6 +1705,13 @@ async fn an_urgent_campaign_displaces_a_comfortable_one() {
     assert_eq!(
         second.channel.login, "urgent-streamer",
         "a campaign expiring in three hours must beat one expiring in twenty days"
+    );
+    // Not left to the next heartbeat to notice: until then the account would
+    // still be watching the channel it has just abandoned.
+    assert_eq!(
+        *e.api().watch_stops.lock().unwrap(),
+        1,
+        "the abandoned channel was not stopped"
     );
 }
 

@@ -58,7 +58,7 @@ impl RecoveryStep {
     /// a frozen progress bar.
     pub fn describe(&self) -> &'static str {
         match self {
-            Self::ResendWatch => "sending another heartbeat",
+            Self::ResendWatch => "starting to watch the stream afresh",
             Self::RefreshStreamInfo => "checking whether the stream restarted",
             Self::ReverifyEligibility => "asking Twitch if this channel still earns our drops",
             Self::SwitchChannel => "giving up on this channel and finding another",

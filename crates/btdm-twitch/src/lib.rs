@@ -1,4 +1,4 @@
-//! Twitch API client: auth, GQL, spade heartbeat, PubSub.
+//! Twitch API client: auth, GQL, playback, the minute-watched event, PubSub.
 
 pub mod api_impl;
 pub mod auth;
@@ -7,6 +7,7 @@ pub mod gql;
 pub mod operations;
 pub mod endpoints;
 pub mod parse;
+pub mod playback;
 pub mod pubsub;
 pub mod watch;
 
@@ -24,10 +25,13 @@ pub enum TwitchError {
     RateLimited,
     #[error("unexpected response shape: {0}")]
     Malformed(String),
+    /// Twitch answered, but not with what was asked for.
+    #[error("{0}")]
+    Refused(String),
     #[error(
-        "cannot reach the watch endpoint {url} — drops CANNOT progress while this is \
-         blocked. It is an analytics domain, so an ad-blocker, Pi-hole, VPN filter or \
-         DNS blocklist is the usual cause: allow-list `spade.twitch.tv`. ({detail})"
+        "cannot reach the analytics endpoint {url} — an ad-blocker, Pi-hole, VPN filter \
+         or DNS blocklist is the usual cause. Drop time does not depend on it since \
+         2026-10-08, so this alone costs nothing. ({detail})"
     )]
     SpadeUnreachable { url: String, detail: String },
     #[error("persisted query hash is stale")]
@@ -53,6 +57,7 @@ impl From<TwitchError> for btdm_core::api::ApiError {
             // decoding response body", which is one prefix of noise in front
             // of the only three words that carried any information.
             TwitchError::Malformed(m) => ApiError::Malformed(m),
+            TwitchError::Refused(m) => ApiError::Refused(m),
             other => ApiError::Malformed(other.to_string()),
         }
     }

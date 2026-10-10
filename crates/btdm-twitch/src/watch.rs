@@ -1,9 +1,13 @@
-//! The watch heartbeat.
+//! The minute-watched event.
 //!
-//! Twitch counts drop time from "minute-watched" analytics events posted to a
-//! per-deployment "spade" endpoint. That URL is in no API — it is embedded in
-//! the site's JavaScript config and has to be scraped. The mobile page exposes
-//! it inline, so we fetch that first and skip a hop.
+//! Until 2026-10-08 Twitch counted drop time from "minute-watched" analytics
+//! events posted to a per-deployment "spade" endpoint. It no longer does — the
+//! stream's video is what counts now, see [`crate::playback`] — but a web
+//! player still reports one every minute, so the miner does too.
+//!
+//! That URL is in no API — it is embedded in the site's JavaScript config and
+//! has to be scraped. The mobile page exposes it inline, so we fetch that
+//! first and skip a hop.
 
 use crate::{TwitchError, describe};
 use base64::Engine;
@@ -17,8 +21,8 @@ pub const MOBILE_BASE_URL: &str = "https://m.twitch.tv";
 static SPADE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     // `http` as well as `https`: the page carrying this was itself fetched
     // over TLS, so refusing a plain-http value buys nothing — and it is what
-    // makes the heartbeat, the single request that advances drop time,
-    // testable against a local fake rather than only observable in production.
+    // makes the event testable against a local fake rather than only
+    // observable in production.
     regex::Regex::new(r#""spade_?[Uu]rl"\s*:\s*"(https?://[.\w\-/:]+)""#).expect("valid regex")
 });
 
@@ -39,9 +43,8 @@ pub fn extract_settings_url(html: &str) -> Option<String> {
 ///
 /// `client_time` is an ISO-8601 string with millisecond precision, matching the
 /// real client. Sending a Unix timestamp here is accepted by the transport and
-/// then silently ignored by the analytics pipeline — heartbeats succeed and no
-/// drop time accrues, which is the exact invisible failure this project exists
-/// to prevent.
+/// then silently ignored by the analytics pipeline. While these events still
+/// earned drop time, that was heartbeats succeeding and nothing accruing.
 pub fn build_watch_payload(
     channel: &Channel,
     stream: &Stream,
@@ -75,14 +78,11 @@ pub fn build_watch_payload(
     base64::engine::general_purpose::STANDARD.encode(payload.to_string())
 }
 
-/// Turns a transport failure against the spade host into an actionable message.
+/// Turns a transport failure against the spade host into a message naming
+/// the likely cause.
 ///
 /// `spade.twitch.tv` is an analytics domain, so it appears on most ad-blocking
-/// and tracker blocklists — and it is also the *only* endpoint that advances
-/// drop time. A blocked spade host therefore produces a miner that looks
-/// perfectly healthy and earns nothing, which is the exact failure this project
-/// exists to prevent. A bare "error sending request" would bury it, so the
-/// likely cause is named outright.
+/// and tracker blocklists. A bare "error sending request" would bury that.
 pub fn classify_spade_transport_error(url: &str, e: &reqwest::Error) -> TwitchError {
     if e.is_connect() || e.is_timeout() {
         TwitchError::SpadeUnreachable {
@@ -94,12 +94,11 @@ pub fn classify_spade_transport_error(url: &str, e: &reqwest::Error) -> TwitchEr
     }
 }
 
-/// How many times a failed heartbeat is retried before the tick gives up.
+/// How many times a failed minute-watched event is retried.
 ///
-/// Deliberately fewer than GQL's three. Every other request can be re-asked at
-/// leisure; this one is racing a minute boundary, and a heartbeat that arrives
-/// after the minute it was meant to claim has bought nothing. Two quick tries
-/// cover a blip without pushing the next one late.
+/// Deliberately fewer than GQL's three: the event is sent inside the
+/// heartbeat, which waits for it, and nothing depends on it arriving any more.
+/// Two quick tries cover a blip without holding the heartbeat up.
 const WATCH_RETRIES: usize = 2;
 const WATCH_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -150,11 +149,10 @@ impl WatchClient {
 
     /// One heartbeat, with a short retry. Twitch answers 204 on success.
     ///
-    /// This is the only request in the whole miner that advances drop time,
-    /// and it was the only one with no retry at all: GQL rode out three 5xxs,
-    /// while a single 504 here silently cost a watch minute. Twitch was
-    /// observed returning 504s freely on 2026-08-27, so that was not a
-    /// theoretical gap.
+    /// While this was the request that advanced drop time, it was also the
+    /// only one with no retry at all: GQL rode out three 5xxs, while a single
+    /// 504 here silently cost a watch minute. Twitch was observed returning
+    /// 504s freely on 2026-08-27, so that was not a theoretical gap.
     ///
     /// A 5xx means Twitch did not accept the event, so the retry replaces a
     /// heartbeat rather than duplicating one. In the one case where it might

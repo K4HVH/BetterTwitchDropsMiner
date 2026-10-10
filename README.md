@@ -44,10 +44,10 @@ channel, watch a specific channel, resync — all live, no restart, written back
 to `config.toml`. Everything on it is also on the CLI, because a headless box
 should not need a browser.
 
-**Recovery is a ladder, not a restart.** On a confirmed stall: resend the
-heartbeat, re-fetch stream info (a restarted broadcast earns nothing while
-looking healthy), re-verify eligibility, switch channel, re-sync campaigns,
-validate auth, quarantine the campaign. Every rung is logged.
+**Recovery is a ladder, not a restart.** On a confirmed stall: start watching
+the stream afresh, re-fetch stream info (a restarted broadcast is a new
+stream), re-verify eligibility, switch channel, re-sync campaigns, validate
+auth, quarantine the campaign. Every rung is logged.
 
 **Stale API hashes degrade, not break.** Twitch's private GraphQL uses persisted
 query hashes that rot without notice. Every operation also carries its raw query
@@ -208,11 +208,14 @@ journalctl --user -u btdm -f
 
 ## Troubleshooting
 
-**Nothing progresses, and the log says the watch endpoint is unreachable.**
-Allow-list `spade.twitch.tv`. It is an analytics domain, so ad-blockers, Pi-hole
-and VPN filters commonly block it — and it is the *only* endpoint that advances
-drop time. Every miner depends on it; most fail silently when it is blocked.
-This one says so.
+**Nothing progresses, and the stall banner stays up.** Since 2026-10-08 Twitch
+credits drop time only to an account that is actually fetching the stream, so
+the miner plays it: a playback token, then the stream's playlists from
+`usher.ttvnw.net` and Twitch's video hosts under `ttvnw.net`, with a HEAD
+request for each video segment (the video itself is never downloaded). Check
+that no ad-blocker, Pi-hole, DNS filter or VPN blocks those hosts.
+`spade.twitch.tv`, which used to be the endpoint that mattered, no longer
+decides anything.
 
 **A campaign says your account is not linked.** The dashboard's Unavailable tab
 links straight to the right page for each one. The miner will never mine an
@@ -246,7 +249,7 @@ a live account. A test that fails the build if a networking dependency enters
 | Crate | Responsibility |
 |---|---|
 | `btdm-core` | Domain model, eligibility, feasibility, strategies, watchdog, engine |
-| `btdm-twitch` | Auth, GraphQL transport, spade heartbeat, PubSub |
+| `btdm-twitch` | Auth, GraphQL transport, stream playback, PubSub |
 | `btdm-web` | Dashboard: axum, SSE, embedded assets |
 | `btdm` | Config, storage, CLI, supervisor |
 

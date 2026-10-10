@@ -16,6 +16,11 @@ pub enum ApiError {
     RateLimited,
     #[error("unexpected response shape: {0}")]
     Malformed(String),
+    /// Twitch answered, but not with what was asked for: a refusal, or nothing
+    /// new. The message says what was observed and nothing more; calling it a
+    /// network failure would name a cause nobody established.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Server-confirmed progress for the drop currently being mined.
@@ -111,7 +116,16 @@ pub trait TwitchApi: Send + Sync {
     async fn stream_info(&self, login: &str) -> Result<Option<Stream>, ApiError>;
 
     /// One watch heartbeat. The engine calls this on a fixed interval.
+    ///
+    /// A transport may go on watching between calls — Twitch's own does, as
+    /// a player has to — until a call names another stream or
+    /// [`TwitchApi::stop_watch`] is called. The result says whether watching
+    /// has actually worked since the previous call.
     async fn send_watch(&self, channel: &Channel, stream: &Stream) -> Result<(), ApiError>;
+
+    /// The engine has stopped watching: whatever `send_watch` kept going must
+    /// stop now, not when it next notices.
+    fn stop_watch(&self) {}
 
     /// Pull-based progress, the backstop for a live-but-silent websocket.
     async fn current_progress(&self, channel: &ChannelId)
