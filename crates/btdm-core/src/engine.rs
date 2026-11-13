@@ -1539,7 +1539,15 @@ impl<A: TwitchApi> Engine<A> {
                     }
                     merged.insert(full.id.clone(), full);
                 }
-                Ok(None) => {}
+                // Twitch listed it a moment ago, so "no such campaign" is not
+                // an answer about the campaign. Observed live on 2026-10-24:
+                // all thirty-two linked campaigns came back this way, and
+                // dropped here uncounted they became "0 mineable", a total
+                // that read as settled and was wrong about every one of them.
+                Ok(None) => {
+                    tracing::warn!(campaign = %id, "Twitch offered this campaign but described nothing");
+                    unchecked.push(id);
+                }
                 Err(e) => {
                     tracing::warn!(campaign = %id, error = %e, "campaign details failed");
                     unchecked.push(id);

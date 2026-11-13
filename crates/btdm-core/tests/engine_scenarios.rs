@@ -3750,6 +3750,45 @@ async fn campaigns_whose_detail_failed_are_counted_rather_than_forgotten() {
     );
 }
 
+/// The same disappearance by a quieter route. Observed live on 2026-10-24:
+/// Twitch answered the detail query for each of thirty-two linked campaigns
+/// with no campaign at all, and every one of them left the sync without a
+/// warning or a count. "Synced 113 campaigns, 0 mineable" read as a settled
+/// answer, and every sync the event log still held, back to 2026-10-16, said
+/// the same.
+///
+/// Offered a moment ago and now not describable is as unknown as a request
+/// that failed outright, and has to be reported the same way.
+#[tokio::test]
+async fn campaigns_twitch_would_not_describe_are_counted_rather_than_forgotten() {
+    let fake = FakeTwitch::default();
+    *fake.offered.lock().unwrap() =
+        vec![campaign("c1", true, vec![]), campaign("c2", true, vec![])];
+    fake.details
+        .lock()
+        .unwrap()
+        .insert("c1".into(), campaign("c1", true, vec![drop("d1", 60, 0)]));
+    // c2 is offered, and the detail query answers that it does not exist.
+
+    let mut e = engine(fake);
+    e.sync(now()).await.unwrap();
+
+    let synced = e
+        .drain_events()
+        .into_iter()
+        .find_map(|ev| match ev.kind {
+            EventKind::CampaignsSynced {
+                total,
+                eligible,
+                unchecked,
+            } => Some((total, eligible, unchecked)),
+            _ => None,
+        })
+        .expect("a sync reports itself");
+
+    assert_eq!(synced, (2, 1, 1));
+}
+
 /// The summary line is what the user actually reads, and it was the lie.
 #[test]
 fn the_sync_summary_admits_what_it_could_not_check() {
