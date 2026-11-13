@@ -51,7 +51,6 @@ fn client(endpoint: String) -> TwitchClient {
         reqwest::Client::new(),
         "token".into(),
         UserId::from("1"),
-        "someone".into(),
         endpoint,
     )
 }

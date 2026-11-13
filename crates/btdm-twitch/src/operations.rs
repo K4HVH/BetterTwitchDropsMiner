@@ -53,8 +53,11 @@ pub const CAMPAIGNS: GqlOperation = GqlOperation {
 pub const CAMPAIGN_DETAILS: GqlOperation = GqlOperation {
     name: "DropCampaignDetails",
     sha256: "039277bf98f3130929262cc7c6efd9c141ca3749cb6dca442fc8ead9a53f77c1",
-    raw_query: r#"query DropCampaignDetails($dropID: ID!, $channelLogin: String!) {
-  user(login: $channelLogin) {
+    // `channelLogin` carries the user id (see `TwitchClient`), so the raw
+    // query has to look the user up by id as well: `user(login:)` given an id
+    // finds nobody.
+    raw_query: r#"query DropCampaignDetails($dropID: ID!, $channelLogin: ID!) {
+  user(id: $channelLogin) {
     dropCampaign(id: $dropID) {
       id name status startAt endAt accountLinkURL
       game { id name slug boxArtURL }

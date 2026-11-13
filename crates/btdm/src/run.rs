@@ -75,7 +75,6 @@ pub async fn mine(
         http,
         tokens.access_token.clone(),
         btdm_core::model::UserId(validated.user_id.clone()),
-        validated.login.clone(),
     );
 
     let account_config = config.account(account);

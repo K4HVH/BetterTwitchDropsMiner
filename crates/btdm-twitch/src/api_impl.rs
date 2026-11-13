@@ -22,18 +22,19 @@ pub struct TwitchClient {
     watch: WatchClient,
     /// Plays the stream being watched, which is what earns drop time.
     player: Player,
+    /// Also the campaign-details query's `channelLogin`, which despite its
+    /// name takes the user id. Observed live on 2026-10-24: given the login it
+    /// answered `"user": null` for every campaign; given the id, the campaign.
+    /// The reference implementation has always sent the id.
     user_id: UserId,
-    /// The account's own login, required as a variable by the campaign-details
-    /// query even though the campaign is identified by ID.
-    login: String,
     /// Discovered once, then reused; cheap to re-derive if it goes stale.
     spade_url: Mutex<Option<String>>,
 }
 
 impl TwitchClient {
-    pub fn new(http: reqwest::Client, token: String, user_id: UserId, login: String) -> Self {
+    pub fn new(http: reqwest::Client, token: String, user_id: UserId) -> Self {
         let gql = GqlClient::new(http.clone(), Some(token));
-        Self::with_gql(http, gql, user_id, login)
+        Self::with_gql(http, gql, user_id)
     }
 
     /// Test seam: point GQL at a mock server.
@@ -41,14 +42,13 @@ impl TwitchClient {
         http: reqwest::Client,
         token: String,
         user_id: UserId,
-        login: String,
         gql_endpoint: String,
     ) -> Self {
         let gql = GqlClient::with_endpoint(http.clone(), Some(token), gql_endpoint);
-        Self::with_gql(http, gql, user_id, login)
+        Self::with_gql(http, gql, user_id)
     }
 
-    fn with_gql(http: reqwest::Client, gql: GqlClient, user_id: UserId, login: String) -> Self {
+    fn with_gql(http: reqwest::Client, gql: GqlClient, user_id: UserId) -> Self {
         let gql = Arc::new(gql);
         Self {
             player: Player::new(
@@ -60,7 +60,6 @@ impl TwitchClient {
             gql,
             watch: WatchClient::new(http),
             user_id,
-            login,
             spade_url: Mutex::new(None),
         }
     }
@@ -120,7 +119,7 @@ impl TwitchApi for TwitchClient {
             .gql
             .run(
                 &ops::CAMPAIGN_DETAILS,
-                json!({ "dropID": id.0, "channelLogin": self.login }),
+                json!({ "dropID": id.0, "channelLogin": self.user_id.0 }),
             )
             .await?;
         Ok(parse::parse_campaign_details(&data)?)
@@ -147,7 +146,7 @@ impl TwitchApi for TwitchClient {
                 .map(|id| {
                     (
                         &ops::CAMPAIGN_DETAILS,
-                        json!({ "dropID": id.0, "channelLogin": self.login }),
+                        json!({ "dropID": id.0, "channelLogin": self.user_id.0 }),
                     )
                 })
                 .collect();
