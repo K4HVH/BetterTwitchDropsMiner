@@ -261,8 +261,17 @@ fn campaign_list(data: &Value, path: &[&str]) -> Result<Vec<DropCampaign>, Twitc
 /// the ones absent from this response. Applying it at the parse boundary meant
 /// it only ever reached campaigns that had least use for it.
 pub fn parse_inventory(data: &Value) -> Result<Inventory, TwitchError> {
+    // Observed live on 2026-10-24: an account with nothing in progress gets
+    // `null` here rather than `[]`, and treating that as malformed failed
+    // every sync, so the miner could not start the campaign that would have
+    // put something back in progress. Only the list itself may be null; a
+    // missing user or inventory still means Twitch did not answer.
+    let campaigns = match data.pointer("/currentUser/inventory/dropCampaignsInProgress") {
+        Some(Value::Null) => Vec::new(),
+        _ => campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])?,
+    };
     Ok(Inventory {
-        campaigns: campaign_list(data, &["currentUser", "inventory", "dropCampaignsInProgress"])?,
+        campaigns,
         awarded: claimed_benefits(data),
     })
 }
@@ -733,6 +742,34 @@ mod ledger_tests {
         let campaigns = reconciled(&data);
         assert!(campaigns[0].drops[0].starts_at.is_some());
         assert!(campaigns[0].drops[0].ends_at.is_some());
+    }
+
+    /// Observed live on 2026-10-24: with nothing in progress, Twitch answers
+    /// `"dropCampaignsInProgress": null` rather than an empty list. Read as a
+    /// malformed response it failed every sync outright, so the miner went on
+    /// showing the last campaign list it had and never saw a new one.
+    #[test]
+    fn nothing_in_progress_is_an_empty_inventory_not_a_broken_one() {
+        let data = json!({
+            "currentUser": {
+                "inventory": {
+                    "dropCampaignsInProgress": null,
+                    "gameEventDrops": [{ "id": "b1", "lastAwardedAt": "2026-08-05T12:00:00Z" }],
+                }
+            }
+        });
+        let inv = parse_inventory(&data).unwrap();
+        assert!(inv.campaigns.is_empty());
+        assert_eq!(inv.awarded.len(), 1, "the ledger is the account's, in progress or not");
+    }
+
+    /// Only the list itself may be null. No user or no inventory is Twitch not
+    /// answering the question, which is not the same as "nothing".
+    #[test]
+    fn an_inventory_with_no_user_behind_it_is_still_an_error() {
+        assert!(parse_inventory(&json!({ "currentUser": null })).is_err());
+        assert!(parse_inventory(&json!({ "currentUser": { "inventory": null } })).is_err());
+        assert!(parse_inventory(&json!({ "currentUser": { "inventory": {} } })).is_err());
     }
 }
 
